@@ -3,15 +3,7 @@
 > An LLM-driven pull-request reviewer as a GitHub Action — inline comments, severity-based gating, no infrastructure.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Powered by DailyBot](https://img.shields.io/badge/Powered%20by-DailyBot-6C5CE7.svg)](https://www.dailybot.com)
-
-<p align="center">
-  <a href="https://www.dailybot.com">
-    <img src="https://www.dailybot.com/images/dailybot-logo.svg" alt="DailyBot" height="40">
-  </a>
-  <br>
-  <sub>Built and maintained by <a href="https://www.dailybot.com"><b>DailyBot</b></a> — automation for high-performing teams.</sub>
-</p>
+[![Powered by Dailybot](https://img.shields.io/badge/Powered%20by-Dailybot-6C5CE7.svg)](https://www.dailybot.com?utm_source=dailybotopensource&utm_medium=ai-pr-reviewer)
 
 A composite GitHub Action that runs a real code review on every pull request: posts inline comments, marks previous reviews as outdated, gates the GitHub check based on configurable strictness, and applies a "reviewed" label. Stdlib-only Python — no Docker image to pull, no Node modules, no infrastructure beyond your provider's API key.
 
@@ -253,10 +245,6 @@ Bug reports, feature requests, provider implementations, and prompt improvements
 
 ---
 
-<p align="center">
-  <a href="https://www.dailybot.com">
-    <img src="https://www.dailybot.com/images/dailybot-logo.svg" alt="DailyBot" height="32">
-  </a>
-  <br>
-  <sub>Powered by <a href="https://www.dailybot.com"><b>DailyBot</b></a> · <a href="https://github.com/DailybotHQ">More open source from DailyBot →</a></sub>
-</p>
+## :electric_plug: Powered by [Dailybot](https://www.dailybot.com?utm_source=dailybotopensource&utm_medium=ai-pr-reviewer)
+
+[Dailybot](https://www.dailybot.com/product/ai) is an AI-powered async communication platform that keeps **people and agents** visible — without adding more meetings or tools. It lives where your team already works (Slack, Teams, Google Chat, Discord, VS Code, and the CLI) and turns scattered signals into clear progress: async check-ins and standups, AI summaries that detect blockers and read team sentiment, workflow automation and approvals, team analytics, and recognition. As AI agents join the workflow, Dailybot surfaces their status and activity right alongside your team's — so long-running agents never go dark. [Learn more](https://www.dailybot.com?utm_source=dailybotopensource&utm_medium=ai-pr-reviewer).
