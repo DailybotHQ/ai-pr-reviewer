@@ -1,0 +1,141 @@
+name: Auto Release
+
+# On every merge to `main`, cut a SemVer release automatically:
+#   1. Derive the bump (major/minor/patch) from the Conventional Commits
+#      since the last tag.
+#   2. Create and push the new `vX.Y.Z` tag.
+#   3. Move the major-version alias tag (e.g. `v1`) to the new release so
+#      consumers pinning `@v1` pick it up — the standard Marketplace pattern.
+#   4. Publish a GitHub Release with auto-generated notes.
+#
+# Mirrors the DailyBot `auto-release` convention (see the agent-skill repo),
+# adapted for a Marketplace-published composite action: there is no npm
+# publish or build artefact — the "package" is the tagged source itself.
+#
+# Bootstrapping: the very first release (v1.0.0) is cut MANUALLY so it can be
+# published to the GitHub Marketplace from the Release UI. This workflow skips
+# while no tag exists yet, then takes over for every release after that.
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: auto-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  auto-release:
+    name: 'Auto Release on Merge to Main'
+    runs-on: ubuntu-latest
+    # Skip release-bookkeeping commits and explicit opt-outs.
+    if: >-
+      !startsWith(github.event.head_commit.message, 'chore(release):') &&
+      !contains(github.event.head_commit.message, '[skip release]')
+    steps:
+      - name: Step 0 - 📥 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.AUTOMATION_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Step 1 - ⚙️ Configure Git
+        run: |
+          git config user.name "🤖 DailyBot"
+          git config user.email "ops@dailybot.com"
+
+      - name: Step 2 - 📝 Determine version bump from commits
+        id: version
+        run: |
+          set -euo pipefail
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No existing tag found. The first release (v1.0.0) must be cut"
+            echo "manually so it can be published to the Marketplace from the"
+            echo "Release UI. Skipping auto-release until a base tag exists."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Latest tag: $LATEST_TAG"
+
+          CURRENT_VERSION=${LATEST_TAG#v}
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+
+          COMMITS=$(git log "${LATEST_TAG}..HEAD" --pretty=format:"%s" 2>/dev/null || echo "")
+          echo "Commits since $LATEST_TAG:"
+          echo "$COMMITS"
+
+          if [ -z "$COMMITS" ]; then
+            echo "No new commits since $LATEST_TAG — nothing to release."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Conventional-commit → bump mapping.
+          BUMP="patch"
+          if echo "$COMMITS" | grep -qE "^(feat|feature|fix|perf|refactor)(\(.+\))?!:|BREAKING CHANGE"; then
+            BUMP="major"
+          elif echo "$COMMITS" | grep -qE "^(feat|feature)(\(.+\))?:"; then
+            BUMP="minor"
+          elif echo "$COMMITS" | grep -qE "^(fix|perf)(\(.+\))?:"; then
+            BUMP="patch"
+          fi
+          echo "Bump type: $BUMP"
+
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+
+          NEW_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+          MAJOR_TAG="v${MAJOR}"
+          echo "New version: $NEW_VERSION (major alias: $MAJOR_TAG)"
+          {
+            echo "skip=false"
+            echo "new_version=$NEW_VERSION"
+            echo "major_tag=$MAJOR_TAG"
+            echo "previous_tag=$LATEST_TAG"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Step 3 - 🏷️ Create and push tags
+        if: steps.version.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          NEW_VERSION="${{ steps.version.outputs.new_version }}"
+          MAJOR_TAG="${{ steps.version.outputs.major_tag }}"
+
+          git tag -a "$NEW_VERSION" -m "Release $NEW_VERSION"
+          git push origin "$NEW_VERSION"
+
+          # Move the major alias tag — `--force` is correct: it's a moving
+          # pointer by design so `@v1` tracks the latest v1.x.y.
+          git tag -f "$MAJOR_TAG" "$NEW_VERSION"
+          git push origin "$MAJOR_TAG" --force
+
+      - name: Step 4 - 📋 Generate release notes
+        id: notes
+        if: steps.version.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          PREV="${{ steps.version.outputs.previous_tag }}"
+          NOTES=$(git log "${PREV}..${{ steps.version.outputs.new_version }}" --pretty=format:"- %s (%h)" 2>/dev/null || echo "")
+          {
+            echo "notes<<RELEASE_NOTES_EOF"
+            echo "$NOTES"
+            echo ""
+            echo "**Full changelog:** [\`${PREV}...${{ steps.version.outputs.new_version }}\`](https://github.com/${{ github.repository }}/compare/${PREV}...${{ steps.version.outputs.new_version }})"
+            echo "RELEASE_NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Step 5 - 🚀 Create GitHub Release
+        if: steps.version.outputs.skip == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.new_version }}
+          name: ${{ steps.version.outputs.new_version }}
+          body: ${{ steps.notes.outputs.notes }}
+          token: ${{ secrets.AUTOMATION_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}

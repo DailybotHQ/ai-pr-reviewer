@@ -1,0 +1,66 @@
+name: Code Check
+
+# Gate every PR to `main` (and every push to `main`) on the same checks a
+# contributor would run locally: the runtime compiles on the supported floor
+# (Python 3.10), the action.yml public contract is intact, the workflows lint
+# clean, and the unit-test suite passes. Mirrors the DailyBot `code_check`
+# convention used across our other open-source repos, adapted for a
+# stdlib-only Python composite action (no npm install / build step).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: 'Validate — compile + contract + lint'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Step 0 - 🐍 Set up Python ${{ '3.10' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Step 1 - 🧪 Compile the runtime (stdlib-only, py3.10 floor)
+        run: python3 -m py_compile scripts/reviewer.py
+
+      - name: Step 2 - 📦 Install lint tooling
+        # CI-only tooling — the runtime stays stdlib-only (AGENTS.md Rule #2).
+        run: python3 -m pip install --quiet pyyaml
+
+      - name: Step 3 - 📄 Validate the action.yml public contract
+        run: python3 .github/scripts/validate_action.py
+
+      - name: Step 4 - 🔎 Lint GitHub workflows (actionlint)
+        # Pin both the bootstrap script (tag) and the binary version so the
+        # check is reproducible and not at the mercy of the latest release.
+        run: |
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7
+          ./actionlint -color
+
+  tests:
+    name: 'Run tests'
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Step 0 - 🐍 Set up Python ${{ '3.10' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Step 1 - 🧪 Run the unit-test suite (stdlib unittest)
+        run: python3 -m unittest discover -s tests -v
