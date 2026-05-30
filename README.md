@@ -10,6 +10,23 @@ Originally built to replace [`anthropics/claude-code-action@v1`](https://github.
 
 ---
 
+## Contents
+
+- [Quick start](#quick-start)
+- [What you get out of the box](#what-you-get-out-of-the-box)
+- [Inputs](#inputs)
+- [Outputs](#outputs)
+- [Strictness levels](#strictness-levels)
+- [Recipes](#recipes)
+- [Required permissions](#required-permissions)
+- [How it works](#how-it-works)
+- [Provider roadmap](#provider-roadmap)
+- [FAQ](#faq)
+- [Contributing](#contributing)
+- [License](#license)
+
+---
+
 ## Quick start
 
 Drop this into `.github/workflows/pr-review.yml`:
