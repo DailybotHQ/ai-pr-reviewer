@@ -37,7 +37,7 @@ jobs:
       !contains(github.event.head_commit.message, '[skip release]')
     steps:
       - name: Step 0 - 📥 Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           token: ${{ secrets.AUTOMATION_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
@@ -133,7 +133,7 @@ jobs:
 
       - name: Step 5 - 🚀 Create GitHub Release
         if: steps.version.outputs.skip == 'false'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.version.outputs.new_version }}
           name: ${{ steps.version.outputs.new_version }}
