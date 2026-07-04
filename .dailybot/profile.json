@@ -1,0 +1,10 @@
+{
+  "name": "AI PR Reviewer",
+  "default_metadata": {
+    "repo": "ai-pr-reviewer"
+  },
+  "report": {
+    "min_interval_minutes": 30,
+    "nudge": true
+  }
+}
