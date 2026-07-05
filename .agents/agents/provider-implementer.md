@@ -14,13 +14,29 @@ can-modify-files: true
 
 ## Role
 
-A specialist in adding new LLM providers to `scripts/reviewer.py`. Owns the `Provider` abstraction, the translation between provider-specific message/tool shapes and the action's Anthropic-shape in-memory representation, and the smoke-testing process for verifying a new provider produces correct reviews.
+A specialist in adding new LLM providers to `scripts/reviewer.py`. Owns **two provider abstractions**: `Provider` (chat-completions family — this action owns the tool-use loop) and `AgentRunnerProvider` (agent-runner family — vendor CLI owns the tool-use loop, communicates via `.aiprr/findings.json`). Understands the translation between provider-specific shapes and the action's in-memory representation, and the smoke-testing process for verifying a new provider produces correct reviews.
+
+## Provider family — pick FIRST
+
+Before implementing anything, decide which family the new provider belongs to:
+
+| Question | Chat-completions (`Provider`) | Agent-runner (`AgentRunnerProvider`) |
+|---|---|---|
+| Does the vendor expose a raw messages/completions HTTP API? | ✅ yes | maybe, but you'd bypass their agent |
+| Does the vendor ship a headless coding-agent CLI? | irrelevant | ✅ yes — use their CLI |
+| Who owns the tool-use loop? | This action's `drive_review()` | The vendor CLI |
+| Where do inline findings come from? | Model calls `post_inline_comment` tool | Vendor writes `.aiprr/findings.json` |
+| Install-step cost? | Zero | ~15–30s (npm or curl-installer) |
+| Examples | Anthropic (raw API), future OpenAI/Gemini/Bedrock | Claude Code, Cursor Agent, OpenAI Codex |
+
+**Rule of thumb:** if the vendor ships a coding-agent CLI (with LSP-backed navigation, semantic search, MCP), use `AgentRunnerProvider` — you get vendor-tuned code comprehension for free. If the vendor only ships a raw API, use `Provider` — you own the loop, you control the tools.
 
 ## When to use
 
-- Implementing a new provider (OpenAI, Azure OpenAI, Google Gemini, AWS Bedrock, self-hosted vLLM/Ollama).
-- Auditing the existing `AnthropicProvider` for changes to Anthropic's API surface.
-- Designing the `Provider` abstraction's evolution if a new provider exposes capabilities Anthropic doesn't (e.g. native streaming, native multi-modal).
+- Implementing a new **chat-completions** provider (raw OpenAI, Azure OpenAI, Google Gemini, AWS Bedrock, self-hosted vLLM/Ollama).
+- Implementing a new **agent-runner** provider (any coding-agent CLI: Aider, Continue, Devin, GitHub Copilot CLI, etc.).
+- Auditing an existing `Provider` or `AgentRunnerProvider` for changes to the vendor's API surface.
+- Designing either abstraction's evolution if a new provider exposes capabilities the current ones don't.
 
 ## When NOT to use
 
@@ -30,13 +46,13 @@ A specialist in adding new LLM providers to `scripts/reviewer.py`. Owns the `Pro
 ## Required reading before starting
 
 1. `scripts/reviewer.py`:
-   - The `Provider` base class.
-   - `AnthropicProvider` — the reference implementation.
-   - `build_provider()` — the registry.
+   - **For chat-completions providers:** `Provider` base class, `AnthropicProvider` reference implementation, `drive_review()` loop that consumes Anthropic-shape responses.
+   - **For agent-runner providers:** `AgentRunnerProvider` base class, `ClaudeCodeProvider` / `CursorProvider` / `CodexProvider` reference implementations, `_invoke_cli_agent()` helper, `_build_cli_env()` env-scrubbing, `parse_findings_file()` + `write_findings_prompt_directive()`.
+   - `build_provider()` — the shared registry (returns either family).
    - `DEFAULT_MODELS` — the per-provider default model map.
-   - `drive_review()` — the loop that consumes the Anthropic-shape response.
-2. `docs/PROVIDERS.md` — roadmap, contract, gotchas per planned provider.
-3. `docs/SECURITY.md` — what trust assumptions hold for the existing provider that you must preserve.
+   - `main()` — the `isinstance(provider, AgentRunnerProvider)` dispatch that routes to the right execution branch.
+2. `docs/PROVIDERS.md` — roadmap, the two-family contract, gotchas per planned provider, the `.aiprr/findings.json` schema.
+3. `docs/SECURITY.md` — trust assumptions to preserve. **Critical for agent-runner providers:** `_build_cli_env()` allowlist + `shlex.split(extra_args)` pattern + `max-inline-comments` cap in `main()`.
 
 ## The contract
 
@@ -88,17 +104,61 @@ Same protocol as OpenAI, different URL: `https://<resource>.openai.azure.com/ope
 
 Most expose an OpenAI-compatible chat-completions endpoint. The OpenAI provider should work with `api-key: <whatever>` and a custom base URL — add an `api-base` input alongside the OpenAI provider.
 
-## Implementation steps
+## Translation patterns — agent-runner family (v1.1.0+)
+
+For an `AgentRunnerProvider`, translation is **input-side only** — the output side is fully standardised via `.aiprr/findings.json`. The three shipping implementations are the reference:
+
+### Shared boilerplate
+
+Every `AgentRunnerProvider.run_review()` follows the same shape:
+
+1. Compute `findings_path = output_dir / FINDINGS_JSON_REL`; create parent directory.
+2. Build the review instructions: `write_findings_prompt_directive(review_instructions, findings_path)`.
+3. Enter a `finally`-guarded MCP swap block: `_swap_mcp_config(self.mcp_config_file, self.MCP_DEST)`.
+4. Build the CLI argv-list. Include model pin if provided; append `shlex.split(self.extra_args)` at the end.
+5. Build the subprocess env via `_build_cli_env(extra_vars={"<VENDOR>_API_KEY": self.api_key})` — DO NOT pass `{**os.environ}` (see Security Review §2).
+6. Call `_invoke_cli_agent(argv=argv, workspace=workspace, findings_path=findings_path, env=env, cli_name=self.CLI_NAME)`.
+7. Restore MCP config in `finally`.
+
+### Per-CLI knobs to look up
+
+- **How does the CLI receive the user prompt?** Positional arg, `-p <text>`, stdin, or an `--input-file <path>`?
+- **How does the CLI receive additional system-prompt instructions?** Some CLIs support `--append-system-prompt <file>` (Claude Code); others require inlining into the user prompt (Cursor, Codex).
+- **What's the model-selection flag?** `--model <id>` in all three shipping providers, but not universal.
+- **What's the auth mechanism?** Env var (usual — Anthropic, Cursor, OpenAI all use env), config file, or CLI flag?
+- **What's the MCP config path?** `~/.<cli>/mcp.json` in all three shipping providers; verify with vendor docs.
+
+### Findings.json contract
+
+Every AgentRunnerProvider produces the same `.aiprr/findings.json` schema (documented in `docs/PROVIDERS.md`). The `write_findings_prompt_directive()` helper appends a standardised schema-documented instruction; you don't invent a per-CLI prompt for the output format.
+
+## Implementation steps — chat-completions family
 
 1. **Read the reference.** Walk through `AnthropicProvider` end-to-end so you understand what the abstraction expects.
 2. **Add the provider class.** Place it next to `AnthropicProvider` in `scripts/reviewer.py`. Same shape: `__init__(api_key, model)`, `complete(...)`, with retries-on-429/5xx and bounded delays.
 3. **Implement message translation** — both directions. In: Anthropic-shape → provider-shape. Out: provider-response → Anthropic-shape `content` blocks.
 4. **Add to `DEFAULT_MODELS`** with the recommended default model for the new provider.
-5. **Add to `build_provider()`** — one new branch.
+5. **Add to `build_provider()`** — one new branch (returns the `Provider` subclass).
 6. **Add new inputs to `action.yml`** if the provider needs them (e.g. `api-base` for self-hosted, `azure-deployment` for Azure).
 7. **Update `docs/PROVIDERS.md`** — flip the status from 🛠 roadmap to ✅ shipping, document any provider-specific inputs, gotchas, and caching behaviour.
 8. **Update `README.md`** — extend the "Provider roadmap" table.
 9. **Update `CHANGELOG.md`** under `[Unreleased]`.
+
+## Implementation steps — agent-runner family
+
+1. **Read the reference.** Walk through `ClaudeCodeProvider` end-to-end. Then compare against `CursorProvider` (different prompt injection strategy) and `CodexProvider` (different sub-command shape).
+2. **Add the provider class.** Place it next to the existing three in `scripts/reviewer.py`. Extend `AgentRunnerProvider`, define `CLI_NAME` / `CLI_BIN` / `MCP_DEST` class attributes, `__init__(api_key, model, extra_args, mcp_config_file)`, `install()` (defensive PATH check via `run_cmd([self.CLI_BIN, "--version"])`), `run_review(...)` following the shared boilerplate above.
+3. **Add to `DEFAULT_MODELS`** — either a real model id or `"auto"` sentinel.
+4. **Add to `build_provider()`** — new `if provider_id == "<name>":` branch that returns your class with `api_key`, `model`, `extra_args`, `mcp_config_file`.
+5. **Add install step in `action.yml`** — new `if: inputs.provider == '<name>'`-guarded step that installs the CLI + emits `<cli> --version`.
+6. **Add a new `<name>-version` input** in `action.yml` if the vendor supports pinning.
+7. **Add matrix entry in `.github/workflows/self-review.yml`** so dogfooding covers the new provider.
+8. **Add matrix entry in `.github/workflows/code_check.yml > cli-install-smoke`** so installer drift is caught in CI.
+9. **Add an example** in `examples/provider-<name>.yml`.
+10. **Update `docs/PROVIDERS.md`** — add the provider to the Agent Runner Provider Contract section.
+11. **Update `README.md`** — extend the "Provider roadmap" table.
+12. **Update `CHANGELOG.md`** under `[Unreleased]`.
+13. **Add unit tests** for the new provider — dispatch (build_provider returns your class), constants (CLI_BIN, MCP_DEST), extra_args flowing through `shlex.split`.
 
 ## Smoke testing
 
@@ -119,8 +179,9 @@ The PR description must paste:
 ## Quality gates
 
 - **Stdlib only.** No `boto3` for Bedrock, no `openai` for OpenAI. If a provider can't be implemented in stdlib, that's a design discussion — not a "just install one dep" PR.
-- **No new files.** Add the provider next to the existing one in `scripts/reviewer.py` unless the implementation is genuinely large (>300 LOC), in which case `scripts/providers/<name>.py` is acceptable but needs to stay stdlib-only.
-- **Preserve existing behaviour.** The Anthropic provider's path through the agentic loop must not change. New providers add code; they don't refactor the loop.
+- **No new files.** Add the provider next to the existing ones in `scripts/reviewer.py` unless the implementation is genuinely large (>300 LOC), in which case `scripts/providers/<name>.py` is acceptable but needs to stay stdlib-only.
+- **Preserve existing behaviour.** No provider addition should change any other provider's path through the runtime. New providers add code; they don't refactor shared paths.
+- **Agent-runner providers MUST:** (a) use `_build_cli_env()` (never `{**os.environ, ...}`); (b) funnel `extra_args` through `shlex.split` (never string-concat into argv); (c) subject to the `max-inline-comments` cap applied in `main()`; (d) use `_invoke_cli_agent` (never bare `subprocess.run` — you'd bypass the timeout + stderr-tail-on-error handling).
 
 ## Tone
 
