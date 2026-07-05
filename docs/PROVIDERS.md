@@ -95,3 +95,78 @@ We don't ask for a unit-test framework yet — the testing surface is the integr
 ## Cost considerations
 
 The Anthropic provider uses prompt caching aggressively, so a long custom prompt only pays full token cost on the first turn. When adding new providers, replicate this where possible: it cuts the cost of a typical review by ~5x once the cache warms.
+
+---
+
+## Agent Runner Provider Contract (v1.1.0)
+
+Alongside the chat-completions `Provider` above, `scripts/reviewer.py` supports a second provider family: **`AgentRunnerProvider`**. Rather than owning the tool-use loop, this family shells out to a vendor's coding-agent CLI in headless mode and receives structured findings via a file-based contract. This is what powers `provider: claude-code`, `provider: cursor`, and `provider: codex`.
+
+### Why file-based (and not MCP, not fenced-stdout)?
+
+- **Portable across CLIs.** Every vendor CLI can already write files; the schema is our contract, not theirs.
+- **Robust to stdout noise.** CLIs emit banners, progress bars, warnings, and streaming JSON that would be brittle to parse.
+- **Small blast radius.** A malformed findings file surfaces a clean error to the operator; a broken stdout parser would silently produce empty reviews.
+- **Future-proof.** When the ecosystem coalesces on MCP-as-tool-server we'll add it as an additional path; file-based stays as the fallback.
+
+### The file
+
+Every agent-runner provider MUST write its review to:
+
+    <workspace>/.aiprr/findings.json
+
+exactly once, at the end of its run. `parse_findings_file()` in `scripts/reviewer.py` reads and validates it.
+
+### The schema
+
+```json
+{
+  "summary": "markdown body of the overall review",
+  "findings": [
+    {
+      "path": "src/foo.py",
+      "line": 42,
+      "body": "markdown body of this inline comment",
+      "severity": "critical",
+      "start_line": 40,
+      "side": "RIGHT"
+    }
+  ]
+}
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `summary` | string | recommended | Markdown for the top-level review body. Empty string is legal (produces a default fallback summary). |
+| `findings` | array | required | May be empty (means "no issues"). |
+| `findings[].path` | string | required | Repo-relative file path. Must appear in the PR diff. |
+| `findings[].line` | integer | required | Line number (end line for multi-line). Must appear in the diff. |
+| `findings[].body` | string | required | Non-empty markdown body of the inline comment. |
+| `findings[].severity` | string | optional (default `info`) | Exactly one of `critical`, `warning`, `info` (lowercase). Drives the strictness gate. |
+| `findings[].start_line` | integer | optional | Start line for multi-line comments. |
+| `findings[].side` | string | optional (default `RIGHT`) | `LEFT` or `RIGHT` (case-normalised). `RIGHT` = new code, `LEFT` = removed. |
+
+### Validation guarantees
+
+`parse_findings_file()` in `scripts/reviewer.py` enforces:
+
+- Root is a JSON object (list/string/number roots rejected).
+- `findings` is a list (dict/scalar rejected).
+- Every finding is an object with non-empty `path`, integer `line`, non-empty `body`.
+- Severity is exactly one of the allowed values (case-insensitive on input, lowercased on output).
+- Side is `LEFT`/`RIGHT` (case-insensitive on input, uppercased on output).
+- Unknown top-level or per-finding keys are silently ignored (forward-compatibility with vendor extensions).
+
+Missing files raise `FileNotFoundError` with an actionable message. Malformed JSON raises `ValueError` with the offending snippet quoted.
+
+### The prompt directive
+
+CLI providers wrap the review instructions with `write_findings_prompt_directive()`, which appends the schema + "write your findings to this file before ending your turn" instruction to whatever comes from `prompts/default.md`. The directive is standardised so every CLI writes the same schema — one parser, three producers.
+
+### Adding a new agent-runner provider
+
+1. Implement `AgentRunnerProvider` — install check + `run_review()` that invokes the CLI with `write_findings_prompt_directive`-wrapped instructions and returns `parse_findings_file(findings_path)`.
+2. Register in `build_provider()`.
+3. Add to `DEFAULT_MODELS`.
+4. Add a conditional install step in `action.yml` (see the modular-install pattern in Task 07 of the DWP plan).
+5. Add a matrix entry in `.github/workflows/self-review.yml` for dogfooding.

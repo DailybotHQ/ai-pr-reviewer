@@ -156,6 +156,21 @@ SEVERITY_RANK: dict[str, int] = {
 # the most recent review unambiguously, even if other bots also comment.
 REVIEW_MARKER: str = "<!-- ai-pr-reviewer-marker -->"
 
+# Agent-runner findings contract (see AgentRunnerProvider docstring).
+# Each CLI provider writes its findings to `<output_dir>/<FINDINGS_JSON_REL>`
+# before exiting; `parse_findings_file` reads + validates that file.
+FINDINGS_JSON_REL: str = ".aiprr/findings.json"
+ALLOWED_SEVERITIES: tuple[str, ...] = (
+    SEVERITY_CRITICAL,
+    SEVERITY_WARNING,
+    SEVERITY_INFO,
+)
+ALLOWED_SIDES: tuple[str, ...] = ("LEFT", "RIGHT")
+
+# Timeout for a single agent-runner CLI invocation (seconds). Aligns with the
+# recommended workflow `timeout-minutes: 15` in examples/*.yml.
+CLI_INVOCATION_TIMEOUT: int = 900
+
 
 # ---------------------------------------------------------------------------
 # Logging / utilities
@@ -1253,6 +1268,157 @@ def state_to_review_result(state: "ReviewState") -> ReviewResult:
         summary=state.final_summary or "",
         findings=findings,
         overall_severity=overall_severity(severities),
+    )
+
+
+def parse_findings_file(path: Path) -> ReviewResult:
+    """Parse an agent-runner `findings.json` into a `ReviewResult`.
+
+    Strict validation:
+      - Root MUST be a JSON object.
+      - `findings` MUST be a list (may be empty).
+      - Every finding MUST carry non-empty `path`, integer `line`, non-empty
+        `body`. Missing severity defaults to `info`; unknown severities raise.
+      - Optional `start_line` is coerced to int; optional `side` MUST be one
+        of LEFT/RIGHT (case-normalised).
+      - Unknown top-level or per-finding keys are silently ignored (forward-
+        compat with vendor extensions).
+
+    Raises:
+      - `FileNotFoundError` with an actionable message if the file is missing.
+      - `ValueError` for malformed JSON or schema violations, quoting the
+        offending path/index/value so the caller can surface it to the model.
+    """
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Agent-runner provider did not write {path}. "
+            "The CLI may have crashed, the review-instruction prompt may be "
+            "missing the write-to-file directive, or the workspace path is "
+            "wrong. See docs/PROVIDERS.md for the contract."
+        )
+    try:
+        raw: Any = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        snippet: str = path.read_text(encoding="utf-8")[:MAX_ERROR_BODY_CHARS]
+        raise ValueError(
+            f"Malformed findings.json ({e}). Content head: {snippet!r}"
+        ) from e
+
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"findings.json root must be an object, got {type(raw).__name__}"
+        )
+
+    summary: str = str(raw.get("summary") or "")
+    raw_findings: Any = raw.get("findings") if raw.get("findings") is not None else []
+    if not isinstance(raw_findings, list):
+        raise ValueError(
+            f"'findings' must be a list, got {type(raw_findings).__name__}"
+        )
+
+    findings: list[Finding] = []
+    for i, item in enumerate(raw_findings):
+        if not isinstance(item, dict):
+            raise ValueError(f"finding[{i}] must be an object")
+        try:
+            path_val: str = str(item["path"])
+            line_val: int = int(item["line"])
+            body_val: str = str(item["body"])
+        except (KeyError, TypeError, ValueError) as e:
+            raise ValueError(
+                f"finding[{i}] missing or invalid required field: {e}"
+            ) from e
+        if not path_val:
+            raise ValueError(f"finding[{i}].path is empty")
+        if not body_val.strip():
+            raise ValueError(f"finding[{i}].body is empty")
+
+        severity_val: str = str(item.get("severity") or SEVERITY_INFO).lower()
+        if severity_val not in ALLOWED_SEVERITIES:
+            raise ValueError(
+                f"finding[{i}].severity={severity_val!r} not in "
+                f"{ALLOWED_SEVERITIES}"
+            )
+
+        start_line_val: int | None = None
+        if item.get("start_line") is not None:
+            try:
+                start_line_val = int(item["start_line"])
+            except (TypeError, ValueError) as e:
+                raise ValueError(
+                    f"finding[{i}].start_line must be an integer: {e}"
+                ) from e
+
+        side_val: str | None = "RIGHT"
+        if item.get("side") is not None:
+            side_val = str(item["side"]).upper()
+            if side_val not in ALLOWED_SIDES:
+                raise ValueError(
+                    f"finding[{i}].side={side_val!r} not in {ALLOWED_SIDES}"
+                )
+
+        findings.append(
+            Finding(
+                path=path_val,
+                line=line_val,
+                body=body_val,
+                severity=severity_val,
+                start_line=start_line_val,
+                side=side_val,
+            )
+        )
+
+    severities: list[str] = [f.severity for f in findings]
+    return ReviewResult(
+        summary=summary,
+        findings=findings,
+        overall_severity=overall_severity(severities),
+    )
+
+
+def write_findings_prompt_directive(
+    review_instructions: str, findings_path: Path
+) -> str:
+    """Append the "write your findings to this file" directive to the
+    review instructions handed to an agent-runner CLI.
+
+    Standardised so every CLI provider emits the same schema — the receiving
+    parser (`parse_findings_file`) is a single implementation shared across
+    all providers.
+    """
+    return (
+        review_instructions
+        + "\n\n---\n\n"
+        + "## Output contract (MANDATORY)\n\n"
+        + "Before ending your turn, write your review to the file:\n\n"
+        + f"    {findings_path}\n\n"
+        + "as JSON matching this schema:\n\n"
+        + "```json\n"
+        + "{\n"
+        + '  "summary": "markdown body of the overall review",\n'
+        + '  "findings": [\n'
+        + "    {\n"
+        + '      "path": "repo-relative file path (must appear in the PR diff)",\n'
+        + '      "line": 123,\n'
+        + '      "body": "markdown body of this inline comment",\n'
+        + '      "severity": "critical | warning | info",\n'
+        + '      "start_line": 121,\n'
+        + '      "side": "RIGHT"\n'
+        + "    }\n"
+        + "  ]\n"
+        + "}\n"
+        + "```\n\n"
+        + "Rules:\n"
+        + "- `path` and `line` MUST reference a line that appears in the PR "
+        + "diff. Off-diff lines are rejected by GitHub with HTTP 422 and lose "
+        + "the whole review.\n"
+        + "- `severity` MUST be exactly one of `critical`, `warning`, `info` "
+        + "(lowercase). Choose honestly — it drives the strictness gate.\n"
+        + "- `start_line` and `side` are optional. `side` defaults to `RIGHT` "
+        + "(new code); use `LEFT` for removed code.\n"
+        + "- Empty `findings` is valid — it means "
+        + '"no issues found; just the summary".\n'
+        + "- Only write the file once, at the end. Do NOT stream partials."
     )
 
 
