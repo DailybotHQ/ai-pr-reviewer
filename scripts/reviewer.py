@@ -755,6 +755,52 @@ def _restore_mcp_config(dest_path: Path | None, backup: str | None) -> None:
         dest_path.unlink(missing_ok=True)
 
 
+# Environment variables the vendor CLIs need to function on ubuntu-latest.
+# Everything else (notably AIPRR_GH_TOKEN and every other AIPRR_* secret)
+# stays in the parent process. See docs/SECURITY.md and Security Review §2.
+_CLI_ENV_ALLOWLIST: tuple[str, ...] = (
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TERM",
+    "SHELL",
+    # Node.js CLIs (@anthropic-ai/claude-code, @openai/codex).
+    "NODE_PATH",
+    "NPM_CONFIG_PREFIX",
+    "NODE_OPTIONS",
+    # GitHub Actions runner metadata (harmless; useful for debug output).
+    "RUNNER_OS",
+    "RUNNER_ARCH",
+    "GITHUB_ACTIONS",
+    "CI",
+)
+
+
+def _build_cli_env(
+    *, extra_vars: dict[str, str]
+) -> dict[str, str]:
+    """Build a scrubbed environment for a vendor-CLI subprocess.
+
+    Forwards only variables the CLI likely needs to function (PATH,
+    HOME, locale, Node.js paths). Adds `extra_vars` on top (typically
+    the vendor-specific API key). Everything else — notably the
+    consumer's GitHub token and any other secrets in the workflow's
+    env: block — stays in the parent process.
+    """
+    scrubbed: dict[str, str] = {}
+    for name in _CLI_ENV_ALLOWLIST:
+        val: str | None = os.environ.get(name)
+        if val is not None:
+            scrubbed[name] = val
+    scrubbed.update(extra_vars)
+    return scrubbed
+
+
 def _invoke_cli_agent(
     *,
     argv: list[str],
@@ -873,7 +919,9 @@ class ClaudeCodeProvider(AgentRunnerProvider):
             if self.extra_args:
                 argv += shlex.split(self.extra_args)
 
-            env: dict[str, str] = {**os.environ, "ANTHROPIC_API_KEY": self.api_key}
+            env: dict[str, str] = _build_cli_env(
+                extra_vars={"ANTHROPIC_API_KEY": self.api_key}
+            )
             return _invoke_cli_agent(
                 argv=argv,
                 workspace=workspace,
@@ -961,7 +1009,9 @@ class CursorProvider(AgentRunnerProvider):
             if self.extra_args:
                 argv += shlex.split(self.extra_args)
 
-            env: dict[str, str] = {**os.environ, "CURSOR_API_KEY": self.api_key}
+            env: dict[str, str] = _build_cli_env(
+                extra_vars={"CURSOR_API_KEY": self.api_key}
+            )
             return _invoke_cli_agent(
                 argv=argv,
                 workspace=workspace,
@@ -1044,7 +1094,9 @@ class CodexProvider(AgentRunnerProvider):
             if self.extra_args:
                 argv += shlex.split(self.extra_args)
 
-            env: dict[str, str] = {**os.environ, "OPENAI_API_KEY": self.api_key}
+            env: dict[str, str] = _build_cli_env(
+                extra_vars={"OPENAI_API_KEY": self.api_key}
+            )
             return _invoke_cli_agent(
                 argv=argv,
                 workspace=workspace,
@@ -2158,6 +2210,22 @@ def main() -> int:
                 workspace=workspace,
                 output_dir=workspace,
             )
+            # Enforce max_inline_comments on the agent-runner path too. The
+            # tool handler enforces this for chat-completions providers; the
+            # cap is a documented safety control (docs/SECURITY.md) that
+            # applies to every provider family.
+            if len(result.findings) > max_inline_comments:
+                dropped: int = len(result.findings) - max_inline_comments
+                log(
+                    f"Agent-runner provider produced {len(result.findings)} "
+                    f"findings; capping to max-inline-comments="
+                    f"{max_inline_comments} ({dropped} dropped)"
+                )
+                result.findings = result.findings[:max_inline_comments]
+                # Recompute overall_severity — dropping the tail may lower it.
+                result.overall_severity = overall_severity(
+                    [f.severity for f in result.findings]
+                )
         else:
             # Chat-completions path: this action owns the tool-use loop.
             messages: list[dict[str, Any]] = [

@@ -249,6 +249,55 @@ class CliBinaryConstantsTests(unittest.TestCase):
         )
 
 
+class CliEnvAllowlistTests(unittest.TestCase):
+    """`_build_cli_env` forwards only the allowlist + provided extras.
+
+    Prevents leaking AIPRR_GH_TOKEN and other consumer secrets into the
+    vendor CLI subprocess. See Security Review §2.
+    """
+
+    def test_allowlist_only_forwarded(self) -> None:
+        prev = dict(os.environ)
+        try:
+            # Populate a mix of allowed and disallowed vars.
+            os.environ.clear()
+            os.environ.update(
+                {
+                    "PATH": "/usr/bin",
+                    "HOME": "/root",
+                    "AIPRR_GH_TOKEN": "ghp_secret",
+                    "AIPRR_API_KEY": "sk-secret",
+                    "MY_CUSTOM_LEAK": "leak-me",
+                }
+            )
+            env = reviewer._build_cli_env(extra_vars={"VENDOR_KEY": "vk"})
+            self.assertEqual(env.get("PATH"), "/usr/bin")
+            self.assertEqual(env.get("HOME"), "/root")
+            self.assertEqual(env.get("VENDOR_KEY"), "vk")
+            self.assertNotIn("AIPRR_GH_TOKEN", env)
+            self.assertNotIn("AIPRR_API_KEY", env)
+            self.assertNotIn("MY_CUSTOM_LEAK", env)
+        finally:
+            os.environ.clear()
+            os.environ.update(prev)
+
+    def test_extra_vars_override_missing_from_env(self) -> None:
+        env = reviewer._build_cli_env(extra_vars={"ANTHROPIC_API_KEY": "AK"})
+        self.assertEqual(env["ANTHROPIC_API_KEY"], "AK")
+
+    def test_no_gh_token_ever_reaches_env(self) -> None:
+        prev = dict(os.environ)
+        try:
+            os.environ["AIPRR_GH_TOKEN"] = "ghp_should_not_leak"
+            env = reviewer._build_cli_env(
+                extra_vars={"OPENAI_API_KEY": "sk-x"}
+            )
+            self.assertNotIn("AIPRR_GH_TOKEN", env)
+        finally:
+            os.environ.clear()
+            os.environ.update(prev)
+
+
 class SecurityInvariantsTests(unittest.TestCase):
     """No shell=True, all agent-extra-args go through shlex.split."""
 
