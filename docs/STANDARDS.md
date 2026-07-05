@@ -57,7 +57,8 @@ Keep branch names short. Long branches show up in `gh pr view` and break termina
 
 ## File layout
 
-- **Runtime:** `scripts/reviewer.py`. One file. Add helpers as functions, not new files, unless adding a new file is unavoidable (e.g. provider-specific code that's >300 LOC and warrants isolation — even then, prefer a single file).
+- **Runtime:** `scripts/reviewer.py`. One file. Add helpers as functions, not new files, unless adding a new file is unavoidable (e.g. provider-specific code that's >300 LOC and warrants isolation — even then, prefer a single file). The four v1.1.0 CLI provider impls each stayed well under that budget by sharing the `_invoke_cli_agent` / `_build_cli_env` helpers rather than each rolling their own.
+- **Tests:** `tests/test_<area>.py`. Split by concern (core, findings parser, agent-runner providers, roundtrip). See [DEVELOPMENT_GUIDELINES.md](DEVELOPMENT_GUIDELINES.md#test-discipline).
 - **Default prompt:** `prompts/default.md`. Keep one. Don't fork into multiple defaults.
 - **User-facing docs:** `docs/STRICTNESS.md`, `docs/PROMPTS.md`, `docs/PROVIDERS.md`. Each ~300–500 lines max; split if longer.
 - **Contributor docs:** `docs/ARCHITECTURE.md`, `docs/SECURITY.md`, etc.
@@ -70,9 +71,10 @@ All code, comments, documentation, commit messages, and PR descriptions are in E
 
 ## File size
 
-- `scripts/reviewer.py` — keep under 3000 LOC. We're at ~1500 today. If the file approaches the limit, the conversation is "should we split into multiple files" — make that decision deliberately, not by drift.
+- `scripts/reviewer.py` — soft ceiling ~4000 LOC. We're at ~2400 today (up from ~1500 pre-v1.1.0). The v1.1.0 growth was all in one place: the two provider families plus the three CLI provider impls. If the file approaches the limit, the conversation is "should we split into multiple files" — make that decision deliberately, not by drift.
 - Doc files — under 500 lines. Long docs are signal that they need to be split.
 - Examples — under 50 lines each. They're showcase, not reference.
+- Test files — under 500 lines. Split by concern rather than growing an existing file (the current four-file split is the model).
 
 ## Whitespace and formatting
 
@@ -97,8 +99,9 @@ See [TESTING_GUIDE.md](TESTING_GUIDE.md). The summary:
 
 - `py_compile` is the static gate.
 - `actionlint` is the workflow gate.
-- `self-review.yml` is the integration gate (dogfooding).
-- Unit tests are welcome for pure-function logic only, using stdlib `unittest`.
+- The stdlib `unittest` suite in `tests/` is the unit gate (109 tests, no third-party deps).
+- `cli-install-smoke` is the CLI-installer gate (matrix over the three agent-runner providers).
+- `self-review.yml` is the integration gate (dogfooding across the 4-leg provider matrix).
 
 ## Security
 
@@ -106,7 +109,7 @@ See [SECURITY.md](SECURITY.md). The summary:
 
 - Stdlib runtime, zero external deps.
 - All paths through `safe_repo_path()`.
-- No `shell=True` in subprocess.
+- No `shell=True` in subprocess; `shlex.split()` on any user-provided arg string; `_build_cli_env()` scrubs the vendor-CLI environment via `_CLI_ENV_ALLOWLIST`.
 - Tool args logged with `redact_for_log()`.
 - Vulnerabilities reported via private GitHub security advisory.
 
