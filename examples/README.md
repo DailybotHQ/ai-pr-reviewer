@@ -10,6 +10,10 @@
 | [`label-gated.yml`](label-gated.yml) | Only run when the PR carries a specific label (e.g. `ready`); apply another label after a successful review (e.g. `pr-reviewed`). Keeps work-in-progress noise out of the review queue. |
 | [`strict.yml`](strict.yml) | Fail the GitHub check on critical (or critical + warning) findings — pair with a branch-protection rule that requires the check to pass. |
 | [`custom-prompt.yml`](custom-prompt.yml) | Point the action at a house-rules prompt inside the consumer's own repo. |
+| [`provider-claude-code.yml`](provider-claude-code.yml) | Use the Claude Code CLI (agent-runner) instead of the direct Anthropic API. |
+| [`provider-cursor.yml`](provider-cursor.yml) | Use the Cursor Agent CLI (agent-runner) for review. |
+| [`provider-codex.yml`](provider-codex.yml) | Use the OpenAI Codex CLI (agent-runner) for review. |
+| [`mcp-passthrough.yml`](mcp-passthrough.yml) | Inject a custom MCP servers config into whichever CLI provider you picked. |
 
 Each file is self-contained and ready to drop into `.github/workflows/` in a downstream project.
 
