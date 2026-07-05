@@ -48,11 +48,28 @@ jobs:
             api-key-secret: OPENAI_API_KEY
             applied-label: 'self-reviewed:codex'
     steps:
+      - name: Skip when provider secret is unset
+        id: gate
+        shell: bash
+        env:
+          API_KEY: ${{ secrets[matrix.api-key-secret] }}
+          PROVIDER: ${{ matrix.provider }}
+          SECRET_NAME: ${{ matrix.api-key-secret }}
+        run: |
+          if [[ -z "${API_KEY}" ]]; then
+            echo "::notice::${SECRET_NAME} is not configured for this repo; skipping the ${PROVIDER} leg."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.gate.outputs.skip != 'true'
         with:
           fetch-depth: 0
 
       - name: Run AI PR Reviewer (local checkout, provider=${{ matrix.provider }})
+        if: steps.gate.outputs.skip != 'true'
         # `./` resolves to this repo's checkout — i.e. we use the version
         # of the action that this PR is proposing, not the published one.
         # This is the canonical "test in CI" setup for action repos.
