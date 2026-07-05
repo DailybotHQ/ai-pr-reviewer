@@ -208,16 +208,22 @@ def redact_for_log(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def truncate_for_tool(text: str, *, label: str) -> str:
-    """Cap tool output so a single bad command can't blow up the prompt."""
+    """Cap tool output so a single bad command can't blow up the prompt.
+
+    Guarantees `len(output.encode("utf-8")) <= MAX_TOOL_OUTPUT_BYTES` by
+    reserving space for the truncation notice inside the byte budget.
+    """
     if len(text.encode("utf-8")) <= MAX_TOOL_OUTPUT_BYTES:
         return text
-    truncated: str = text.encode("utf-8")[:MAX_TOOL_OUTPUT_BYTES].decode(
-        "utf-8", errors="ignore"
-    )
-    return (
-        f"{truncated}\n\n[output truncated at {MAX_TOOL_OUTPUT_BYTES} bytes — "
+    notice: str = (
+        f"\n\n[output truncated at {MAX_TOOL_OUTPUT_BYTES} bytes — "
         f"narrow your {label} call (e.g. add path/glob/limit) for full content]"
     )
+    body_budget: int = max(0, MAX_TOOL_OUTPUT_BYTES - len(notice.encode("utf-8")))
+    truncated: str = text.encode("utf-8")[:body_budget].decode(
+        "utf-8", errors="ignore"
+    )
+    return truncated + notice
 
 
 def run_cmd(
@@ -1509,7 +1515,10 @@ def tool_read_file(args: dict[str, Any]) -> str:
     limit: int = min(
         MAX_FILE_READ_LINES, int(args.get("limit", MAX_FILE_READ_LINES))
     )
-    path: Path = safe_repo_path(rel)
+    try:
+        path: Path = safe_repo_path(rel)
+    except ValueError as e:
+        return f"Error: {e}"
     if not path.exists() or not path.is_file():
         return f"Error: file not found: {rel}"
     with path.open("r", encoding="utf-8", errors="replace") as f:
