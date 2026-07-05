@@ -1,0 +1,45 @@
+# Claude Code CLI provider (agent-runner family, v1.1.0+).
+#
+# The action installs `@anthropic-ai/claude-code` via npm and runs Claude Code
+# in headless mode. Compared to `provider: anthropic` (direct Messages API),
+# this path gets the vendor-tuned coding-agent baseline system prompt, LSP
+# integration, and semantic-search tools that Claude Code ships out of the box.
+#
+# Auth: your Anthropic API key. The action forwards it as ANTHROPIC_API_KEY
+# to the CLI subprocess — same secret as `provider: anthropic`.
+
+name: PR review (Claude Code)
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize]
+
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    # Higher timeout — the CLI's own agentic loop can be longer than the
+    # chat-completions path, especially on larger PRs.
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: DailybotHQ/ai-pr-reviewer@v1
+        with:
+          provider: claude-code
+          api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Optional: pin the CLI so a mid-week vendor release doesn't
+          # change review behaviour under you.
+          # claude-code-version: '2.0.4'
+          # Optional: constrain the internal turn count of the CLI's own
+          # agentic loop. Empty = provider default (usually generous).
+          # agent-max-turns: '20'

@@ -64,8 +64,8 @@ That's the minimum. Open a PR; the action posts a tracking comment, runs a revie
 |---|---|---|---|
 | `api-key` | ✅ | — | Provider API key. For Anthropic this is your `ANTHROPIC_API_KEY`. |
 | `github-token` | ✅ | — | Token with `pull-requests: write` and `contents: read`. The default `secrets.GITHUB_TOKEN` works; pass a PAT or automation-bot token if you want the review attributed to a specific account. |
-| `provider` | | `anthropic` | LLM provider. v1 supports Anthropic only; OpenAI/Gemini are on the roadmap (see [docs/PROVIDERS.md](docs/PROVIDERS.md)). |
-| `model` | | provider default (`claude-sonnet-4-6`) | Model id for the chosen provider. |
+| `provider` | | `anthropic` | LLM provider. `anthropic` (chat-completions), `claude-code` / `cursor` / `codex` (agent-runner CLIs). See [docs/PROVIDERS.md](docs/PROVIDERS.md). |
+| `model` | | provider default | Model id. Anthropic → `claude-sonnet-4-6`, Cursor → `composer-2.5`, Codex → `gpt-5-codex`, Claude Code → account default. |
 | `prompt-file` | | bundled `prompts/default.md` | Path **inside the consumer checkout** to a markdown system prompt. Customising the prompt is the main lever for adapting the review to your codebase — see [docs/PROMPTS.md](docs/PROMPTS.md). |
 | `label-gate` | | `''` | If non-empty, the review only runs when the PR carries this label (e.g. `ready`). |
 | `applied-label` | | `''` | If non-empty, this label is applied to the PR after a successful, non-blocked review (e.g. `pr-reviewed`). The label is auto-created if it doesn't exist. |
@@ -73,7 +73,13 @@ That's the minimum. Open a PR; the action posts a tracking comment, runs a revie
 | `tracking-comment` | | `true` | Post a spinner comment that transitions to the final review URL. |
 | `strictness` | | `lenient` | `lenient` / `block-on-critical` / `block-on-warning` — see [docs/STRICTNESS.md](docs/STRICTNESS.md). |
 | `max-inline-comments` | | `10` | Hard cap on inline comments per review. |
-| `max-turns` | | `30` | Hard cap on the agentic-loop iterations. |
+| `max-turns` | | `30` | Hard cap on the agentic-loop iterations (chat-completions providers only). |
+| `agent-max-turns` | | `''` | Cap on the CLI provider's internal turn count. Empty = provider default. Ignored for chat-completions providers. |
+| `agent-extra-args` | | `''` | Raw string appended to the CLI invocation. Parsed with `shlex.split` (never `shell=True`). Escape hatch for provider-specific flags. |
+| `mcp-config-file` | | `''` | Path inside the consumer checkout to an MCP servers JSON config. If set, the file is copied to the CLI's expected location before invocation. |
+| `claude-code-version` | | `''` | Pin the Claude Code CLI version (npm semver). Empty = latest. |
+| `cursor-version` | | `''` | Pin the Cursor Agent CLI version. Empty = latest stable. |
+| `codex-version` | | `''` | Pin the OpenAI Codex CLI version (npm semver). Empty = latest. |
 
 ## Outputs
 
@@ -187,14 +193,22 @@ For the full design, see [docs/PROVIDERS.md](docs/PROVIDERS.md), [docs/PROMPTS.m
 
 ## Provider roadmap
 
-| Provider | Status | Notes |
-|---|---|---|
-| Anthropic (Claude) | ✅ shipping | Sonnet 4.6 default; any tool-use-capable model works. |
-| OpenAI | 🛠 roadmap | Tool-use schema translation; planned for v1.1. |
-| Google (Gemini) | 🛠 roadmap | Function-calling translation; planned for v1.2. |
-| Azure OpenAI | 🛠 roadmap | Same as OpenAI plus deployment-name support. |
+| Provider | Family | Status | Notes |
+|---|---|---|---|
+| Anthropic (Claude) | chat-completions | ✅ shipping | Sonnet 4.6 default. Zero CLI install. |
+| Claude Code CLI | agent-runner | 🚧 v1.1.0 (in progress) | `@anthropic-ai/claude-code` npm CLI in headless mode. Uses `ANTHROPIC_API_KEY`. |
+| Cursor Agent CLI | agent-runner | 🚧 v1.1.0 (in progress) | `cursor-agent` local CLI in headless mode. Uses `CURSOR_API_KEY`. |
+| OpenAI Codex CLI | agent-runner | 🚧 v1.1.0 (in progress) | `@openai/codex` npm CLI in headless mode. Uses `OPENAI_API_KEY`. |
+| OpenAI (raw API) | chat-completions | 🛠 roadmap (v1.2) | Direct chat-completions, no CLI install. |
+| Google Gemini | chat-completions | 🛠 roadmap (v1.2) | Function-calling translation. |
+| AWS Bedrock | chat-completions | 🤔 considering | Anthropic-shape under Bedrock. |
 
-The internal `Provider` interface in `scripts/reviewer.py` is the seam; adding a provider means implementing one class and registering it in `build_provider()`. Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+**Two provider families:**
+
+- **`Provider`** (chat-completions family) — the action owns the tool-use loop, calling the model's API in a bounded turn count. No install step needed. Zero overhead for consumers.
+- **`AgentRunnerProvider`** (agent-runner family) — a vendor's coding-agent CLI owns the tool-use loop; we shell out in headless mode and receive findings via `.aiprr/findings.json`. Better code comprehension (vendor-tuned tools, LSP, semantic search) at the cost of a CLI install step (only when the consumer opts in — modular install; see [docs/PROVIDERS.md](docs/PROVIDERS.md)).
+
+Adding a new provider means implementing one class and registering it in `build_provider()`. Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 

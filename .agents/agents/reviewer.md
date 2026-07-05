@@ -63,17 +63,22 @@ Run through this in order:
 - Any new tool that takes a path argument routes through `safe_repo_path()`.
 - Any new subprocess call uses an explicit argv list, never `shell=True`.
 - Any new tool argument that might leak a secret if echoed by a prompt-injected model is covered by the `LOG_REDACT_SUBSTRINGS` filter.
+- **Agent-runner subprocesses (v1.1.0+):** env built via `_build_cli_env(extra_vars=...)` — never `{**os.environ, ...}`. `extra_args` funnelled through `shlex.split` — never string-concat into argv. CLI invocation delegates to `_invoke_cli_agent` — never a bare `subprocess.run` (skipping it means skipping the timeout + stderr-tail-on-error handling).
 
 ### 6. Conversation correctness
 
 - Changes to the agentic loop respect the "prune in pairs" invariant (assistant + matching tool_results dropped together).
 - Changes to the tool list also update the `tools_schema()` JSON schema with valid input definitions.
+- **Provider-family dispatch (v1.1.0+):** if code touches `main()` around `isinstance(provider, AgentRunnerProvider)`, both branches must remain exhaustive — the shared submission path expects a `ReviewResult` regardless of family.
 
 ### 7. Marker / public-contract stability
 
 - The marker constant `<!-- ai-pr-reviewer-marker -->` is unchanged.
 - `Provider.complete()` signature is unchanged.
+- `AgentRunnerProvider.run_review()` signature is unchanged (also part of the contract; changing it breaks in-tree providers).
+- `.aiprr/findings.json` schema is unchanged (or evolved additively — unknown keys are already ignored by `parse_findings_file`).
 - Exit-code semantics (`0` / `1` / `2`) are unchanged.
+- `max_inline_comments` cap remains enforced on **both** provider-family paths (chat-completions via `tool_post_inline_comment`, agent-runner via `main()` truncation).
 
 ### 8. Documentation in sync
 
@@ -104,7 +109,7 @@ After reviewing, produce a Markdown report with:
 
 ## Anti-patterns to flag every time
 
-- Adding a non-stdlib import.
+- Adding a non-stdlib **runtime** import.
 - Renaming an `action.yml` input/output without a major-version-break discussion.
 - Inline magic numbers (promote to a named constant at the top of the file).
 - Broad `except` without `# noqa` and a comment.
@@ -112,6 +117,12 @@ After reviewing, produce a Markdown report with:
 - A tool implementation that doesn't return a string for the `tool_result`.
 - Logging anything that contains an env var matching the redaction substrings.
 - Edits at `.claude/...` or `CLAUDE.md` (those are symlinks; edit the canonical paths).
+- **Agent-runner-specific (v1.1.0+):**
+  - `{**os.environ, "<VAR>": v}` in a `subprocess.run` — bypasses `_build_cli_env`, leaks `AIPRR_GH_TOKEN`.
+  - String-concatenating `extra_args` into an argv list — bypasses `shlex.split`.
+  - Bare `subprocess.run(..., cwd=workspace)` in a provider `run_review` — bypasses `_invoke_cli_agent`.
+  - New agent-runner provider without a corresponding leg in `.github/workflows/self-review.yml` and `code_check.yml > cli-install-smoke`.
+  - New CLI install step in `action.yml` without the `if: inputs.provider == '<id>'` guard — undoes the modular-install promise.
 
 ## Tone
 

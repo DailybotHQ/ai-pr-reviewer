@@ -18,7 +18,7 @@ For the philosophy of why these exist and when to use each, see [docs/AI_AGENT_C
 |---|---|---|---|
 | [`reviewer`](../agents/reviewer.md) | 2 | Code review and standards enforcement | After any non-trivial change to `scripts/reviewer.py`, `action.yml`, or `prompts/default.md`. |
 | [`prompt-engineer`](../agents/prompt-engineer.md) | 3 | System-prompt design and evaluation | Substantive prompt changes; severity-calibration shifts; investigating systematic misclassifications. |
-| [`provider-implementer`](../agents/provider-implementer.md) | 3 | Provider implementation and message-shape translation | Adding a new LLM provider (OpenAI, Gemini, Bedrock, self-hosted). |
+| [`provider-implementer`](../agents/provider-implementer.md) | 3 | Provider implementation across **both** families (chat-completions + agent-runner) | Adding a new LLM provider — raw-API family (OpenAI, Gemini, Bedrock, self-hosted vLLM/Ollama) **or** coding-agent CLI family (Aider, Continue, Copilot CLI, …). |
 
 ## Skills
 
@@ -26,7 +26,7 @@ For the philosophy of why these exist and when to use each, see [docs/AI_AGENT_C
 |---|---|---|---|
 | [`release`](../skills/release/SKILL.md) | 2 | release | Cutting a new `vX.Y.Z` tag and publishing the GitHub Release. |
 | [`prompt-test`](../skills/prompt-test/SKILL.md) | 2 | evaluate | Producing before/after evidence for a prompt change. Required for any non-trivial `prompts/default.md` PR. |
-| [`add-provider`](../skills/add-provider/SKILL.md) | 3 | scaffold | Scaffolding a new `Provider` implementation (class, registry, defaults, inputs, docs). |
+| [`add-provider`](../skills/add-provider/SKILL.md) | 3 | scaffold | Scaffolding a new provider — either chat-completions (`Provider`) or agent-runner (`AgentRunnerProvider`). Handles class, registry, defaults, action.yml inputs, install steps, dogfooding matrix legs, examples, docs. |
 | [`deepworkplan`](../skills/deepworkplan/SKILL.md) | 3 | methodology | Structured plan-execute-verify loop for novel/large work. Router + eight sub-skills (`create`, `execute`, `refine`, `resume`, `status`, `verify`, `onboard`, `author`). Backed by the `dwp-*` / `skill-create` / `agent-create` slash commands. |
 
 ## Slash commands

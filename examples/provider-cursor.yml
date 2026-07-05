@@ -1,0 +1,41 @@
+# Cursor Agent CLI provider (agent-runner family, v1.1.0+).
+#
+# The action installs `cursor-agent` (local runtime) and runs it in headless
+# mode. Cursor's coding-agent baseline system prompt + its own set of tools
+# (LSP-backed navigation, semantic search, MCP) drive the review; the
+# reviewer.py runtime unifies the output via .aiprr/findings.json.
+#
+# Auth: your Cursor API key (Settings → API keys in cursor.com). The action
+# forwards it as CURSOR_API_KEY to the CLI subprocess.
+
+name: PR review (Cursor Agent)
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize]
+
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: DailybotHQ/ai-pr-reviewer@v1
+        with:
+          provider: cursor
+          api-key: ${{ secrets.CURSOR_API_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Optional: pick a Cursor Composer model (default: composer-2.5).
+          # model: composer-2.5
+          # Optional: pin the CLI version.
+          # cursor-version: '2025.11.01'

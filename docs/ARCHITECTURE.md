@@ -58,7 +58,7 @@ The entire runtime in one file. Sections, in source order:
 1. **Constants** — every magic number is a named module-level constant. URLs, timeouts, retry delays, severity ranks.
 2. **Logging utilities** — `log()`, `redact_for_log()`, `truncate_for_tool()`. The redaction list is the gate that prevents accidental token leakage in tool-arg logging.
 3. **GitHub API helpers** — `gh_request`, `gh_graphql`, `gh_post_issue_comment`, `gh_apply_label`, `gh_collapse_previous_reviews`, `gh_submit_review`, `gh_submit_review_with_fallback`. Pure stdlib `urllib`; no `requests`, no `gh` CLI.
-4. **Provider abstraction** — `Provider` base class + `AnthropicProvider`. The contract: `complete(system_prompt, messages, tools) -> dict`. Anthropic-shaped messages are the in-memory representation; future providers translate at the boundary.
+4. **Provider abstraction** — Two peers: `Provider` (chat-completions family; action owns the tool-use loop) and `AgentRunnerProvider` (agent-runner family; vendor CLI owns the tool-use loop, communicates via `.aiprr/findings.json`). `AnthropicProvider` is the shipping `Provider`; `ClaudeCodeProvider`, `CursorProvider`, `CodexProvider` are the shipping `AgentRunnerProvider`s. `build_provider()` returns either type; `main()` dispatches via `isinstance`.
 5. **PR context** — `PRContext` dataclass + `fetch_pr_context()`. Pulls metadata + the unified diff as the agentic loop's seed user message.
 6. **Tool definitions** — `tools_schema()` and the per-tool implementations (`tool_read_file`, `tool_grep`, `tool_glob`, `tool_post_inline_comment`, `tool_submit_review`). Each tool implementation handles its own errors and returns a string for the `tool_result`.
 7. **Severity / strictness** — `overall_severity()` aggregates the per-comment severities; `evaluate_strictness()` maps `(severity, strictness)` to a blocking decision.
@@ -117,6 +117,36 @@ Distinguishing 1 from 2 lets the consumer's workflow `if:` clauses tell "the bot
 
 The Anthropic provider sends the system prompt with `cache_control: ephemeral` so a long custom prompt only pays the full token cost on the first turn of each review. Subsequent turns within the same review (and within the ~5-minute cache TTL) read from cache. This is what makes long, opinionated prompts economically viable.
 
+### 8. Two provider families (v1.1.0+)
+
+The runtime supports two disjoint provider families, unified by the `ReviewResult` dataclass:
+
+**Chat-completions (`Provider`)** — the action owns the tool-use loop:
+- Calls the vendor's messages/completions endpoint directly.
+- Executes tool calls (`read_file`, `grep`, `glob`, `post_inline_comment`, `submit_review`) from `scripts/reviewer.py` in-process.
+- Pros: zero install overhead for consumers; deterministic tool set; direct control.
+- Cons: reinvents the wheel of code comprehension; no LSP; no vendor-tuned coding-agent prompt.
+- Shipping: `AnthropicProvider` (`provider: anthropic`).
+
+**Agent-runner (`AgentRunnerProvider`)** — the vendor's coding-agent CLI owns the tool-use loop:
+- Subprocess-invokes the CLI in headless mode with the layered prompt.
+- CLI runs its own agentic loop with vendor-tuned tools (LSP-backed navigation, semantic search, MCP).
+- Communicates back via the file-based `.aiprr/findings.json` contract (schema in [PROVIDERS.md](PROVIDERS.md)).
+- Pros: better code comprehension out of the box; MCP passthrough; vendor keeps their tool set current.
+- Cons: install step on the runner; larger LOC-per-review cost since the CLI can spend more turns.
+- Shipping: `ClaudeCodeProvider`, `CursorProvider`, `CodexProvider`.
+
+**Convergence point:** both families produce a `ReviewResult(summary, findings, overall_severity)` that flows into the SAME submission path (`gh_submit_review_with_fallback` — accepts a `ReviewResult`, encodes findings into the GitHub Reviews inline shape at the boundary). This means the strictness gate, tracking comment renderers, and action outputs are provider-agnostic.
+
+### 9. Modular CLI install (v1.1.0+)
+
+The composite action's `runs.steps` list contains ONE install step per CLI provider, each guarded by `if: inputs.provider == '...'`. Consumers picking `provider: anthropic` (the default) see zero install overhead. Consumers picking `provider: cursor` see only the Cursor Agent installer run, etc. No consumer ever has all three CLIs installed on their runner.
+
+Each install step:
+1. Sets up its runtime dependency (Node.js for Claude Code and Codex; nothing for Cursor).
+2. Runs the vendor's install command, optionally pinned via the corresponding `*-version` input.
+3. Emits a `--version` line as a smoke assertion — if the binary is not on PATH, the composite step fails loudly here instead of the reviewer's `install()` sanity check firing 20 lines later.
+
 ## What lives where
 
 | Concern | Lives in |
@@ -126,7 +156,9 @@ The Anthropic provider sends the system prompt with `cache_control: ephemeral` s
 | Detailed user-facing guides | `docs/STRICTNESS.md`, `docs/PROMPTS.md`, `docs/PROVIDERS.md` |
 | Runtime constants (limits, timeouts, ranks) | top of `scripts/reviewer.py` |
 | Internal env-var contract (`AIPRR_*`) | `action.yml` `env:` block + `scripts/reviewer.py` `main()` |
-| Provider abstraction | `Provider` class + `build_provider()` in `scripts/reviewer.py` |
+| Provider abstraction | `Provider` + `AgentRunnerProvider` classes + `build_provider()` in `scripts/reviewer.py` |
+| Findings.json parser + schema | `parse_findings_file()` + `write_findings_prompt_directive()` in `scripts/reviewer.py`; user-facing schema in `docs/PROVIDERS.md` |
+| CLI install steps (modular, conditional) | `action.yml` `runs.steps` block, one `if:`-guarded step per CLI provider |
 | Default prompt | `prompts/default.md` |
 | CI strategy | `.github/workflows/ci.yml`, `.github/workflows/self-review.yml` |
 | Release strategy | `.github/workflows/release.yml`, `CHANGELOG.md` |

@@ -22,7 +22,8 @@ self-hosted runner that has Python 3.10+.
 
 Environment (set by the composite action's `env:` block; see action.yml):
 
-    AIPRR_PROVIDER           Provider id (currently only `anthropic`).
+    AIPRR_PROVIDER           Provider id (`anthropic`, `claude-code`, `cursor`,
+                            or `codex`).
     AIPRR_API_KEY            Provider API key.
     AIPRR_GH_TOKEN           GitHub token for PR/review operations.
     AIPRR_MODEL              Model id (empty = provider default).
@@ -49,6 +50,8 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -70,11 +73,18 @@ GITHUB_REST_BASE: str = "https://api.github.com"
 GITHUB_GRAPHQL_URL: str = "https://api.github.com/graphql"
 
 # Provider defaults — keyed by `AIPRR_PROVIDER`. Adding a new provider means:
-#   1. New entry here for the default model id.
-#   2. New `Provider` implementation below.
+#   1. New entry here for the default model id (or a sentinel like "auto" for
+#      agent-runner CLIs that pick their own default at invocation time).
+#   2. New `Provider` or `AgentRunnerProvider` implementation below.
 #   3. New branch in `build_provider()`.
 DEFAULT_MODELS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-6",
+    # Agent-runner (CLI) providers — empty means "let the CLI pick its own
+    # default at runtime" (usually the account-tier default for that vendor).
+    # A `model:` input from the consumer overrides this.
+    "claude-code": "auto",
+    "cursor": "composer-2.5",
+    "codex": "gpt-5-codex",
 }
 
 DEFAULT_MAX_TURNS: int = 30
@@ -155,6 +165,21 @@ SEVERITY_RANK: dict[str, int] = {
 # the most recent review unambiguously, even if other bots also comment.
 REVIEW_MARKER: str = "<!-- ai-pr-reviewer-marker -->"
 
+# Agent-runner findings contract (see AgentRunnerProvider docstring).
+# Each CLI provider writes its findings to `<output_dir>/<FINDINGS_JSON_REL>`
+# before exiting; `parse_findings_file` reads + validates that file.
+FINDINGS_JSON_REL: str = ".aiprr/findings.json"
+ALLOWED_SEVERITIES: tuple[str, ...] = (
+    SEVERITY_CRITICAL,
+    SEVERITY_WARNING,
+    SEVERITY_INFO,
+)
+ALLOWED_SIDES: tuple[str, ...] = ("LEFT", "RIGHT")
+
+# Timeout for a single agent-runner CLI invocation (seconds). Aligns with the
+# recommended workflow `timeout-minutes: 15` in examples/*.yml.
+CLI_INVOCATION_TIMEOUT: int = 900
+
 
 # ---------------------------------------------------------------------------
 # Logging / utilities
@@ -183,16 +208,22 @@ def redact_for_log(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def truncate_for_tool(text: str, *, label: str) -> str:
-    """Cap tool output so a single bad command can't blow up the prompt."""
+    """Cap tool output so a single bad command can't blow up the prompt.
+
+    Guarantees `len(output.encode("utf-8")) <= MAX_TOOL_OUTPUT_BYTES` by
+    reserving space for the truncation notice inside the byte budget.
+    """
     if len(text.encode("utf-8")) <= MAX_TOOL_OUTPUT_BYTES:
         return text
-    truncated: str = text.encode("utf-8")[:MAX_TOOL_OUTPUT_BYTES].decode(
-        "utf-8", errors="ignore"
-    )
-    return (
-        f"{truncated}\n\n[output truncated at {MAX_TOOL_OUTPUT_BYTES} bytes — "
+    notice: str = (
+        f"\n\n[output truncated at {MAX_TOOL_OUTPUT_BYTES} bytes — "
         f"narrow your {label} call (e.g. add path/glob/limit) for full content]"
     )
+    body_budget: int = max(0, MAX_TOOL_OUTPUT_BYTES - len(notice.encode("utf-8")))
+    truncated: str = text.encode("utf-8")[:body_budget].decode(
+        "utf-8", errors="ignore"
+    )
+    return truncated + notice
 
 
 def run_cmd(
@@ -530,10 +561,13 @@ def gh_submit_review_with_fallback(
     repo: str,
     pr_number: int,
     head_sha: str,
-    body: str,
-    inline_comments: list[dict[str, Any]],
+    result: "ReviewResult",
 ) -> tuple[dict[str, Any], int]:
     """Submit the review; on a 422, retry summary-only and report the drop.
+
+    Consumes a provider-independent `ReviewResult`. Encodes findings into the
+    GitHub Reviews API inline shape at the boundary so agent-runner providers
+    can hand back a `ReviewResult` without knowing the GitHub API schema.
 
     Returns `(review, dropped_count)`. A 422 from `POST /pulls/{n}/reviews`
     rejects the entire request when any single inline comment points at a
@@ -543,13 +577,16 @@ def gh_submit_review_with_fallback(
     With it we drop the inline comments and post summary-only — the original
     422 body is logged so an operator can see which comment was rejected.
     """
+    inline_comments: list[dict[str, Any]] = findings_to_gh_inline_comments(
+        result.findings
+    )
     try:
         review: dict[str, Any] = gh_submit_review(
             token=token,
             repo=repo,
             pr_number=pr_number,
             head_sha=head_sha,
-            body=body,
+            body=result.summary,
             inline_comments=inline_comments,
         )
         return review, 0
@@ -568,7 +605,7 @@ def gh_submit_review_with_fallback(
             repo=repo,
             pr_number=pr_number,
             head_sha=head_sha,
-            body=body,
+            body=result.summary,
             inline_comments=[],
         )
         return review, len(inline_comments)
@@ -663,14 +700,493 @@ class AnthropicProvider(Provider):
         raise last_error
 
 
-def build_provider(provider_id: str, *, api_key: str, model: str) -> Provider:
-    """Construct the provider implementation for `provider_id`."""
+class AgentRunnerProvider:
+    """Provider that delegates the full review to a vendor's coding-agent CLI.
+
+    Unlike `Provider` (chat-completions family — this action owns the tool-use
+    loop), an `AgentRunnerProvider` hands off the entire agentic loop to the
+    vendor CLI running in headless mode and receives structured findings via a
+    file-based contract (`.aiprr/findings.json` — see `parse_findings_file`).
+
+    Concrete implementations (`ClaudeCodeProvider`, `CursorProvider`,
+    `CodexProvider`) live below this class.
+    """
+
+    def install(self) -> None:
+        """Sanity-check that the CLI is on PATH.
+
+        The composite action installs the CLI in a preceding step; this
+        method is a defensive verification, not the install itself.
+        """
+        raise NotImplementedError
+
+    def run_review(
+        self,
+        *,
+        pr_context: PRContext,
+        review_instructions: str,
+        workspace: Path,
+        output_dir: Path,
+    ) -> ReviewResult:
+        """Invoke the vendor CLI headless; return a ReviewResult."""
+        raise NotImplementedError
+
+
+def _swap_mcp_config(
+    src_file: str, dest_path: Path
+) -> tuple[Path | None, str | None]:
+    """Copy an MCP config to a CLI's expected location, backing up the previous.
+
+    Returns `(dest_path_or_None, backup_content_or_None)` so the caller can
+    restore/delete on exit. If `src_file` is empty, both return values are
+    `None` — a no-op that the finally block can safely handle.
+    """
+    if not src_file:
+        return None, None
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    backup: str | None = None
+    if dest_path.exists():
+        backup = dest_path.read_text(encoding="utf-8")
+    shutil.copyfile(src_file, dest_path)
+    return dest_path, backup
+
+
+def _restore_mcp_config(dest_path: Path | None, backup: str | None) -> None:
+    """Restore or delete the MCP config after a CLI invocation."""
+    if dest_path is None:
+        return
+    if backup is not None:
+        dest_path.write_text(backup, encoding="utf-8")
+    else:
+        dest_path.unlink(missing_ok=True)
+
+
+# Environment variables the vendor CLIs need to function on ubuntu-latest.
+# Everything else (notably AIPRR_GH_TOKEN and every other AIPRR_* secret)
+# stays in the parent process. See docs/SECURITY.md and Security Review §2.
+_CLI_ENV_ALLOWLIST: tuple[str, ...] = (
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TERM",
+    "SHELL",
+    # Node.js CLIs (@anthropic-ai/claude-code, @openai/codex).
+    "NODE_PATH",
+    "NPM_CONFIG_PREFIX",
+    "NODE_OPTIONS",
+    # GitHub Actions runner metadata (harmless; useful for debug output).
+    "RUNNER_OS",
+    "RUNNER_ARCH",
+    "GITHUB_ACTIONS",
+    "CI",
+)
+
+
+def _build_cli_env(
+    *, extra_vars: dict[str, str]
+) -> dict[str, str]:
+    """Build a scrubbed environment for a vendor-CLI subprocess.
+
+    Forwards only variables the CLI likely needs to function (PATH,
+    HOME, locale, Node.js paths). Adds `extra_vars` on top (typically
+    the vendor-specific API key). Everything else — notably the
+    consumer's GitHub token and any other secrets in the workflow's
+    env: block — stays in the parent process.
+    """
+    scrubbed: dict[str, str] = {}
+    for name in _CLI_ENV_ALLOWLIST:
+        val: str | None = os.environ.get(name)
+        if val is not None:
+            scrubbed[name] = val
+    scrubbed.update(extra_vars)
+    return scrubbed
+
+
+def _invoke_cli_agent(
+    *,
+    argv: list[str],
+    workspace: Path,
+    findings_path: Path,
+    env: dict[str, str],
+    cli_name: str,
+) -> ReviewResult:
+    """Run a CLI agent subprocess and parse its findings.json output.
+
+    Common to all AgentRunnerProvider implementations. Enforces:
+      - Argv-list form (no `shell=True`) — see docs/SECURITY.md.
+      - Hard timeout via CLI_INVOCATION_TIMEOUT.
+      - Structured error on non-zero exit with truncated stderr.
+      - Delegation to parse_findings_file() for output validation.
+    """
+    log(f"Invoking {cli_name}: {' '.join(shlex.quote(a) for a in argv[:2])} …")
+    try:
+        result = subprocess.run(
+            argv,
+            cwd=str(workspace),
+            env=env,
+            timeout=CLI_INVOCATION_TIMEOUT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"{cli_name} CLI exceeded the timeout of "
+            f"{CLI_INVOCATION_TIMEOUT}s. Consider lowering `agent-max-turns` "
+            f"or narrowing the PR scope."
+        ) from e
+
+    if result.returncode != 0:
+        stderr_tail: str = (result.stderr or "")[-MAX_ERROR_BODY_CHARS:]
+        stdout_tail: str = (result.stdout or "")[-MAX_ERROR_BODY_CHARS:]
+        raise RuntimeError(
+            f"{cli_name} CLI exited with code {result.returncode}. "
+            f"stderr tail: {stderr_tail!r}. stdout tail: {stdout_tail!r}."
+        )
+
+    return parse_findings_file(findings_path)
+
+
+class ClaudeCodeProvider(AgentRunnerProvider):
+    """Claude Code CLI (headless) as an agent-runner provider.
+
+    Auth: `ANTHROPIC_API_KEY` env var (from the consumer's `api-key` input).
+    CLI: `@anthropic-ai/claude-code` on npm. Installed by the composite step
+    in `action.yml` when `provider: claude-code`.
+    """
+
+    CLI_NAME: str = "Claude Code"
+    CLI_BIN: str = "claude"
+    MCP_DEST: Path = Path.home() / ".claude" / "mcp.json"
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        extra_args: str = "",
+        mcp_config_file: str = "",
+    ) -> None:
+        self.api_key: str = api_key
+        self.model: str = model
+        self.extra_args: str = extra_args
+        self.mcp_config_file: str = mcp_config_file
+
+    def install(self) -> None:
+        result = run_cmd([self.CLI_BIN, "--version"])
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"{self.CLI_NAME} CLI not found on PATH. The composite step "
+                "should install `@anthropic-ai/claude-code` before invoking "
+                "reviewer.py."
+            )
+
+    def run_review(
+        self,
+        *,
+        pr_context: PRContext,
+        review_instructions: str,
+        workspace: Path,
+        output_dir: Path,
+    ) -> ReviewResult:
+        findings_path: Path = output_dir / FINDINGS_JSON_REL
+        findings_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Write review instructions (with findings-contract directive) to a
+        # file so we can pass it via --append-system-prompt.
+        instructions_file: Path = output_dir / ".aiprr" / "instructions.md"
+        instructions_file.write_text(
+            write_findings_prompt_directive(review_instructions, findings_path),
+            encoding="utf-8",
+        )
+
+        mcp_dest, mcp_backup = _swap_mcp_config(
+            self.mcp_config_file, self.MCP_DEST
+        )
+        try:
+            user_prompt: str = render_user_prompt(pr_context)
+            argv: list[str] = [
+                self.CLI_BIN,
+                "-p",
+                user_prompt,
+                "--append-system-prompt",
+                str(instructions_file),
+                "--output-format",
+                "stream-json",
+                "--verbose",
+            ]
+            if self.model and self.model != "auto":
+                argv += ["--model", self.model]
+            if self.extra_args:
+                argv += shlex.split(self.extra_args)
+
+            env: dict[str, str] = _build_cli_env(
+                extra_vars={"ANTHROPIC_API_KEY": self.api_key}
+            )
+            return _invoke_cli_agent(
+                argv=argv,
+                workspace=workspace,
+                findings_path=findings_path,
+                env=env,
+                cli_name=self.CLI_NAME,
+            )
+        finally:
+            _restore_mcp_config(mcp_dest, mcp_backup)
+            instructions_file.unlink(missing_ok=True)
+
+
+class CursorProvider(AgentRunnerProvider):
+    """Cursor Agent CLI (headless, local runtime) as an agent-runner provider.
+
+    Auth: `CURSOR_API_KEY` env var (from the consumer's `api-key` input).
+    CLI: `cursor-agent` — installed via `curl -fsSL https://cursor.com/install
+    | bash` by the composite step.
+
+    Local runtime only for v1.1.0 (no `/v1/agents` cloud REST path). The CLI
+    operates against `workspace` directly.
+    """
+
+    CLI_NAME: str = "Cursor Agent"
+    CLI_BIN: str = "cursor-agent"
+    MCP_DEST: Path = Path.home() / ".cursor" / "mcp.json"
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        extra_args: str = "",
+        mcp_config_file: str = "",
+    ) -> None:
+        self.api_key: str = api_key
+        self.model: str = model
+        self.extra_args: str = extra_args
+        self.mcp_config_file: str = mcp_config_file
+
+    def install(self) -> None:
+        result = run_cmd([self.CLI_BIN, "--version"])
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"{self.CLI_NAME} CLI not found on PATH. The composite step "
+                "should install cursor-agent before invoking reviewer.py."
+            )
+
+    def run_review(
+        self,
+        *,
+        pr_context: PRContext,
+        review_instructions: str,
+        workspace: Path,
+        output_dir: Path,
+    ) -> ReviewResult:
+        findings_path: Path = output_dir / FINDINGS_JSON_REL
+        findings_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Cursor Agent CLI does not expose a separate --append-system-prompt;
+        # we inline our review instructions as the front of the user prompt.
+        # The vendor's own code-tuned baseline system prompt still applies.
+        enriched_instructions: str = write_findings_prompt_directive(
+            review_instructions, findings_path
+        )
+        user_prompt: str = (
+            enriched_instructions
+            + "\n\n---\n\n"
+            + render_user_prompt(pr_context)
+        )
+
+        mcp_dest, mcp_backup = _swap_mcp_config(
+            self.mcp_config_file, self.MCP_DEST
+        )
+        try:
+            argv: list[str] = [
+                self.CLI_BIN,
+                "-p",
+                user_prompt,
+                "--output-format",
+                "text",
+            ]
+            if self.model:
+                argv += ["--model", self.model]
+            if self.extra_args:
+                argv += shlex.split(self.extra_args)
+
+            env: dict[str, str] = _build_cli_env(
+                extra_vars={"CURSOR_API_KEY": self.api_key}
+            )
+            return _invoke_cli_agent(
+                argv=argv,
+                workspace=workspace,
+                findings_path=findings_path,
+                env=env,
+                cli_name=self.CLI_NAME,
+            )
+        finally:
+            _restore_mcp_config(mcp_dest, mcp_backup)
+
+
+class CodexProvider(AgentRunnerProvider):
+    """OpenAI Codex CLI (headless) as an agent-runner provider.
+
+    Auth: `OPENAI_API_KEY` env var (from the consumer's `api-key` input).
+    CLI: `@openai/codex` on npm. Installed by the composite step when
+    `provider: codex`.
+    """
+
+    CLI_NAME: str = "OpenAI Codex"
+    CLI_BIN: str = "codex"
+    MCP_DEST: Path = Path.home() / ".codex" / "mcp.json"
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        extra_args: str = "",
+        mcp_config_file: str = "",
+    ) -> None:
+        self.api_key: str = api_key
+        self.model: str = model
+        self.extra_args: str = extra_args
+        self.mcp_config_file: str = mcp_config_file
+
+    def install(self) -> None:
+        result = run_cmd([self.CLI_BIN, "--version"])
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"{self.CLI_NAME} CLI not found on PATH. The composite step "
+                "should install `@openai/codex` before invoking reviewer.py."
+            )
+
+    def run_review(
+        self,
+        *,
+        pr_context: PRContext,
+        review_instructions: str,
+        workspace: Path,
+        output_dir: Path,
+    ) -> ReviewResult:
+        findings_path: Path = output_dir / FINDINGS_JSON_REL
+        findings_path.parent.mkdir(parents=True, exist_ok=True)
+
+        enriched_instructions: str = write_findings_prompt_directive(
+            review_instructions, findings_path
+        )
+        user_prompt: str = (
+            enriched_instructions
+            + "\n\n---\n\n"
+            + render_user_prompt(pr_context)
+        )
+
+        mcp_dest, mcp_backup = _swap_mcp_config(
+            self.mcp_config_file, self.MCP_DEST
+        )
+        try:
+            # Codex CLI headless is `codex exec` (fully non-interactive since
+            # ~v0.2). Older versions used `--print`; the `exec` subcommand
+            # is the stable surface as of Codex CLI 0.5+.
+            argv: list[str] = [
+                self.CLI_BIN,
+                "exec",
+                "--skip-git-repo-check",
+                user_prompt,
+            ]
+            if self.model:
+                argv += ["--model", self.model]
+            if self.extra_args:
+                argv += shlex.split(self.extra_args)
+
+            env: dict[str, str] = _build_cli_env(
+                extra_vars={"OPENAI_API_KEY": self.api_key}
+            )
+            return _invoke_cli_agent(
+                argv=argv,
+                workspace=workspace,
+                findings_path=findings_path,
+                env=env,
+                cli_name=self.CLI_NAME,
+            )
+        finally:
+            _restore_mcp_config(mcp_dest, mcp_backup)
+
+
+def build_provider(
+    provider_id: str, *, api_key: str, model: str
+) -> Provider | AgentRunnerProvider:
+    """Construct the provider implementation for `provider_id`.
+
+    Returns either a `Provider` (chat-completions family, action owns the
+    tool-use loop) or an `AgentRunnerProvider` (vendor CLI owns the loop).
+    `main()` dispatches on the returned instance type.
+    """
     if provider_id == "anthropic":
         return AnthropicProvider(api_key=api_key, model=model)
+
+    # Agent-runner providers share a common constructor shape — extra_args
+    # and mcp_config_file come from the AIPRR_* env vars set by action.yml.
+    extra_args: str = os.environ.get("AIPRR_AGENT_EXTRA_ARGS", "").strip()
+    mcp_config: str = os.environ.get("AIPRR_MCP_CONFIG_FILE", "").strip()
+    if provider_id == "claude-code":
+        return ClaudeCodeProvider(
+            api_key=api_key,
+            model=model,
+            extra_args=extra_args,
+            mcp_config_file=mcp_config,
+        )
+    if provider_id == "cursor":
+        return CursorProvider(
+            api_key=api_key,
+            model=model,
+            extra_args=extra_args,
+            mcp_config_file=mcp_config,
+        )
+    if provider_id == "codex":
+        return CodexProvider(
+            api_key=api_key,
+            model=model,
+            extra_args=extra_args,
+            mcp_config_file=mcp_config,
+        )
     raise ValueError(
         f"Unsupported provider: {provider_id!r}. Currently supported: "
         f"{sorted(DEFAULT_MODELS)}."
     )
+
+
+# ---------------------------------------------------------------------------
+# Provider-independent review payload
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Finding:
+    """A single inline finding, provider-independent.
+
+    Both provider families (chat-completions via `Provider` and agent-runner
+    via `AgentRunnerProvider`) surface findings as this dataclass so the
+    downstream submission / label / strictness paths never need to know
+    which provider produced the review.
+    """
+
+    path: str
+    line: int
+    body: str
+    severity: str = SEVERITY_INFO
+    start_line: int | None = None
+    side: str | None = "RIGHT"
+
+
+@dataclass
+class ReviewResult:
+    """Provider-independent review payload consumed by the submission path."""
+
+    summary: str = ""
+    findings: list[Finding] = field(default_factory=list)
+    overall_severity: str = SEVERITY_NONE
 
 
 # ---------------------------------------------------------------------------
@@ -999,7 +1515,10 @@ def tool_read_file(args: dict[str, Any]) -> str:
     limit: int = min(
         MAX_FILE_READ_LINES, int(args.get("limit", MAX_FILE_READ_LINES))
     )
-    path: Path = safe_repo_path(rel)
+    try:
+        path: Path = safe_repo_path(rel)
+    except ValueError as e:
+        return f"Error: {e}"
     if not path.exists() or not path.is_file():
         return f"Error: file not found: {rel}"
     with path.open("r", encoding="utf-8", errors="replace") as f:
@@ -1140,6 +1659,217 @@ def overall_severity(severities: list[str]) -> str:
         (SEVERITY_RANK.get(s, 0), s) for s in severities
     ]
     return max(ranked)[1]
+
+
+def state_to_review_result(state: "ReviewState") -> ReviewResult:
+    """Adapt a `ReviewState` (populated by `drive_review`) into a `ReviewResult`.
+
+    Bridges the chat-completions provider family into the provider-independent
+    shape the submission path consumes. The CLI (agent-runner) providers
+    produce `ReviewResult` directly via `parse_findings_file`, so the two
+    families converge at this dataclass.
+    """
+    findings: list[Finding] = []
+    for i, comment in enumerate(state.inline_comments):
+        severity: str = (
+            state.severities[i] if i < len(state.severities) else SEVERITY_INFO
+        )
+        findings.append(
+            Finding(
+                path=str(comment.get("path", "")),
+                line=int(comment.get("line", 0)),
+                body=str(comment.get("body", "")),
+                severity=severity,
+                start_line=(
+                    int(comment["start_line"])
+                    if "start_line" in comment
+                    and comment["start_line"] is not None
+                    else None
+                ),
+                side=comment.get("side", "RIGHT"),
+            )
+        )
+    severities: list[str] = [f.severity for f in findings]
+    return ReviewResult(
+        summary=state.final_summary or "",
+        findings=findings,
+        overall_severity=overall_severity(severities),
+    )
+
+
+def parse_findings_file(path: Path) -> ReviewResult:
+    """Parse an agent-runner `findings.json` into a `ReviewResult`.
+
+    Strict validation:
+      - Root MUST be a JSON object.
+      - `findings` MUST be a list (may be empty).
+      - Every finding MUST carry non-empty `path`, integer `line`, non-empty
+        `body`. Missing severity defaults to `info`; unknown severities raise.
+      - Optional `start_line` is coerced to int; optional `side` MUST be one
+        of LEFT/RIGHT (case-normalised).
+      - Unknown top-level or per-finding keys are silently ignored (forward-
+        compat with vendor extensions).
+
+    Raises:
+      - `FileNotFoundError` with an actionable message if the file is missing.
+      - `ValueError` for malformed JSON or schema violations, quoting the
+        offending path/index/value so the caller can surface it to the model.
+    """
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Agent-runner provider did not write {path}. "
+            "The CLI may have crashed, the review-instruction prompt may be "
+            "missing the write-to-file directive, or the workspace path is "
+            "wrong. See docs/PROVIDERS.md for the contract."
+        )
+    try:
+        raw: Any = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        snippet: str = path.read_text(encoding="utf-8")[:MAX_ERROR_BODY_CHARS]
+        raise ValueError(
+            f"Malformed findings.json ({e}). Content head: {snippet!r}"
+        ) from e
+
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"findings.json root must be an object, got {type(raw).__name__}"
+        )
+
+    summary: str = str(raw.get("summary") or "")
+    raw_findings: Any = raw.get("findings") if raw.get("findings") is not None else []
+    if not isinstance(raw_findings, list):
+        raise ValueError(
+            f"'findings' must be a list, got {type(raw_findings).__name__}"
+        )
+
+    findings: list[Finding] = []
+    for i, item in enumerate(raw_findings):
+        if not isinstance(item, dict):
+            raise ValueError(f"finding[{i}] must be an object")
+        try:
+            path_val: str = str(item["path"])
+            line_val: int = int(item["line"])
+            body_val: str = str(item["body"])
+        except (KeyError, TypeError, ValueError) as e:
+            raise ValueError(
+                f"finding[{i}] missing or invalid required field: {e}"
+            ) from e
+        if not path_val:
+            raise ValueError(f"finding[{i}].path is empty")
+        if not body_val.strip():
+            raise ValueError(f"finding[{i}].body is empty")
+
+        severity_val: str = str(item.get("severity") or SEVERITY_INFO).lower()
+        if severity_val not in ALLOWED_SEVERITIES:
+            raise ValueError(
+                f"finding[{i}].severity={severity_val!r} not in "
+                f"{ALLOWED_SEVERITIES}"
+            )
+
+        start_line_val: int | None = None
+        if item.get("start_line") is not None:
+            try:
+                start_line_val = int(item["start_line"])
+            except (TypeError, ValueError) as e:
+                raise ValueError(
+                    f"finding[{i}].start_line must be an integer: {e}"
+                ) from e
+
+        side_val: str | None = "RIGHT"
+        if item.get("side") is not None:
+            side_val = str(item["side"]).upper()
+            if side_val not in ALLOWED_SIDES:
+                raise ValueError(
+                    f"finding[{i}].side={side_val!r} not in {ALLOWED_SIDES}"
+                )
+
+        findings.append(
+            Finding(
+                path=path_val,
+                line=line_val,
+                body=body_val,
+                severity=severity_val,
+                start_line=start_line_val,
+                side=side_val,
+            )
+        )
+
+    severities: list[str] = [f.severity for f in findings]
+    return ReviewResult(
+        summary=summary,
+        findings=findings,
+        overall_severity=overall_severity(severities),
+    )
+
+
+def write_findings_prompt_directive(
+    review_instructions: str, findings_path: Path
+) -> str:
+    """Append the "write your findings to this file" directive to the
+    review instructions handed to an agent-runner CLI.
+
+    Standardised so every CLI provider emits the same schema — the receiving
+    parser (`parse_findings_file`) is a single implementation shared across
+    all providers.
+    """
+    return (
+        review_instructions
+        + "\n\n---\n\n"
+        + "## Output contract (MANDATORY)\n\n"
+        + "Before ending your turn, write your review to the file:\n\n"
+        + f"    {findings_path}\n\n"
+        + "as JSON matching this schema:\n\n"
+        + "```json\n"
+        + "{\n"
+        + '  "summary": "markdown body of the overall review",\n'
+        + '  "findings": [\n'
+        + "    {\n"
+        + '      "path": "repo-relative file path (must appear in the PR diff)",\n'
+        + '      "line": 123,\n'
+        + '      "body": "markdown body of this inline comment",\n'
+        + '      "severity": "critical | warning | info",\n'
+        + '      "start_line": 121,\n'
+        + '      "side": "RIGHT"\n'
+        + "    }\n"
+        + "  ]\n"
+        + "}\n"
+        + "```\n\n"
+        + "Rules:\n"
+        + "- `path` and `line` MUST reference a line that appears in the PR "
+        + "diff. Off-diff lines are rejected by GitHub with HTTP 422 and lose "
+        + "the whole review.\n"
+        + "- `severity` MUST be exactly one of `critical`, `warning`, `info` "
+        + "(lowercase). Choose honestly — it drives the strictness gate.\n"
+        + "- `start_line` and `side` are optional. `side` defaults to `RIGHT` "
+        + "(new code); use `LEFT` for removed code.\n"
+        + "- Empty `findings` is valid — it means "
+        + '"no issues found; just the summary".\n'
+        + "- Only write the file once, at the end. Do NOT stream partials."
+    )
+
+
+def findings_to_gh_inline_comments(
+    findings: list[Finding],
+) -> list[dict[str, Any]]:
+    """Convert a `list[Finding]` into the GitHub Reviews API inline shape.
+
+    Kept separate from `state_to_review_result` so agent-runner providers
+    (which produce `Finding`s directly from `.aiprr/findings.json`) can reuse
+    the same encoder without round-tripping through `ReviewState`.
+    """
+    out: list[dict[str, Any]] = []
+    for f in findings:
+        comment: dict[str, Any] = {
+            "path": f.path,
+            "body": f.body,
+            "line": f.line,
+            "side": f.side or "RIGHT",
+        }
+        if f.start_line is not None:
+            comment["start_line"] = f.start_line
+            comment["start_side"] = f.side or "RIGHT"
+        out.append(comment)
+    return out
 
 
 def evaluate_strictness(
@@ -1473,23 +2203,54 @@ def main() -> int:
             f"{len(pr_ctx.changed_files)} files"
         )
 
-        provider: Provider = build_provider(
+        provider: Provider | AgentRunnerProvider = build_provider(
             provider_id, api_key=api_key, model=model
         )
 
-        messages: list[dict[str, Any]] = [
-            {"role": "user", "content": render_user_prompt(pr_ctx)}
-        ]
-        tools: list[dict[str, Any]] = tools_schema(max_inline_comments)
+        if isinstance(provider, AgentRunnerProvider):
+            # Agent-runner path: vendor CLI owns the tool-use loop. Verify the
+            # CLI is on PATH (defensive — the composite step should have
+            # installed it), then invoke and parse findings.json.
+            provider.install()
+            workspace: Path = Path.cwd()
+            result: ReviewResult = provider.run_review(
+                pr_context=pr_ctx,
+                review_instructions=system_prompt,
+                workspace=workspace,
+                output_dir=workspace,
+            )
+            # Enforce max_inline_comments on the agent-runner path too. The
+            # tool handler enforces this for chat-completions providers; the
+            # cap is a documented safety control (docs/SECURITY.md) that
+            # applies to every provider family.
+            if len(result.findings) > max_inline_comments:
+                dropped: int = len(result.findings) - max_inline_comments
+                log(
+                    f"Agent-runner provider produced {len(result.findings)} "
+                    f"findings; capping to max-inline-comments="
+                    f"{max_inline_comments} ({dropped} dropped)"
+                )
+                result.findings = result.findings[:max_inline_comments]
+                # Recompute overall_severity — dropping the tail may lower it.
+                result.overall_severity = overall_severity(
+                    [f.severity for f in result.findings]
+                )
+        else:
+            # Chat-completions path: this action owns the tool-use loop.
+            messages: list[dict[str, Any]] = [
+                {"role": "user", "content": render_user_prompt(pr_ctx)}
+            ]
+            tools: list[dict[str, Any]] = tools_schema(max_inline_comments)
 
-        drive_review(
-            provider=provider,
-            system_prompt=system_prompt,
-            messages=messages,
-            tools=tools,
-            state=state,
-            max_turns=max_turns,
-        )
+            drive_review(
+                provider=provider,
+                system_prompt=system_prompt,
+                messages=messages,
+                tools=tools,
+                state=state,
+                max_turns=max_turns,
+            )
+            result = state_to_review_result(state)
     except Exception as e:  # noqa: BLE001
         log(f"Agentic loop crashed: {type(e).__name__}: {e}")
         gh_update_issue_comment(
@@ -1507,8 +2268,8 @@ def main() -> int:
     # ------------------------------------------------------------------
     # Post the review (with 422 fallback)
     # ------------------------------------------------------------------
-    if state.final_summary is None:
-        state.final_summary = (
+    if not result.summary:
+        result.summary = (
             "## Code Review Summary\n\n"
             "_The reviewer hit the turn cap without producing a structured "
             "summary. Inline comments (if any) are still attached below._"
@@ -1516,8 +2277,8 @@ def main() -> int:
         log("No submit_review captured — posting fallback summary")
 
     log(
-        f"Submitting review: {len(state.inline_comments)} inline comment(s), "
-        f"{len(state.final_summary)} chars of summary"
+        f"Submitting review: {len(result.findings)} inline comment(s), "
+        f"{len(result.summary)} chars of summary"
     )
 
     try:
@@ -1526,8 +2287,7 @@ def main() -> int:
             repo=repo,
             pr_number=pr_number,
             head_sha=head_sha,
-            body=state.final_summary,
-            inline_comments=state.inline_comments,
+            result=result,
         )
     except Exception as e:  # noqa: BLE001
         log(f"Failed to post review: {e}")
@@ -1549,14 +2309,14 @@ def main() -> int:
     # ------------------------------------------------------------------
     # Strictness gate
     # ------------------------------------------------------------------
-    severity: str = overall_severity(state.severities)
+    severity: str = result.overall_severity
     blocked, block_reason = evaluate_strictness(severity, strictness)
     log(
         f"Severity: {severity}; strictness: {strictness}; blocked: {blocked} "
         f"({block_reason})"
     )
 
-    attached_inline: int = len(state.inline_comments) - dropped_inline
+    attached_inline: int = len(result.findings) - dropped_inline
     gh_update_issue_comment(
         token=gh_token,
         repo=repo,

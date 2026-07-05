@@ -1,0 +1,57 @@
+# MCP servers passthrough — inject custom Multi-Code-Protocol (MCP) tools
+# into the CLI provider's agentic loop (v1.1.0+).
+#
+# When `mcp-config-file` is set, the action copies your JSON config into the
+# CLI's expected location BEFORE invocation (with a round-trip backup of any
+# pre-existing user config), then restores it on exit. Any MCP-capable CLI
+# provider (`claude-code`, `cursor`, `codex`) picks the servers up
+# automatically.
+#
+# Common use cases:
+#   - Add a private-docs MCP server (Sourcegraph, custom Vertex Search).
+#   - Wire the reviewer into a bug-tracker MCP (Linear, Jira) so it can
+#     link the PR to a related ticket.
+#   - Provide a custom code-search MCP that supersedes grep/glob defaults.
+
+name: PR review (with MCP servers)
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: DailybotHQ/ai-pr-reviewer@v1
+        with:
+          provider: claude-code
+          api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Path is relative to the consumer checkout. Commit this file
+          # alongside your workflow.
+          mcp-config-file: .github/pr-review-mcp.json
+
+# Example .github/pr-review-mcp.json content (do NOT commit real secrets):
+#
+# {
+#   "mcpServers": {
+#     "linear": {
+#       "command": "npx",
+#       "args": ["-y", "@linear/mcp-server"],
+#       "env": { "LINEAR_API_KEY": "${env:LINEAR_API_KEY}" }
+#     }
+#   }
+# }
+#
+# Then expose LINEAR_API_KEY in the job env: block if your MCP server needs
+# it. The action does not proxy arbitrary env vars into the CLI — set them
+# at the workflow level.

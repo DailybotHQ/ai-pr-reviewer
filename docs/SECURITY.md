@@ -19,12 +19,33 @@ The action runs **inside the consumer's GitHub Actions runner** with the consume
 - It can read environment variables set on the workflow.
 - It cannot escape the runner sandbox; it cannot read secrets not exposed to the workflow.
 
-Outbound network calls go to **two endpoints only**:
+Outbound network calls depend on the configured provider:
 
-- `https://api.anthropic.com` — Anthropic Messages API (or whichever provider you configure; v1 is Anthropic only).
+**With `provider: anthropic` (default):**
+- `https://api.anthropic.com` — Anthropic Messages API.
 - `https://api.github.com` — GitHub REST + GraphQL APIs.
 
-No other domains are contacted. Auditable in `scripts/reviewer.py` via the `ANTHROPIC_API_URL`, `GITHUB_REST_BASE`, and `GITHUB_GRAPHQL_URL` constants.
+**With an agent-runner CLI provider (`claude-code`, `cursor`, `codex`), additional egress happens during the composite step's install phase and during the vendor's own subprocess:**
+- `https://registry.npmjs.org` — for `claude-code` and `codex` (npm install of the vendor CLI).
+- `https://cursor.com/install` — for `cursor` (vendor install script; see the "Cursor installer supply chain" note below).
+- The vendor CLI's own runtime endpoints (Anthropic, Cursor, OpenAI respectively).
+
+Auditable in `scripts/reviewer.py` via the `ANTHROPIC_API_URL`, `GITHUB_REST_BASE`, and `GITHUB_GRAPHQL_URL` constants, and in `action.yml` via the install steps.
+
+### Vendor-CLI subprocess environment (v1.1.0+)
+
+Agent-runner providers invoke the vendor CLI via `subprocess.run(argv, env=...)` — argv-list form, never `shell=True`. The `env` passed to the subprocess is **explicitly scrubbed** via `_build_cli_env()`: it forwards only an allowlist of variables the CLI needs (`PATH`, `HOME`, `NODE_PATH`, locale, runner metadata) plus the vendor-specific API key. `AIPRR_GH_TOKEN` and every other `AIPRR_*` env var are **not** forwarded to the CLI — the reviewer's Python runtime keeps the GitHub token in-process and calls the GitHub API directly.
+
+### Cursor installer supply chain
+
+The `provider: cursor` install step in `action.yml` runs `curl -fsSL https://cursor.com/install | bash`. This is the officially-supported installer path from Cursor and is used by every consumer of that CLI. Consequences:
+
+- Compromise of `cursor.com` or the CDN serving `/install` would execute arbitrary code on every runner that invokes the action with `provider: cursor`.
+- Consumers on regulated networks should either (a) mirror the installer script in-house and reference it via a self-hosted runner + `agent-extra-args`-style extension in a future task, or (b) stay on `provider: anthropic` / `provider: claude-code` (npm — has integrity metadata) / `provider: codex` (npm) until Cursor publishes signed installer artefacts.
+
+### MCP config passthrough on self-hosted runners
+
+The `mcp-config-file` input copies the consumer's MCP JSON into the CLI's expected location (e.g. `~/.claude/mcp.json`) before invocation, and restores or removes it in a `finally` block. On ephemeral runners (`ubuntu-latest`) this is safe — the whole VM is destroyed at the end of the job. On **persistent self-hosted runners**, a hard-kill of the reviewer process (SIGKILL from runner cancellation or OOM) can leave the swapped MCP config in place, potentially affecting subsequent jobs. Use ephemeral runners for MCP passthrough, or accept the risk and ensure your MCP configs are non-sensitive.
 
 ## Supply chain
 

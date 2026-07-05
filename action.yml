@@ -18,11 +18,11 @@ inputs:
     required: true
 
   provider:
-    description: 'LLM provider. Currently supports `anthropic`. Future: `openai`, `azure-openai`, `google`.'
+    description: 'LLM provider. `anthropic` (default, chat-completions), `claude-code` (Claude Code CLI, agent-runner), `cursor` (Cursor Agent CLI, agent-runner), `codex` (OpenAI Codex CLI, agent-runner).'
     required: false
     default: 'anthropic'
   model:
-    description: 'Model id for the chosen provider. Empty = provider default (Anthropic → `claude-sonnet-4-6`).'
+    description: 'Model id for the chosen provider. Empty = provider default (Anthropic → `claude-sonnet-4-6`, Cursor → `composer-2.5`, Codex → `gpt-5-codex`, Claude Code → account default).'
     required: false
     default: ''
 
@@ -59,9 +59,37 @@ inputs:
     required: false
     default: '10'
   max-turns:
-    description: 'Hard cap on the agentic loop iterations. Each turn = one Anthropic API call + a batch of tool calls.'
+    description: 'Hard cap on the agentic loop iterations. Each turn = one Anthropic API call + a batch of tool calls. Only used by chat-completions providers; agent-runner providers use `agent-max-turns` instead.'
     required: false
     default: '30'
+
+  # ---------------- Agent-runner (CLI) provider parameterisation ----------------
+  # These inputs only affect the CLI providers (`claude-code`, `cursor`, `codex`).
+  # Ignored by `anthropic`. Empty = provider default.
+  agent-max-turns:
+    description: 'Cap on the CLI provider''s internal turn count. Empty = provider default. Ignored for chat-completions providers.'
+    required: false
+    default: ''
+  agent-extra-args:
+    description: 'Raw string appended to the CLI invocation. Parsed with `shlex.split` on the Python side (never `shell=True`). Escape hatch for provider-specific flags not exposed by other inputs.'
+    required: false
+    default: ''
+  mcp-config-file:
+    description: 'Path (relative to the consumer''s checkout) to an MCP servers JSON config. If set, the file is copied to the CLI''s expected location (`~/.claude/mcp.json`, `~/.cursor/mcp.json`, `~/.codex/mcp.json`) before invocation and cleaned up after.'
+    required: false
+    default: ''
+  claude-code-version:
+    description: 'Pin the Claude Code CLI version (npm semver). Empty = latest.'
+    required: false
+    default: ''
+  cursor-version:
+    description: 'Pin the Cursor Agent CLI version. Empty = latest stable.'
+    required: false
+    default: ''
+  codex-version:
+    description: 'Pin the OpenAI Codex CLI version (npm semver). Empty = latest.'
+    required: false
+    default: ''
 
 outputs:
   review-url:
@@ -86,6 +114,80 @@ outputs:
 runs:
   using: 'composite'
   steps:
+    # ---------------------------------------------------------------
+    # Modular CLI install — only one of these steps runs per invocation,
+    # gated by `if: inputs.provider == '...'`. Consumers of the default
+    # `provider: anthropic` pay zero install overhead.
+    # ---------------------------------------------------------------
+    - name: Set up Node.js (Claude Code)
+      if: inputs.provider == 'claude-code'
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    - name: Install Claude Code CLI
+      if: inputs.provider == 'claude-code'
+      shell: bash
+      env:
+        CLAUDE_CODE_VERSION: ${{ inputs.claude-code-version }}
+      run: |
+        set -euo pipefail
+        # Pin if the user provided a version; otherwise resolve `latest`.
+        pkg="@anthropic-ai/claude-code"
+        if [ -n "${CLAUDE_CODE_VERSION}" ]; then
+          pkg="${pkg}@${CLAUDE_CODE_VERSION}"
+        fi
+        echo "::group::npm install -g ${pkg}"
+        npm install -g "${pkg}"
+        echo "::endgroup::"
+        claude --version
+
+    - name: Set up Node.js (Codex)
+      if: inputs.provider == 'codex'
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    - name: Install OpenAI Codex CLI
+      if: inputs.provider == 'codex'
+      shell: bash
+      env:
+        CODEX_VERSION: ${{ inputs.codex-version }}
+      run: |
+        set -euo pipefail
+        pkg="@openai/codex"
+        if [ -n "${CODEX_VERSION}" ]; then
+          pkg="${pkg}@${CODEX_VERSION}"
+        fi
+        echo "::group::npm install -g ${pkg}"
+        npm install -g "${pkg}"
+        echo "::endgroup::"
+        codex --version
+
+    - name: Install Cursor Agent CLI
+      if: inputs.provider == 'cursor'
+      shell: bash
+      env:
+        CURSOR_VERSION: ${{ inputs.cursor-version }}
+      run: |
+        set -euo pipefail
+        # Cursor's official installer script places the binary in
+        # ~/.local/bin. We forward VERSION when the consumer pins it.
+        installer_url="https://cursor.com/install"
+        if [ -n "${CURSOR_VERSION}" ]; then
+          # Cursor's installer respects a VERSION env var for pinning.
+          echo "::group::Install cursor-agent (pinned to ${CURSOR_VERSION})"
+          VERSION="${CURSOR_VERSION}" curl -fsSL "${installer_url}" | bash
+        else
+          echo "::group::Install cursor-agent (latest)"
+          curl -fsSL "${installer_url}" | bash
+        fi
+        echo "::endgroup::"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        "$HOME/.local/bin/cursor-agent" --version
+
+    # ---------------------------------------------------------------
+    # Main review runtime — invoked for every provider (chat-completions
+    # OR agent-runner). scripts/reviewer.py dispatches on AIPRR_PROVIDER.
+    # ---------------------------------------------------------------
     - name: Run AI PR reviewer
       id: review
       shell: bash
@@ -107,6 +209,15 @@ runs:
         AIPRR_STRICTNESS: ${{ inputs.strictness }}
         AIPRR_MAX_INLINE_COMMENTS: ${{ inputs.max-inline-comments }}
         AIPRR_MAX_TURNS: ${{ inputs.max-turns }}
+
+        # Agent-runner (CLI) provider parameterisation. Consumed only by the
+        # `claude-code`, `cursor`, and `codex` provider branches.
+        AIPRR_AGENT_MAX_TURNS: ${{ inputs.agent-max-turns }}
+        AIPRR_AGENT_EXTRA_ARGS: ${{ inputs.agent-extra-args }}
+        AIPRR_MCP_CONFIG_FILE: ${{ inputs.mcp-config-file }}
+        AIPRR_CLAUDE_CODE_VERSION: ${{ inputs.claude-code-version }}
+        AIPRR_CURSOR_VERSION: ${{ inputs.cursor-version }}
+        AIPRR_CODEX_VERSION: ${{ inputs.codex-version }}
 
         # Repo / PR context — pulled from the consumer's `pull_request` event.
         AIPRR_REPO: ${{ github.repository }}

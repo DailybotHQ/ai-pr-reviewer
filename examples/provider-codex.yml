@@ -1,0 +1,41 @@
+# OpenAI Codex CLI provider (agent-runner family, v1.1.0+).
+#
+# The action installs `@openai/codex` via npm and runs Codex in headless mode
+# (`codex exec`). OpenAI's coding-agent baseline system prompt drives the
+# review; the reviewer.py runtime normalises the output via the shared
+# .aiprr/findings.json contract.
+#
+# Auth: your OpenAI API key. The action forwards it as OPENAI_API_KEY to
+# the CLI subprocess.
+
+name: PR review (OpenAI Codex)
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize]
+
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: DailybotHQ/ai-pr-reviewer@v1
+        with:
+          provider: codex
+          api-key: ${{ secrets.OPENAI_API_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Optional: override the default gpt-5-codex model.
+          # model: 'gpt-5-codex'
+          # Optional: pin the CLI version.
+          # codex-version: '0.6.1'
