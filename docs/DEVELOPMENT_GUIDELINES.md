@@ -45,13 +45,15 @@ Use the modern syntax: `dict[str, Any]` not `Dict[str, Any]`, `list[X] | None` n
 
 ## Functions over classes
 
-The codebase has two real classes:
+The codebase's real classes are:
 
 - `PRContext` — dataclass holding the seed user message data.
-- `ReviewState` — dataclass holding mutable state across the agentic loop.
-- `Provider` (abstract) and its concrete impls (`AnthropicProvider`).
+- `ReviewState` — dataclass holding mutable state across the agentic loop (chat-completions family).
+- `Finding` and `ReviewResult` — dataclasses for the provider-independent inline-comment payload (both families converge on `ReviewResult` before submission).
+- `Provider` (abstract) and its concrete impl (`AnthropicProvider`) — chat-completions family.
+- `AgentRunnerProvider` (abstract) and its concrete impls (`ClaudeCodeProvider`, `CursorProvider`, `CodexProvider`) — agent-runner family.
 
-Everything else is a free function. Don't add a class to "organise" related functions — Python modules are already a namespace. `tool_read_file`, `tool_grep`, etc. are functions; they don't need a `Tools` class wrapping them.
+Everything else is a free function. Don't add a class to "organise" related functions — Python modules are already a namespace. `tool_read_file`, `tool_grep`, etc. are functions; they don't need a `Tools` class wrapping them. Same for the CLI-invocation helpers (`_invoke_cli_agent`, `_build_cli_env`, `_swap_mcp_config`) — they're shared free functions consumed by all three `AgentRunnerProvider` impls.
 
 ## Module structure
 
@@ -59,18 +61,22 @@ Everything else is a free function. Don't add a class to "organise" related func
 
 1. Module docstring (with usage and env-var documentation).
 2. Imports.
-3. Constants (URLs, timeouts, caps, severity ranks).
+3. Constants (URLs, timeouts, caps, severity ranks, `_CLI_ENV_ALLOWLIST`).
 4. Logging utilities.
 5. GitHub API helpers.
-6. Provider abstraction + implementations.
-7. PR context dataclass + `fetch_pr_context`.
-8. Tool definitions (`tools_schema`).
-9. Tool implementations.
-10. Severity / strictness logic.
-11. Agentic loop (`drive_review`).
-12. Tracking-comment renderers.
-13. `main()`.
-14. `if __name__ == "__main__": sys.exit(main())`.
+6. `Finding` and `ReviewResult` dataclasses (the provider-independent payload).
+7. `Provider` abstraction + `AnthropicProvider` (chat-completions family).
+8. `AgentRunnerProvider` abstraction + CLI helpers (`_build_cli_env`, `_invoke_cli_agent`, `_swap_mcp_config`) + `ClaudeCodeProvider` / `CursorProvider` / `CodexProvider`.
+9. PR context dataclass + `fetch_pr_context`.
+10. Tool definitions (`tools_schema`) — chat-completions family only.
+11. Tool implementations (`tool_read_file`, `tool_grep`, `tool_glob`, `tool_post_inline_comment`, `tool_submit_review`).
+12. Findings parsing (`parse_findings_file`, `write_findings_prompt_directive`) — agent-runner family only.
+13. Severity / strictness logic.
+14. Agentic loop (`drive_review`, `state_to_review_result`).
+15. Review submission (`findings_to_gh_inline_comments`, `gh_submit_review_with_fallback`).
+16. Tracking-comment renderers.
+17. `main()` (dispatches to `drive_review` or `AgentRunnerProvider.run_review()` based on the provider family).
+18. `if __name__ == "__main__": sys.exit(main())`.
 
 When adding new code, place it in the section it logically belongs to. If you find yourself wanting a new section, that might be a sign the logic warrants a separate file — but err toward keeping the single-file structure.
 
@@ -157,7 +163,13 @@ The `log()` helper writes to stdout with a `[ai-pr-reviewer]` prefix. Don't use 
 
 ## Subprocess
 
-Use the `run_cmd()` helper. It uses `subprocess.run` with explicit argv, `capture_output=True`, `text=True`, `errors="replace"`. Never pass `shell=True`. Never construct shell strings via formatting.
+Use the `run_cmd()` helper for internal commands (e.g. `git diff`). It uses `subprocess.run` with explicit argv, `capture_output=True`, `text=True`, `errors="replace"`. Never pass `shell=True`. Never construct shell strings via formatting.
+
+For invoking a vendor CLI on the agent-runner path, use `_invoke_cli_agent()` — the shared helper enforces three invariants that a hand-rolled `subprocess.run` would be easy to get wrong:
+
+1. **`shell=False` always.** No exceptions. If you find yourself wanting shell features (globbing, redirection, pipes), invoke the shell as an explicit argv (`["bash", "-c", ...]`) with a hard-coded command — never string-interpolate user input.
+2. **`shlex.split()` on any user-provided arg string** (`agent-extra-args`). Never `.split()` on whitespace; that breaks quoted values and lets attackers hide shell metacharacters.
+3. **Scrubbed environment via `_build_cli_env()`.** The vendor CLI subprocess only sees variables in `_CLI_ENV_ALLOWLIST` — no `AIPRR_GH_TOKEN`, no arbitrary `AIPRR_*`, no accidental leakage of secrets to a third-party binary. If a new CLI needs a new env var, add it to the allowlist explicitly with a comment justifying why it's safe.
 
 ## Path handling
 
@@ -232,14 +244,14 @@ Use `enum.Enum` only when type-safe state machines are clearly load-bearing.
 
 ## Test discipline
 
-Most "tests" are dogfooding (see [TESTING_GUIDE.md](TESTING_GUIDE.md)). For pure-function logic that warrants a unit test:
+There's a stdlib `unittest` suite in `tests/` (109 tests as of v1.1.0) plus dogfooding via `self-review.yml`. See [TESTING_GUIDE.md](TESTING_GUIDE.md) for the full breakdown. For pure-function logic that warrants a new test:
 
-- Place at `scripts/test_<area>.py`.
-- Use stdlib `unittest`.
-- Run via `python3 -m unittest discover scripts`.
-- Keep tests under 100 lines per file.
-- Don't mock external APIs; if your code is "mostly mocking out the network", it's not testing the right thing — write a smoke test on a real PR instead.
+- Place at `tests/test_<area>.py` — **not** at `scripts/test_<area>.py`. The tests live in a sibling directory to keep `scripts/reviewer.py` importable as a plain module (`sys.path.insert(0, 'scripts'); import reviewer as r` — see the pattern in the existing test files).
+- Use stdlib `unittest`. No `pytest`.
+- Run via `python3 -m unittest discover -s tests`.
+- Keep each file focused on one concern; the existing four-file split (`test_reviewer.py` for core, `test_findings_parser.py` for the findings-file parser, `test_agent_runner_providers.py` for CLI providers + subprocess-security invariants, `test_end_to_end_roundtrip.py` for cross-family serialization) is the model. Add a new file rather than growing an existing one past ~500 lines.
+- Don't mock external APIs end-to-end. If your code is "mostly mocking out the network", it's not testing the right thing — write a smoke test on a real PR instead. Mocking a subprocess boundary (e.g. simulating a fake `.aiprr/findings.json` file that a vendor CLI would have written) is fine and encouraged.
 
 ## When in doubt
 
-Read `scripts/reviewer.py`. It's ~1500 LOC and follows every rule above. The patterns that exist are the patterns; new code should look like the surrounding code.
+Read `scripts/reviewer.py`. It's ~2400 LOC and follows every rule above. The patterns that exist are the patterns; new code should look like the surrounding code.
