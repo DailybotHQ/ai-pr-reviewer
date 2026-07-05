@@ -12,7 +12,14 @@ You're an AI coding agent (Claude Code, Cursor, Codex, Gemini, Copilot, OpenClaw
 
 ## What this repo is
 
-A composite GitHub Action that runs an LLM-driven code review on pull requests. Single Python script (`scripts/reviewer.py`, ~1500 LOC), stdlib only. Distributed via the GitHub Marketplace.
+A composite GitHub Action that runs an LLM-driven code review on pull requests. Single Python script (`scripts/reviewer.py`, ~2400 LOC), stdlib only. Distributed via the GitHub Marketplace.
+
+As of v1.1.0 the runtime ships with **four providers across two families**:
+
+- **Chat-completions family** (this action drives the tool-use loop): `anthropic`.
+- **Agent-runner family** (vendor CLI drives the loop; findings return via `.aiprr/findings.json`): `claude-code`, `cursor`, `codex`.
+
+The two families converge on a shared `ReviewResult` payload before submission, so downstream behaviour (severity gating, 422 fallback, tracking comment) is identical.
 
 The product name is **"AI PR Reviewer"** (capitalised exactly that way). The repo slug is `ai-pr-reviewer`. The internal env-var prefix is `AIPRR_`.
 
@@ -35,7 +42,8 @@ Treat as immutable unless you're cutting a major version:
 - All keys under `inputs:` and `outputs:` in `action.yml`.
 - Their default values.
 - The exit codes (`0` = success, `1` = hard failure, `2` = strictness blocked).
-- The `Provider.complete()` signature and Anthropic-shaped response contract.
+- The `Provider.complete()` signature and Anthropic-shaped response contract (chat-completions family).
+- The `AgentRunnerProvider.run_review()` signature and the `.aiprr/findings.json` schema documented in [PROVIDERS.md](PROVIDERS.md#agent-runner-provider-contract-v110) (agent-runner family). The schema is versioned; add fields backwards-compatibly rather than reshaping existing ones.
 - The marker string (above).
 - The action name and description in `action.yml` (Marketplace-visible).
 
@@ -55,11 +63,12 @@ You can change any of these without ceremony as long as compile-check passes and
 | Task | Read first |
 |---|---|
 | Add a new `action.yml` input | `action.yml` (existing patterns), README's input table, `STANDARDS.md` (naming) |
-| Add a new tool to the agentic loop | `tools_schema()` and the `tool_*` functions in `scripts/reviewer.py` |
-| Add a new provider | `Provider` class + `AnthropicProvider` + `build_provider()` in `scripts/reviewer.py`, then `docs/PROVIDERS.md` |
-| Tune the default prompt | `prompts/default.md`, then `docs/PROMPTS.md` for context |
+| Add a new tool to the agentic loop (chat-completions family) | `tools_schema()` and the `tool_*` functions in `scripts/reviewer.py` |
+| Add a new chat-completions provider (OpenAI, Gemini, Bedrock) | `Provider` class + `AnthropicProvider` + `build_provider()` in `scripts/reviewer.py`, `.agents/agents/provider-implementer.md`, then `docs/PROVIDERS.md` |
+| Add a new agent-runner provider (a new CLI) | `AgentRunnerProvider` + `ClaudeCodeProvider` (as reference) + `_invoke_cli_agent` + `_build_cli_env` in `scripts/reviewer.py`, the `AgentRunnerProviderContractTests` in `tests/test_agent_runner_providers.py`, then `docs/PROVIDERS.md#agent-runner-provider-contract-v110` |
+| Tune the default prompt | `prompts/default.md`, then `docs/PROMPTS.md` for context (note the layered-prompt semantics for the agent-runner family) |
 | Change strictness behaviour | `evaluate_strictness()` and `overall_severity()` in `scripts/reviewer.py`, then `docs/STRICTNESS.md` |
-| Fix a bug | The function that has the bug; then look for similar patterns nearby |
+| Fix a bug | The function that has the bug; then look for similar patterns nearby; add a regression test under `tests/` |
 | Touch CI | The relevant file in `.github/workflows/`, then `docs/TESTING_GUIDE.md` |
 | Add a doc | `docs/DOCUMENTATION_GUIDE.md` first — it tells you the audience map |
 
@@ -71,10 +80,13 @@ When you're reviewing your own PR before pushing (or someone else's):
 - Does it rename or remove an `action.yml` input/output? Major-version-break flag.
 - Does it pass user/model-supplied paths through `safe_repo_path()`? Required.
 - Does it use `subprocess.run` with `shell=True`? Reject.
+- Does it call a vendor CLI without going through `_invoke_cli_agent()`, or without scrubbing the environment via `_build_cli_env()`? Reject.
+- Does it `.split()` an `agent-extra-args` string on whitespace rather than `shlex.split()`? Reject — that's the injection-vector footgun the helper exists to prevent.
 - Does it have a broad `except Exception` without `# noqa: BLE001` and a justifying comment? Fix.
 - Does it log a value that might be a secret? Run it through `redact_for_log()` if it's a tool arg, or remove the log entirely.
 - Does the diff change runtime behaviour without a `CHANGELOG.md` entry? Add the entry.
 - Does the diff add a new input without a row in the README's table? Add the row.
+- Does the diff modify the `.aiprr/findings.json` schema? Confirm forward-compat: parse_findings_file must accept older payloads without raising. Add tests to `tests/test_findings_parser.py`.
 
 ## Pre-PR checklist
 
@@ -83,14 +95,16 @@ The same checklist as in `AGENTS.md`:
 - [ ] All code in English with type hints.
 - [ ] No new non-stdlib imports.
 - [ ] `python3 -m py_compile scripts/reviewer.py` passes.
+- [ ] `python3 -m unittest discover -s tests` passes.
 - [ ] `action.yml` parses.
 - [ ] If `action.yml` inputs/outputs changed: README's tables updated.
 - [ ] If runtime behaviour changed: `CHANGELOG.md` entry under `[Unreleased]`.
 - [ ] If a new input was added: there's an example in `examples/`.
 - [ ] If the default prompt changed: a before/after on a real PR linked in the PR description.
+- [ ] If a new agent-runner provider was added: `cli-install-smoke` matrix updated with a new leg.
 - [ ] No new files at `.claude/...` or `CLAUDE.md` — those are symlinks.
 - [ ] Commit follows Conventional Commits.
-- [ ] `.github/workflows/self-review.yml` ran successfully on the PR.
+- [ ] `.github/workflows/self-review.yml` ran successfully across all applicable legs on the PR.
 
 ## When you don't know
 

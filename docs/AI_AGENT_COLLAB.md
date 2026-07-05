@@ -5,10 +5,10 @@ How AI coding agents — running on this repo, possibly across multiple agents a
 ## Principles
 
 1. **One change per PR.** Don't bundle a provider addition with a prompt rewrite with a CI refactor. Three PRs are easier to review and revert than one.
-2. **Read before writing.** The repo is ~1500 LOC of runtime + ~200 lines of `action.yml` + a handful of docs. You can read the whole thing in an hour. Do.
+2. **Read before writing.** The repo is ~2400 LOC of runtime + ~300 lines of `action.yml` + ~500 lines of unit tests + a handful of docs. You can read the whole thing in a couple of hours. Do.
 3. **Match existing patterns.** This repo's consistency is a feature. New code should look like the surrounding code unless there's a deliberate reason to break the pattern.
 4. **Update docs in the same PR as the code.** Out-of-sync docs are worse than no docs.
-5. **Self-review before requesting human review.** The action runs on every PR; it's the first reviewer you need to satisfy.
+5. **Self-review before requesting human review.** The action runs on every PR as a 4-leg matrix (one per provider); it's the first reviewer you need to satisfy.
 
 ## When to spawn a sub-agent
 
@@ -29,9 +29,9 @@ The available specialised agents for this repo live in `.agents/agents/`. The cu
 
 | Agent | Use for |
 |---|---|
-| `prompt-engineer` | Tuning `prompts/default.md`; evaluating prompt changes against real PRs; thinking about severity calibration. |
-| `provider-implementer` | Adding a new `Provider` implementation (OpenAI, Gemini, etc.); translating between provider message shapes. |
-| `reviewer` | Code review specialist for this repo's standards (stdlib-only, type hints, error patterns, action.yml contract). |
+| `prompt-engineer` | Tuning `prompts/default.md`; evaluating prompt changes against real PRs; thinking about severity calibration; navigating the layered-prompt semantics of the agent-runner family. |
+| `provider-implementer` | Adding a new provider in either family — a `Provider` implementation for chat-completions APIs (OpenAI, Gemini, Bedrock) or an `AgentRunnerProvider` implementation for a new CLI. Knows both contracts and the translation gotchas for each. |
+| `reviewer` | Code review specialist for this repo's standards (stdlib-only, type hints, error patterns, action.yml contract, `_invoke_cli_agent` / `_build_cli_env` / `shlex.split` invariants). |
 
 The catalog with full descriptions is at [.agents/docs/skills_agents_catalog.md](../.agents/docs/skills_agents_catalog.md).
 
@@ -43,9 +43,9 @@ Skills are reusable workflows. Useful for repetitive operations:
 |---|---|
 | `/commit` | Generate a Conventional Commits message from staged diff. |
 | `/pr` | Generate a PR description from the branch's commits. |
-| `/release` | Cut a new `vX.Y.Z` tag and publish a GitHub Release. |
+| `/release` | Cut a new `vX.Y.Z` tag and publish a GitHub Release manually (fallback for when `auto-release.yml` can't do it for you). |
 | `/prompt-test` | Smoke-test a prompt change against a real PR. |
-| `/add-provider` | Scaffold a new `Provider` implementation. |
+| `/add-provider` | Scaffold a new provider — asks first which family (`Provider` for chat-completions, `AgentRunnerProvider` for a new CLI) and then produces the right skeleton for the chosen path. |
 
 Defined in `.agents/commands/`.
 
@@ -89,13 +89,14 @@ Don't sit on a blocker silently. Don't push half-baked code to mainline. Don't b
 
 ## Working with the dogfood loop
 
-Every PR triggers `.github/workflows/self-review.yml`, which runs the action against itself.
+Every PR triggers `.github/workflows/self-review.yml`, which runs the action against itself across a **4-leg matrix** (one leg per shipping provider: `anthropic`, `claude-code`, `cursor`, `codex`). Each leg posts an independent review with a distinct `self-reviewed:<provider>` label so you can tell them apart in the PR conversation.
 
-- **Watch the tracking comment.** It transitions in-place from `Working…` to `View review →` (or `failed`). If it gets stuck, something in the runtime crashed and didn't reach the failure-update path — that's a bug worth fixing immediately.
-- **Read the inline comments.** Even when you're confident in the change, the bot will sometimes flag something worth thinking about.
-- **Apply suggestion blocks if the bot's fix is right.** GitHub's one-click apply is fast.
-- **Push a follow-up commit if the bot is wrong.** The next run reviews the new HEAD.
-- **Don't manually dismiss the bot's comments.** They auto-collapse on the next push via `collapse-previous`. Manual dismissal hides the history.
+- **Watch the four tracking comments.** Each transitions in-place from `Working…` to `View review →` (or `failed`). If a leg's API-key secret is not set on the repo, that leg emits a `::notice::` and short-circuits before running — that's expected on forks and secret-less consumer setups, not a bug.
+- **Read the inline comments per leg.** Provider-family behaviour can diverge: the `anthropic` leg is the strictest control (this action drives the loop), the three CLI legs may find different classes of issue because their vendor CLIs run their own tools.
+- **Apply suggestion blocks if any bot's fix is right.** GitHub's one-click apply is fast; it doesn't matter which leg suggested it.
+- **Push a follow-up commit if a leg is wrong.** The next run reviews the new HEAD across all four legs.
+- **Don't manually dismiss the bots' comments.** They auto-collapse on the next push via `collapse-previous`. Manual dismissal hides the history.
+- **A single-leg failure is signal, not noise.** If `codex` fails but the other three succeed, the fault is almost certainly in the `CodexProvider` path (or the `codex` CLI itself), not shared code. Narrow the investigation before touching shared helpers.
 
 ## When the bot is wrong
 
@@ -121,7 +122,7 @@ These three are read in different contexts; keep all three honest.
 
 To set expectations, things you might be used to from other codebases that **don't exist here** and shouldn't be added casually:
 
-- A test runner. Compile-check + dogfood is the bar.
+- A third-party test runner. We use stdlib `unittest` deliberately — no `pytest`, no `nose`. The suite runs on a bare Python install.
 - A linter / formatter in CI.
 - A coverage tool.
 - A type-checker in CI (mypy is fine to run locally; not enforced).
@@ -131,3 +132,9 @@ To set expectations, things you might be used to from other codebases that **don
 - A merge queue (the dogfood loop assumes single-PR-at-a-time semantics).
 
 Each of those is a real cost. We've decided the cost outweighs the benefit at this repo's size. If a contribution wants to change that calculus, the PR needs to make the case explicitly.
+
+What we **do** have (post v1.1.0) that earlier versions of this doc claimed we didn't:
+
+- A stdlib `unittest` suite (109 tests in `tests/`) that runs in CI.
+- A CLI-installer smoke matrix (`cli-install-smoke` in `code_check.yml`).
+- Automated releases from Conventional Commits (`auto-release.yml`), so no manual tag-and-push step.
