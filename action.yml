@@ -121,7 +121,7 @@ runs:
     # ---------------------------------------------------------------
     - name: Set up Node.js (Claude Code)
       if: inputs.provider == 'claude-code'
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@v6
       with:
         node-version: '20'
     - name: Install Claude Code CLI
@@ -143,7 +143,7 @@ runs:
 
     - name: Set up Node.js (Codex)
       if: inputs.provider == 'codex'
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@v6
       with:
         node-version: '20'
     - name: Install OpenAI Codex CLI

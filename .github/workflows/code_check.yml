@@ -26,10 +26,10 @@ jobs:
     name: 'Validate — compile + contract + lint'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Step 0 - 🐍 Set up Python ${{ '3.10' }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.10'
 
@@ -55,10 +55,10 @@ jobs:
     needs: validate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Step 0 - 🐍 Set up Python ${{ '3.10' }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.10'
 
@@ -74,7 +74,7 @@ jobs:
       matrix:
         provider: [claude-code, cursor, codex]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Verify each provider's install steps from action.yml succeed on a
       # fresh runner. The install script must:
@@ -85,7 +85,7 @@ jobs:
       # dependencies) BEFORE it reaches consumers on `main`.
       - name: Set up Node.js (Claude Code + Codex)
         if: matrix.provider == 'claude-code' || matrix.provider == 'codex'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: '20'
 
