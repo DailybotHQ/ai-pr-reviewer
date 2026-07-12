@@ -53,6 +53,8 @@ This mode fires the workflow only when GitHub emits a `labeled` event with the m
 
 **Contrast with `label-once`:** `label-once` also runs when the label is already present and the PR gets a new commit *and* the generation is fresh. `label-added-only` requires the current event to literally be `labeled`.
 
+**The webhook-vs-gate distinction (v1.2.0+):** GitHub's `labeled` event fires for *any* label. If `label-gate: ai-review` is already on the PR and someone adds an unrelated label (e.g. `bug`, `dependencies`), the workflow *would* fire — but the action inspects `event.label.name` and skips when it doesn't match `label-gate`, logging `Trigger decision: should_run=False (labeled event was for 'bug', not 'ai-review')`. So you don't have to worry about accidentally paying for a review every time a bot bumps a dependency label.
+
 ## Interaction with `on:` and `concurrency`
 
 - The workflow's `on:` block is the outer gate — GitHub only fires the runner when the subscribed event matches.

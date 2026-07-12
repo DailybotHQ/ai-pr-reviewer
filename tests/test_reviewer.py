@@ -341,7 +341,52 @@ class ResolveTriggerActionTests(unittest.TestCase):
         )
         self.assertTrue(d.should_run)
 
-    def test_unknown_trigger_mode_blocks(self) -> None:
+    def test_label_added_only_fires_when_event_label_matches_gate(self) -> None:
+        """The labeled event carries `ready` → run."""
+        d = reviewer.resolve_trigger_action(
+            trigger_mode=reviewer.TRIGGER_LABEL_ADDED_ONLY,
+            event_action="labeled",
+            event_label="ready",
+            label_gate="ready",
+            current_labels=["ready"],
+            label_toggle_generation=1,
+            last_reviewed_generation=0,
+        )
+        self.assertTrue(d.should_run)
+
+    def test_label_added_only_skips_when_event_label_is_unrelated(self) -> None:
+        """Regression for the PR #9 self-review finding: someone adds an
+        unrelated label (e.g. `bug`) while `ready` is already present. The
+        `labeled` webhook fires; we must NOT run a full review."""
+        d = reviewer.resolve_trigger_action(
+            trigger_mode=reviewer.TRIGGER_LABEL_ADDED_ONLY,
+            event_action="labeled",
+            event_label="bug",
+            label_gate="ready",
+            current_labels=["ready", "bug"],
+            label_toggle_generation=1,
+            last_reviewed_generation=0,
+        )
+        self.assertFalse(d.should_run)
+        self.assertIn("'bug'", d.reason)
+        self.assertIn("'ready'", d.reason)
+
+    def test_label_added_only_backcompat_when_event_label_unknown(self) -> None:
+        """`event_label=""` (payload not available) preserves v1.2.0
+        behaviour so runs from GitHub UI/API label additions where the
+        payload is missing still work."""
+        d = reviewer.resolve_trigger_action(
+            trigger_mode=reviewer.TRIGGER_LABEL_ADDED_ONLY,
+            event_action="labeled",
+            event_label="",
+            label_gate="ready",
+            current_labels=["ready"],
+            label_toggle_generation=1,
+            last_reviewed_generation=0,
+        )
+        self.assertTrue(d.should_run)
+
+    def test_unknown_trigger_mode_blocks(self) -> None:  # keep signature stable
         d = reviewer.resolve_trigger_action(
             trigger_mode="whatever",
             event_action="opened",
@@ -351,6 +396,84 @@ class ResolveTriggerActionTests(unittest.TestCase):
             last_reviewed_generation=0,
         )
         self.assertFalse(d.should_run)
+
+
+class AgentRunnerNoopWarningTests(unittest.TestCase):
+    """`build_agent_runner_noop_warning` — the v1.2 provider-family notice.
+
+    Regression for the PR #9 self-review finding: enabling
+    `pr-description-mode=autocomplete` or `complexity-labels-enabled=true`
+    on an agent-runner CLI provider silently no-ops. This helper produces
+    a WARNING log line so consumers see the caveat before paying for a
+    review that can't apply their PATCH/label.
+    """
+
+    def test_chat_completions_never_warns(self) -> None:
+        w = reviewer.build_agent_runner_noop_warning(
+            provider_id="anthropic",
+            is_agent_runner=False,
+            pr_desc_mode=reviewer.PR_DESC_MODE_AUTOCOMPLETE,
+            complexity_labels_enabled=True,
+        )
+        self.assertEqual(w, "")
+
+    def test_agent_runner_with_no_optin_features_is_silent(self) -> None:
+        w = reviewer.build_agent_runner_noop_warning(
+            provider_id="cursor",
+            is_agent_runner=True,
+            pr_desc_mode=reviewer.PR_DESC_MODE_OFF,
+            complexity_labels_enabled=False,
+        )
+        self.assertEqual(w, "")
+
+    def test_warn_and_block_modes_do_not_trigger(self) -> None:
+        """`warn`/`block` inspect the body themselves — they don't need
+        `set_pr_description` tool and DO work on agent-runners."""
+        for mode in (
+            reviewer.PR_DESC_MODE_WARN,
+            reviewer.PR_DESC_MODE_BLOCK,
+        ):
+            with self.subTest(mode=mode):
+                w = reviewer.build_agent_runner_noop_warning(
+                    provider_id="cursor",
+                    is_agent_runner=True,
+                    pr_desc_mode=mode,
+                    complexity_labels_enabled=False,
+                )
+                self.assertEqual(w, "", f"mode={mode!r} should not warn")
+
+    def test_autocomplete_on_agent_runner_warns(self) -> None:
+        w = reviewer.build_agent_runner_noop_warning(
+            provider_id="cursor",
+            is_agent_runner=True,
+            pr_desc_mode=reviewer.PR_DESC_MODE_AUTOCOMPLETE,
+            complexity_labels_enabled=False,
+        )
+        self.assertIn("WARNING", w)
+        self.assertIn("pr-description-mode=autocomplete", w)
+        self.assertIn("'cursor'", w)
+        self.assertIn("PR_METADATA_CHECKS.md", w)
+
+    def test_complexity_on_agent_runner_warns(self) -> None:
+        w = reviewer.build_agent_runner_noop_warning(
+            provider_id="claude-code",
+            is_agent_runner=True,
+            pr_desc_mode=reviewer.PR_DESC_MODE_OFF,
+            complexity_labels_enabled=True,
+        )
+        self.assertIn("WARNING", w)
+        self.assertIn("complexity-labels-enabled=true", w)
+        self.assertIn("'claude-code'", w)
+
+    def test_both_features_listed_together(self) -> None:
+        w = reviewer.build_agent_runner_noop_warning(
+            provider_id="codex",
+            is_agent_runner=True,
+            pr_desc_mode=reviewer.PR_DESC_MODE_AUTOCOMPLETE,
+            complexity_labels_enabled=True,
+        )
+        self.assertIn("pr-description-mode=autocomplete", w)
+        self.assertIn("complexity-labels-enabled=true", w)
 
 
 class TriggerStateRoundtripTests(unittest.TestCase):

@@ -2028,26 +2028,46 @@ def write_trigger_state(body: str, state: dict[str, Any]) -> str:
     return body[:insert_at] + "\n" + payload + body[insert_at:]
 
 
-def _read_github_event_action() -> str:
-    """Return the `action` field of the current GitHub event, or `""`.
+def _read_github_event_payload() -> dict[str, Any]:
+    """Return the current GitHub event payload as a dict, or `{}`.
 
     Reads `GITHUB_EVENT_PATH` — a JSON file provided by the runner for
-    every workflow event. Best-effort: parsing errors return `""` so
+    every workflow event. Best-effort: parsing errors return `{}` so
     the trigger resolver treats the event as generic.
     """
     path: str = os.environ.get("GITHUB_EVENT_PATH", "")
     if not path:
-        return ""
+        return {}
     try:
         with open(path, "r", encoding="utf-8") as fh:
             payload: Any = json.load(fh)
     except (OSError, json.JSONDecodeError) as e:
         log(f"Could not read GITHUB_EVENT_PATH ({path!r}): {e}")
-        return ""
+        return {}
     if not isinstance(payload, dict):
+        return {}
+    return payload
+
+
+def _read_github_event_action() -> str:
+    """Return the `action` field of the current GitHub event, or `""`."""
+    payload = _read_github_event_payload()
+    return str(payload.get("action", "") or "")
+
+
+def _read_github_event_label() -> str:
+    """Return the `label.name` field of the current event, or `""`.
+
+    Only meaningful for `labeled` / `unlabeled` webhook events, where
+    GitHub attaches the specific label that triggered the event to the
+    payload. Any other event returns `""`. Used by
+    `label-added-only` to reject webhooks fired by unrelated labels.
+    """
+    payload = _read_github_event_payload()
+    label = payload.get("label")
+    if not isinstance(label, dict):
         return ""
-    action: str = str(payload.get("action", "") or "")
-    return action
+    return str(label.get("name", "") or "")
 
 
 def _read_existing_tracking_state(
@@ -2091,8 +2111,15 @@ def resolve_trigger_action(
     current_labels: list[str],
     label_toggle_generation: int,
     last_reviewed_generation: int,
+    event_label: str = "",
 ) -> TriggerDecision:
     """Decide whether to run the review for the current event.
+
+    `event_label` is the specific label attached to `labeled`/`unlabeled`
+    webhook payloads (from `event.label.name`). It's used by
+    `label-added-only` to distinguish "this label was just added" from
+    "some unrelated label was just added while `label_gate` was already
+    present."
 
     See docs/TRIGGER_MODES.md for the full semantics per mode.
     """
@@ -2150,6 +2177,17 @@ def resolve_trigger_action(
             return TriggerDecision(
                 False, f"label {label_gate!r} not present"
             )
+        # `labeled` fires for ANY label — reject when it's not our gate.
+        # Without this, adding an unrelated label (e.g. `bug`) triggers
+        # a full review as long as `label_gate` was already present.
+        if event_label and event_label != label_gate:
+            return TriggerDecision(
+                False,
+                (
+                    f"labeled event was for {event_label!r}, "
+                    f"not {label_gate!r}"
+                ),
+            )
         return TriggerDecision(True, "labeled event fired")
 
     return TriggerDecision(
@@ -2168,6 +2206,43 @@ class DescriptionVerdict:
 
     is_adequate: bool
     reason: str  # empty when adequate, otherwise a short human-readable reason
+
+
+def build_agent_runner_noop_warning(
+    *,
+    provider_id: str,
+    is_agent_runner: bool,
+    pr_desc_mode: str,
+    complexity_labels_enabled: bool,
+) -> str:
+    """Return the WARNING log line for v1.2 features that silently no-op
+    on agent-runner providers, or `""` if none apply.
+
+    Extracted from `main()` for unit-testability. `set_pr_description` and
+    `set_pr_complexity` are exposed via `tools_schema()` only on the
+    chat-completions path, so `pr-description-mode=autocomplete` and
+    `complexity-labels-enabled=true` never populate their `state.proposed_*`
+    fields on agent-runner providers → the post-loop PATCH/label blocks
+    silently no-op. See docs/PR_METADATA_CHECKS.md § "Provider support
+    matrix".
+    """
+    if not is_agent_runner:
+        return ""
+    skips: list[str] = []
+    if pr_desc_mode == PR_DESC_MODE_AUTOCOMPLETE:
+        skips.append("pr-description-mode=autocomplete")
+    if complexity_labels_enabled:
+        skips.append("complexity-labels-enabled=true")
+    if not skips:
+        return ""
+    return (
+        "WARNING: "
+        + ", ".join(skips)
+        + f" requested but provider={provider_id!r} is an "
+        "agent-runner CLI. These features are chat-completions-only "
+        "in v1.2 and will silently no-op. See "
+        "docs/PR_METADATA_CHECKS.md § 'Provider support matrix'."
+    )
 
 
 def evaluate_pr_description(
@@ -2752,6 +2827,7 @@ def main() -> int:
         )
 
     event_action: str = _read_github_event_action()
+    event_label: str = _read_github_event_label()
 
     log(
         f"Reviewing {repo}#{pr_number} @ {head_sha[:7]} with "
@@ -2807,6 +2883,7 @@ def main() -> int:
     trigger_decision: TriggerDecision = resolve_trigger_action(
         trigger_mode=trigger_mode,
         event_action=event_action,
+        event_label=event_label,
         label_gate=label_gate,
         current_labels=current_labels,
         label_toggle_generation=label_toggle_generation,
@@ -2941,6 +3018,23 @@ def main() -> int:
         provider: Provider | AgentRunnerProvider = build_provider(
             provider_id, api_key=api_key, model=model
         )
+
+        # v1.2.0 dispatch caveat: the `set_pr_description` and
+        # `set_pr_complexity` tools are only exposed on the chat-completions
+        # path (they piggyback on the built-in tool-use loop). On agent-
+        # runner providers, `state.proposed_*` stays empty and the post-loop
+        # PATCH/label blocks silently no-op. Warn the consumer so they
+        # don't silently pay for a review that can't do what they asked.
+        # Roadmap: extend findings.json schema to carry these signals from
+        # the CLI back to the runtime (see docs/PR_METADATA_CHECKS.md).
+        agent_runner_warning: str = build_agent_runner_noop_warning(
+            provider_id=provider_id,
+            is_agent_runner=isinstance(provider, AgentRunnerProvider),
+            pr_desc_mode=pr_desc_mode,
+            complexity_labels_enabled=complexity_labels_enabled,
+        )
+        if agent_runner_warning:
+            log(agent_runner_warning)
 
         if isinstance(provider, AgentRunnerProvider):
             # Agent-runner path: vendor CLI owns the tool-use loop. Verify the

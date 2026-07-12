@@ -84,3 +84,14 @@ They're orthogonal — enable both if you want:
 ```
 
 The `set_pr_description` and `set_pr_complexity` tools are exposed conditionally to the model in the same turn — no extra API call cost.
+
+## Provider support matrix
+
+| Provider family | `pr-description-mode: warn` / `block` | `pr-description-mode: autocomplete` | `complexity-labels-enabled` |
+|---|:---:|:---:|:---:|
+| Chat-completions (`provider: anthropic`) | ✅ | ✅ | ✅ |
+| Agent-runner (`provider: cursor` / `claude-code` / `codex`) | ✅ | ⚠️ no-op in v1.2 | ⚠️ no-op in v1.2 |
+
+**Why the split.** `warn` and `block` only need to inspect the PR body, which `main()` does independently of the provider. `autocomplete` and complexity labeling require the *model* to call `set_pr_description` / `set_pr_complexity` tools; those tools ride on top of this action's built-in tool-use loop, which agent-runner CLIs bypass by design (they own their own loops). Bridging the CLIs' findings.json schema to carry these two extra signals is on the v1.3 roadmap.
+
+**What happens if you turn them on with an agent-runner provider.** The action logs a `WARNING:` line at the start of the run listing the specific inputs that will no-op, and the review still runs end-to-end (inline comments, summary, strictness gate — all unchanged). You just don't get the PATCH or the label. If you rely on either, pin `provider: anthropic` until v1.3.

@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `examples/provider-cursor.yml` now sets `model: auto` explicitly as the recommended CI default.
 - `docs/PERFORMANCE.md` § "Two performance shapes" — added a Billing row clarifying that Cursor consumes subscription credits while other agent-runner providers use metered vendor API tokens.
 
+### Fixed
+- **CursorProvider E2BIG on large PRs.** The Cursor CLI concatenated review instructions + PR diff and passed the whole string as a positional argv token (`cursor-agent -p <200 KB…>`), which exceeded the Linux `ARG_MAX` (~128 KB) and crashed the review before the CLI could start (`OSError: [Errno 7] Argument list too long`). `_invoke_cli_agent()` now accepts an optional `stdin_input=` parameter; `CursorProvider.run_review()` pipes the prompt via stdin (`cursor-agent -p` with no positional argument), unblocking reviews of PRs whose diff alone can exceed 200 KB. Regression covered by `CursorHeadlessDefaultsTests.test_user_prompt_not_in_argv_and_goes_via_stdin`.
+- Other providers (`anthropic`, `claude-code`, `codex`) were unaffected — Claude Code writes the system prompt to a file via `--append-system-prompt` and Codex's prompt shape stays under `ARG_MAX` in practice.
+- **`label-added-only` no longer fires on unrelated labels.** When `label-gate` was already present on a PR and a webhook added a different label (e.g. `bug` or a Dependabot label), the workflow would still enter this action and pay for a full review. `_read_github_event_label()` now surfaces `event.label.name`; `resolve_trigger_action()` requires it to match `label-gate` in `label-added-only` mode. Consumers relying on `label-added-only` avoid stray runs and stray billing. Regression covered by `ResolveTriggerActionTests.test_label_added_only_skips_when_event_label_is_unrelated`.
+- **Silent no-op on agent-runner providers now logs a `WARNING`.** Enabling `pr-description-mode: autocomplete` or `complexity-labels-enabled: true` with `provider: cursor|claude-code|codex` never populated the corresponding `state.proposed_*` fields (the tools are chat-completions-only in v1.2). Consumers used to pay for a review with nothing to show for those inputs. `main()` now emits a `WARNING:` line at run start listing which inputs will no-op, and `docs/PR_METADATA_CHECKS.md` § "Provider support matrix" documents the current split. Extracted into a testable helper `build_agent_runner_noop_warning()`.
+
 ## [1.1.0] — 2026-07-05
 
 **Headline:** three new agent-runner providers (`claude-code`, `cursor`, `codex`) alongside the incumbent `anthropic` chat-completions provider — zero migration cost for consumers on `@v1`. See [`.dwp/plans/PLAN_multi_cli_provider_expansion/analysis_results/EXECUTIVE_REPORT.md`](.dwp/plans/PLAN_multi_cli_provider_expansion/analysis_results/EXECUTIVE_REPORT.md) for the full breakdown.
@@ -60,8 +66,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Refreshed `.agents/agents/provider-implementer.md`, `.agents/skills/add-provider/SKILL.md`, `.agents/agents/reviewer.md`, and `.agents/docs/skills_agents_catalog.md` for the two-family model.
 
 ### Fixed
-- **CursorProvider E2BIG on large PRs.** The Cursor CLI concatenated review instructions + PR diff and passed the whole string as a positional argv token (`cursor-agent -p <200 KB…>`), which exceeded the Linux `ARG_MAX` (~128 KB) and crashed the review before the CLI could start (`OSError: [Errno 7] Argument list too long`). `_invoke_cli_agent()` now accepts an optional `stdin_input=` parameter; `CursorProvider.run_review()` pipes the prompt via stdin (`cursor-agent -p` with no positional argument), unblocking reviews of PRs whose diff alone can exceed 200 KB. Regression covered by `CursorHeadlessDefaultsTests.test_user_prompt_not_in_argv_and_goes_via_stdin`.
-- Other providers (`anthropic`, `claude-code`, `codex`) were unaffected — Claude Code writes the system prompt to a file via `--append-system-prompt` and Codex's prompt shape stays under `ARG_MAX` in practice.
+- N/A — additive release. Existing `provider: anthropic` consumers see zero behavioural drift.
 
 ### Security
 - `_invoke_cli_agent()` enforces argv-list subprocess invocation (no `shell=True`).
