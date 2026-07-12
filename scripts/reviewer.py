@@ -28,12 +28,17 @@ Environment (set by the composite action's `env:` block; see action.yml):
     AIPRR_GH_TOKEN           GitHub token for PR/review operations.
     AIPRR_MODEL              Model id (empty = provider default).
     AIPRR_PROMPT_FILE        Path to a markdown system prompt (empty =
-                            bundled `prompts/default.md`).
+                            bundled `prompts/default.md`). Fully replaces
+                            the base prompt.
+    AIPRR_PROMPT_EXTENSION_FILE  Path to a markdown file APPENDED to the
+                            base prompt. Layer overrides without copying
+                            the whole default.
     AIPRR_LABEL_GATE         Required label, or empty for no gate.
     AIPRR_APPLIED_LABEL      Label to apply on success, or empty.
     AIPRR_COLLAPSE_PREVIOUS  `true`/`false`.
     AIPRR_TRACKING_COMMENT   `true`/`false`.
-    AIPRR_STRICTNESS         `lenient` | `block-on-critical` | `block-on-warning`.
+    AIPRR_STRICTNESS         `lenient` | `block-on-critical` |
+                            `block-on-warning` | `block-on-any`.
     AIPRR_MAX_INLINE_COMMENTS  Integer cap.
     AIPRR_MAX_TURNS          Integer cap.
     AIPRR_REPO               `owner/name`.
@@ -1896,6 +1901,20 @@ def findings_to_gh_inline_comments(
     return out
 
 
+def compose_system_prompt(base: str, extension: str) -> str:
+    """Compose the effective system prompt from a base + optional extension.
+
+    - `extension` empty → returns `base` unchanged.
+    - `extension` non-empty → returns `base.rstrip() + "\\n\\n---\\n\\n" +
+      extension.lstrip()`. The `---` separator gives the model an
+      unambiguous boundary between the base prompt and the consumer's
+      overrides so overrides can safely contradict the base.
+    """
+    if not extension:
+        return base
+    return base.rstrip() + "\n\n---\n\n" + extension.lstrip()
+
+
 def evaluate_strictness(
     severity: str, strictness: str
 ) -> tuple[bool, str]:
@@ -2115,6 +2134,9 @@ def main() -> int:
         return 1
 
     prompt_file: str = os.environ.get("AIPRR_PROMPT_FILE", "").strip()
+    prompt_extension_file: str = os.environ.get(
+        "AIPRR_PROMPT_EXTENSION_FILE", ""
+    ).strip()
     label_gate: str = os.environ.get("AIPRR_LABEL_GATE", "").strip()
     applied_label: str = os.environ.get("AIPRR_APPLIED_LABEL", "").strip()
     collapse_previous: bool = parse_bool(
@@ -2200,14 +2222,21 @@ def main() -> int:
     # ------------------------------------------------------------------
     # Resolve and read system prompt
     # ------------------------------------------------------------------
+    # Composition matrix:
+    #   1) neither set              → bundled default
+    #   2) prompt_file only         → prompt_file replaces default
+    #   3) prompt_extension only    → default + "\n\n---\n\n" + extension
+    #   4) both set                 → prompt_file + "\n\n---\n\n" + extension
+    # The `---` separator gives the model an unambiguous boundary between
+    # the base prompt and the consumer's overrides.
     resolved_prompt_path: Path
     if prompt_file:
         resolved_prompt_path = Path(prompt_file)
     else:
         resolved_prompt_path = Path(action_path) / "prompts" / "default.md"
     try:
-        system_prompt: str = resolved_prompt_path.read_text(encoding="utf-8")
-        log(f"Prompt loaded from {resolved_prompt_path}")
+        base_prompt: str = resolved_prompt_path.read_text(encoding="utf-8")
+        log(f"Base prompt loaded from {resolved_prompt_path}")
     except OSError as e:
         log(f"Failed to read prompt file {resolved_prompt_path!r}: {e}")
         gh_update_issue_comment(
@@ -2221,6 +2250,30 @@ def main() -> int:
         )
         write_all_outputs(skipped=False)
         return 1
+
+    extension_text: str = ""
+    if prompt_extension_file:
+        extension_path: Path = Path(prompt_extension_file)
+        try:
+            extension_text = extension_path.read_text(encoding="utf-8")
+            log(f"Prompt extension appended from {extension_path}")
+        except OSError as e:
+            log(
+                f"Failed to read prompt extension file "
+                f"{extension_path!r}: {e}"
+            )
+            gh_update_issue_comment(
+                token=gh_token,
+                repo=repo,
+                comment_id=tracking_id,
+                body=render_tracking_body_failed(
+                    head_sha=head_sha,
+                    error=f"Could not read prompt extension file: {e}",
+                ),
+            )
+            write_all_outputs(skipped=False)
+            return 1
+    system_prompt: str = compose_system_prompt(base_prompt, extension_text)
 
     # ------------------------------------------------------------------
     # Fetch PR + run agentic loop, all wrapped so failures hit the spinner

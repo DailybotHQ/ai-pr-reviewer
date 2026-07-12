@@ -84,7 +84,26 @@ The point of the example is the *structure* — persona, severity overrides, hou
 
 ## How the action loads your prompt
 
-The `prompt-file` input is a path **inside the consumer's checkout** (not the action's checkout). Make sure the file is committed to the same branch the workflow runs on:
+You have three levers, from least to most invasive:
+
+### Base vs Extension vs Replacement — the decision guide
+
+| Input | What it does | When to use |
+|---|---|---|
+| _(none)_ | The bundled `prompts/default.md` is the entire system prompt. | Just trying the action out; comfortable with the shipped defaults. |
+| `prompt-extension-file:` | The bundled default is the base; your file is APPENDED with a `---` separator. | You mostly agree with the default but want stack-specific severity overrides or house rules. Best for teams: you get every future improvement to the default without merge pain. |
+| `prompt-file:` | Your file REPLACES the default. Nothing from `prompts/default.md` remains. | You want full control over persona, tool guidance, severity system. Highest-effort but highest-fidelity. |
+| Both set | `prompt-file:` becomes the base; `prompt-extension-file:` is APPENDED to it. | You have a custom base prompt and want to add per-repo or per-environment overrides on top (e.g. one custom base, three different extensions for `main` / `staging` / `experimental`). |
+
+### Example — extend the default
+
+```yaml
+- uses: DailybotHQ/ai-pr-reviewer@v1
+  with:
+    prompt-extension-file: examples/prompts/python-strict.md
+```
+
+### Example — full replacement
 
 ```yaml
 - uses: DailybotHQ/ai-pr-reviewer@v1
@@ -92,7 +111,30 @@ The `prompt-file` input is a path **inside the consumer's checkout** (not the ac
     prompt-file: .github/prompts/our_review_rules.md
 ```
 
-The default prompt (`prompts/default.md` *inside this action's repo*) is used when `prompt-file` is empty. You can also start by copying the default into your own repo, then editing it — that's how most teams converge on a high-quality prompt fastest.
+Both inputs are paths **inside the consumer's checkout** (not the action's checkout). Make sure the files are committed to the same branch the workflow runs on.
+
+### Starter extensions
+
+If you're starting from scratch, copy one of the starter extensions from [`examples/prompts/`](../examples/prompts/) into your own repo:
+
+- [`python-strict.md`](../examples/prompts/python-strict.md) — Python severity overrides.
+- [`typescript-strict.md`](../examples/prompts/typescript-strict.md) — TypeScript severity overrides + React gotchas.
+- [`security-focused.md`](../examples/prompts/security-focused.md) — OWASP top-10 severity categorization.
+
+Each starter is a short (~40–60 lines) extension file — NOT a copy of the default. Reference it with `prompt-extension-file:`, not `prompt-file:`.
+
+### Generate a fully custom prompt with your own AI
+
+If none of the starter extensions match your stack (or you specifically want `prompt-file` full replacement), use the **meta-prompt** at [`examples/prompts/generate-custom-prompt-meta.md`](../examples/prompts/generate-custom-prompt-meta.md).
+
+Workflow:
+
+1. Copy the meta-prompt into your favorite coding AI (Claude Code, Cursor, Codex, ChatGPT, Gemini) with your repo checked out.
+2. The AI analyzes your codebase — technology stack, architecture, security surface, existing quality standards, historical pain points — and produces a repo-specific `prompt-file`.
+3. Save the AI's output to `.github/prompts/pr-review.md` in your own repo and reference it via `prompt-file:` in your workflow.
+4. Iterate: run one review, read the inline comments, refine any overrides that feel off. Two or three iterations usually gets it dialed in.
+
+This approach beats generic templates for teams whose stack is unusual, whose architecture is unconventional, or who have accumulated a lot of tacit "we learned this the hard way" knowledge worth encoding in the prompt.
 
 ## How the prompt is applied per provider family
 

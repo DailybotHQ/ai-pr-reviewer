@@ -27,7 +27,12 @@ inputs:
     default: ''
 
   prompt-file:
-    description: 'Path inside the consumer checkout to a markdown system prompt. Empty = use the bundled `prompts/default.md`. The prompt is what makes the reviewer opinionated about your codebase — see docs/PROMPTS.md.'
+    description: 'Path inside the consumer checkout to a markdown system prompt. Empty = use the bundled `prompts/default.md`. FULLY REPLACES the base prompt. Use `prompt-extension-file` if you only want to layer overrides on top. See docs/PROMPTS.md.'
+    required: false
+    default: ''
+
+  prompt-extension-file:
+    description: 'Path inside the consumer checkout to a markdown file whose content is APPENDED to the base prompt (either the bundled default or a custom `prompt-file`). Use this to layer project-specific severity overrides, stack-specific conventions, or repo-specific guidance without copy-pasting the whole default. Both inputs can be set together: `prompt-file` becomes the base, `prompt-extension-file` is appended. See docs/PROMPTS.md.'
     required: false
     default: ''
 
@@ -202,6 +207,7 @@ runs:
         AIPRR_GH_TOKEN: ${{ inputs.github-token }}
         AIPRR_MODEL: ${{ inputs.model }}
         AIPRR_PROMPT_FILE: ${{ inputs.prompt-file }}
+        AIPRR_PROMPT_EXTENSION_FILE: ${{ inputs.prompt-extension-file }}
         AIPRR_LABEL_GATE: ${{ inputs.label-gate }}
         AIPRR_APPLIED_LABEL: ${{ inputs.applied-label }}
         AIPRR_COLLAPSE_PREVIOUS: ${{ inputs.collapse-previous }}

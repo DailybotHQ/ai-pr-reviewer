@@ -99,6 +99,60 @@ class OverallSeverityTests(unittest.TestCase):
         )
 
 
+class ComposeSystemPromptTests(unittest.TestCase):
+    """`compose_system_prompt(base, extension)` covers the four cases of
+    the base+extension matrix.
+    """
+
+    def test_empty_extension_returns_base_unchanged(self) -> None:
+        base = "You are the reviewer.\n"
+        result = reviewer.compose_system_prompt(base, "")
+        self.assertEqual(result, base)
+
+    def test_extension_appended_with_separator(self) -> None:
+        base = "You are the reviewer."
+        ext = "Extra rule: never suggest `any`."
+        result = reviewer.compose_system_prompt(base, ext)
+        self.assertIn("You are the reviewer.", result)
+        self.assertIn("---", result)
+        self.assertIn("Extra rule: never suggest `any`.", result)
+        # The base appears before the separator, extension after.
+        self.assertLess(
+            result.index("You are the reviewer."), result.index("---")
+        )
+        self.assertLess(
+            result.index("---"),
+            result.index("Extra rule: never suggest `any`."),
+        )
+
+    def test_extension_strips_leading_whitespace(self) -> None:
+        base = "Base."
+        ext = "\n\n\nExtension."
+        result = reviewer.compose_system_prompt(base, ext)
+        # Should not have four consecutive newlines between separator and
+        # extension body — extension is lstripped.
+        self.assertNotIn("---\n\n\n\nExtension", result)
+        self.assertIn("---\n\nExtension.", result)
+
+    def test_base_strips_trailing_whitespace(self) -> None:
+        base = "Base.\n\n\n\n"
+        ext = "Ext."
+        result = reviewer.compose_system_prompt(base, ext)
+        self.assertIn("Base.\n\n---\n\nExt.", result)
+
+    def test_full_replacement_semantic_preserved(self) -> None:
+        # When a custom prompt-file is used as the base, the same
+        # composition rule applies with no default content leaked.
+        custom_base = "# Custom prompt\nOnly rule: be brief."
+        ext = "Additional rule: cite line numbers."
+        result = reviewer.compose_system_prompt(custom_base, ext)
+        self.assertIn("Custom prompt", result)
+        self.assertIn("Only rule: be brief.", result)
+        self.assertIn("Additional rule: cite line numbers.", result)
+        # No leakage of the bundled default (its unique phrase).
+        self.assertNotIn("post_inline_comment", result)
+
+
 class EvaluateStrictnessTests(unittest.TestCase):
     def test_lenient_never_blocks(self) -> None:
         blocked, _ = reviewer.evaluate_strictness(
