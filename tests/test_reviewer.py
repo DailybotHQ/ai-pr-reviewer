@@ -99,6 +99,148 @@ class OverallSeverityTests(unittest.TestCase):
         )
 
 
+class EvaluatePrDescriptionTests(unittest.TestCase):
+    """Cheap heuristic covering empty / short / adequate bodies."""
+
+    def test_empty_body_is_inadequate(self) -> None:
+        v = reviewer.evaluate_pr_description("", min_length=50)
+        self.assertFalse(v.is_adequate)
+        self.assertIn("empty", v.reason.lower())
+
+    def test_whitespace_only_body_is_inadequate(self) -> None:
+        v = reviewer.evaluate_pr_description("   \n\t\n  ", min_length=50)
+        self.assertFalse(v.is_adequate)
+
+    def test_short_body_is_inadequate(self) -> None:
+        v = reviewer.evaluate_pr_description("wip", min_length=50)
+        self.assertFalse(v.is_adequate)
+        self.assertIn("too short", v.reason.lower())
+        self.assertIn("50", v.reason)
+
+    def test_body_at_threshold_is_adequate(self) -> None:
+        body = "x" * 50
+        v = reviewer.evaluate_pr_description(body, min_length=50)
+        self.assertTrue(v.is_adequate)
+        self.assertEqual(v.reason, "")
+
+    def test_marker_is_stripped_before_length_check(self) -> None:
+        # The autocomplete marker adds ~50 chars; a body that's just the
+        # marker should NOT pass the min_length gate.
+        body = reviewer.PR_DESC_AUTOCOMPLETE_MARKER + "x"
+        v = reviewer.evaluate_pr_description(body, min_length=50)
+        self.assertFalse(v.is_adequate)
+
+    def test_none_body_treated_as_empty(self) -> None:
+        v = reviewer.evaluate_pr_description(None, min_length=50)  # type: ignore[arg-type]
+        self.assertFalse(v.is_adequate)
+
+
+class ToolSetPrDescriptionTests(unittest.TestCase):
+    """`tool_set_pr_description` records into state and enforces one-shot."""
+
+    def test_records_proposal(self) -> None:
+        state = reviewer.ReviewState()
+        result = reviewer.tool_set_pr_description(
+            {"body": "New rich PR body with context."}, state
+        )
+        self.assertEqual(
+            state.proposed_pr_description, "New rich PR body with context."
+        )
+        self.assertIn("recorded", result.lower())
+
+    def test_rejects_empty_body(self) -> None:
+        state = reviewer.ReviewState()
+        result = reviewer.tool_set_pr_description({"body": "  \n  "}, state)
+        self.assertIsNone(state.proposed_pr_description)
+        self.assertIn("Error", result)
+
+    def test_one_shot(self) -> None:
+        state = reviewer.ReviewState()
+        reviewer.tool_set_pr_description({"body": "first"}, state)
+        result = reviewer.tool_set_pr_description({"body": "second"}, state)
+        self.assertEqual(state.proposed_pr_description, "first")
+        self.assertIn("already", result.lower())
+
+
+class ToolSetPrComplexityTests(unittest.TestCase):
+    """`tool_set_pr_complexity` records + validates level enum."""
+
+    def test_records_low(self) -> None:
+        state = reviewer.ReviewState()
+        result = reviewer.tool_set_pr_complexity({"level": "low"}, state)
+        self.assertEqual(state.proposed_pr_complexity, "low")
+        self.assertIn("recorded", result.lower())
+
+    def test_case_normalized(self) -> None:
+        state = reviewer.ReviewState()
+        reviewer.tool_set_pr_complexity({"level": "HIGH"}, state)
+        self.assertEqual(state.proposed_pr_complexity, "high")
+
+    def test_rejects_unknown_level(self) -> None:
+        state = reviewer.ReviewState()
+        result = reviewer.tool_set_pr_complexity({"level": "epic"}, state)
+        self.assertIsNone(state.proposed_pr_complexity)
+        self.assertIn("Error", result)
+
+    def test_one_shot(self) -> None:
+        state = reviewer.ReviewState()
+        reviewer.tool_set_pr_complexity({"level": "low"}, state)
+        result = reviewer.tool_set_pr_complexity({"level": "high"}, state)
+        self.assertEqual(state.proposed_pr_complexity, "low")
+        self.assertIn("already", result.lower())
+
+
+class ToolsSchemaGatingTests(unittest.TestCase):
+    """Optional tools are exposed only when their flag is set."""
+
+    def test_base_five_always_present(self) -> None:
+        schema = reviewer.tools_schema(10)
+        names = [t["name"] for t in schema]
+        for expected in (
+            "read_file",
+            "grep",
+            "glob",
+            "post_inline_comment",
+            "submit_review",
+        ):
+            self.assertIn(expected, names)
+
+    def test_set_pr_description_absent_by_default(self) -> None:
+        schema = reviewer.tools_schema(10)
+        names = [t["name"] for t in schema]
+        self.assertNotIn("set_pr_description", names)
+
+    def test_set_pr_description_present_when_allowed(self) -> None:
+        schema = reviewer.tools_schema(
+            10, allow_set_pr_description=True
+        )
+        names = [t["name"] for t in schema]
+        self.assertIn("set_pr_description", names)
+
+    def test_set_pr_complexity_absent_by_default(self) -> None:
+        schema = reviewer.tools_schema(10)
+        names = [t["name"] for t in schema]
+        self.assertNotIn("set_pr_complexity", names)
+
+    def test_set_pr_complexity_present_when_allowed(self) -> None:
+        schema = reviewer.tools_schema(
+            10, allow_set_pr_complexity=True
+        )
+        names = [t["name"] for t in schema]
+        self.assertIn("set_pr_complexity", names)
+
+    def test_both_optional_tools_present_when_both_flags(self) -> None:
+        schema = reviewer.tools_schema(
+            10,
+            allow_set_pr_description=True,
+            allow_set_pr_complexity=True,
+        )
+        names = [t["name"] for t in schema]
+        self.assertIn("set_pr_description", names)
+        self.assertIn("set_pr_complexity", names)
+        self.assertEqual(len(names), 7)
+
+
 class ComposeSystemPromptTests(unittest.TestCase):
     """`compose_system_prompt(base, extension)` covers the four cases of
     the base+extension matrix.

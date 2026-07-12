@@ -92,6 +92,10 @@ That's the minimum. Open a PR; the action posts a tracking comment, runs a revie
 | `tracking-comment` | | `true` | Post a spinner comment that transitions to the final review URL. |
 | `strictness` | | `lenient` | `lenient` / `block-on-critical` / `block-on-warning` / `block-on-any` — see [docs/STRICTNESS.md](docs/STRICTNESS.md). |
 | `max-inline-comments` | | `10` | Hard cap on inline comments per review. |
+| `pr-description-mode` | | `off` | `off` / `warn` / `block` / `autocomplete` — see [docs/PR_METADATA_CHECKS.md](docs/PR_METADATA_CHECKS.md). |
+| `pr-description-min-length` | | `50` | Char threshold below which the PR body is treated as vague. |
+| `complexity-labels-enabled` | | `false` | When `true`, the reviewer applies a `complexity:low/medium/high` label to the PR. |
+| `complexity-label-prefix` | | `complexity:` | Prefix for the complexity label (change to match your labeling conventions). |
 | `max-turns` | | `30` | Hard cap on the agentic-loop iterations (chat-completions providers only). |
 | `agent-max-turns` | | `''` | Cap on the CLI provider's internal turn count. Empty = provider default. Ignored for chat-completions providers. |
 | `agent-extra-args` | | `''` | Raw string appended to the CLI invocation. Parsed with `shlex.split` (never `shell=True`). Escape hatch for provider-specific flags. |

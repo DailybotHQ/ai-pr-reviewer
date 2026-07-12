@@ -41,6 +41,10 @@ Environment (set by the composite action's `env:` block; see action.yml):
                             `block-on-warning` | `block-on-any`.
     AIPRR_MAX_INLINE_COMMENTS  Integer cap.
     AIPRR_MAX_TURNS          Integer cap.
+    AIPRR_PR_DESCRIPTION_MODE  `off` | `warn` | `block` | `autocomplete`.
+    AIPRR_PR_DESCRIPTION_MIN_LENGTH  Integer threshold for adequacy.
+    AIPRR_COMPLEXITY_LABELS_ENABLED  `true`/`false`.
+    AIPRR_COMPLEXITY_LABEL_PREFIX  Label prefix, e.g. `complexity:`.
     AIPRR_REPO               `owner/name`.
     AIPRR_PR_NUMBER          PR number.
     AIPRR_HEAD_SHA           Commit SHA the review anchors to.
@@ -61,6 +65,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -154,6 +159,33 @@ VALID_STRICTNESS: tuple[str, ...] = (
     STRICTNESS_BLOCK_WARNING,
     STRICTNESS_BLOCK_ANY,
 )
+
+# PR description review modes (v1.2.0+).
+PR_DESC_MODE_OFF: str = "off"
+PR_DESC_MODE_WARN: str = "warn"
+PR_DESC_MODE_BLOCK: str = "block"
+PR_DESC_MODE_AUTOCOMPLETE: str = "autocomplete"
+PR_DESC_MODES: tuple[str, ...] = (
+    PR_DESC_MODE_OFF,
+    PR_DESC_MODE_WARN,
+    PR_DESC_MODE_BLOCK,
+    PR_DESC_MODE_AUTOCOMPLETE,
+)
+PR_DESC_MIN_LENGTH_DEFAULT: int = 50
+PR_DESC_AUTOCOMPLETE_MARKER: str = (
+    "<!-- ai-pr-reviewer-description-autocompleted -->"
+)
+
+# PR complexity labeling (v1.2.0+).
+PR_COMPLEXITY_LOW: str = "low"
+PR_COMPLEXITY_MEDIUM: str = "medium"
+PR_COMPLEXITY_HIGH: str = "high"
+PR_COMPLEXITY_LEVELS: tuple[str, ...] = (
+    PR_COMPLEXITY_LOW,
+    PR_COMPLEXITY_MEDIUM,
+    PR_COMPLEXITY_HIGH,
+)
+PR_COMPLEXITY_LABEL_PREFIX_DEFAULT: str = "complexity:"
 
 # Severity levels — ordered low→high so `max(SEVERITY_RANK)` yields the most
 # severe finding in a review.
@@ -442,6 +474,48 @@ def gh_pr_has_label(
     )
     labels: list[dict[str, Any]] = pr.get("labels", []) or []
     return any((lbl.get("name") or "") == label for lbl in labels)
+
+
+def gh_remove_labels_by_prefix(
+    *,
+    token: str,
+    repo: str,
+    pr_number: int,
+    prefix: str,
+    except_label: str = "",
+) -> int:
+    """Remove all PR labels starting with `prefix`, except `except_label`.
+
+    Returns the number of labels removed. Best-effort — callers wrap in
+    try/except so label bookkeeping failures do not crash the review.
+    """
+    if not prefix:
+        return 0
+    owner, name = repo.split("/", 1)
+    pr: dict[str, Any] = gh_request(
+        "GET", f"/repos/{owner}/{name}/pulls/{pr_number}", token=token
+    )
+    labels: list[dict[str, Any]] = pr.get("labels", []) or []
+    removed: int = 0
+    for lbl in labels:
+        lbl_name: str = (lbl.get("name") or "").strip()
+        if not lbl_name.startswith(prefix):
+            continue
+        if except_label and lbl_name == except_label:
+            continue
+        try:
+            gh_request(
+                "DELETE",
+                (
+                    f"/repos/{owner}/{name}/issues/{pr_number}/labels/"
+                    f"{urllib.parse.quote(lbl_name)}"
+                ),
+                token=token,
+            )
+            removed += 1
+        except Exception as e:  # noqa: BLE001 — best-effort GH API call
+            log(f"Could not remove label {lbl_name!r}: {e}")
+    return removed
 
 
 def gh_collapse_previous_reviews(
@@ -1348,9 +1422,20 @@ def render_user_prompt(ctx: PRContext) -> str:
 # ---------------------------------------------------------------------------
 
 
-def tools_schema(max_inline_comments: int) -> list[dict[str, Any]]:
-    """JSONSchema for every tool the model can call."""
-    return [
+def tools_schema(
+    max_inline_comments: int,
+    *,
+    allow_set_pr_description: bool = False,
+    allow_set_pr_complexity: bool = False,
+) -> list[dict[str, Any]]:
+    """JSONSchema for every tool the model can call.
+
+    `set_pr_description` is exposed only when `allow_set_pr_description`
+    is True (i.e. `pr-description-mode: autocomplete`). Similarly for
+    `set_pr_complexity` and the complexity-labeling feature. The base
+    five tools are always present.
+    """
+    base: list[dict[str, Any]] = [
         {
             "name": "read_file",
             "description": (
@@ -1503,6 +1588,69 @@ def tools_schema(max_inline_comments: int) -> list[dict[str, Any]]:
             },
         },
     ]
+    if allow_set_pr_description:
+        base.append(
+            {
+                "name": "set_pr_description",
+                "description": (
+                    "Set the PR body to a new markdown value. Call this "
+                    "AT MOST ONCE, only when the current PR body is missing "
+                    "or too vague. Do NOT call it if the current body "
+                    f"already carries the `{PR_DESC_AUTOCOMPLETE_MARKER}` "
+                    "marker (that means a previous run already wrote it). "
+                    "Do NOT include environment variables, tokens, or "
+                    "secrets in the body."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "body": {
+                            "type": "string",
+                            "description": (
+                                "New markdown for the PR body. Should NOT "
+                                "include the autocomplete marker — the "
+                                "action appends it automatically."
+                            ),
+                        }
+                    },
+                    "required": ["body"],
+                },
+            }
+        )
+    if allow_set_pr_complexity:
+        base.append(
+            {
+                "name": "set_pr_complexity",
+                "description": (
+                    "Assess and record the PR's overall complexity. Call "
+                    "this AT MOST ONCE, near the end of the review. The "
+                    "value drives a `complexity:*` label on the PR. Assess "
+                    "based on total change (files touched, cognitive load, "
+                    "cross-cutting concerns, security surface, test "
+                    "coverage delta) — NOT line count."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "level": {
+                            "type": "string",
+                            "enum": list(PR_COMPLEXITY_LEVELS),
+                            "description": (
+                                "`low` = self-contained, easy to review "
+                                "(e.g. typo fix, doc, isolated helper). "
+                                "`medium` = one subsystem, moderate "
+                                "cognitive load. `high` = multiple "
+                                "subsystems, security-adjacent code, "
+                                "novel abstraction, or requires "
+                                "cross-team review."
+                            ),
+                        }
+                    },
+                    "required": ["level"],
+                },
+            }
+        )
+    return base
 
 
 # ---------------------------------------------------------------------------
@@ -1518,6 +1666,13 @@ class ReviewState:
     severities: list[str] = field(default_factory=list)
     final_summary: str | None = None
     max_inline_comments: int = DEFAULT_MAX_INLINE_COMMENTS
+    # Populated by `set_pr_description` tool (only in `autocomplete` mode).
+    # None = model did not propose a description. `""` is treated identically
+    # to None so an accidental empty-string tool call is a no-op.
+    proposed_pr_description: str | None = None
+    # Populated by `set_pr_complexity` tool (only when complexity labeling
+    # is enabled). Values: `low`, `medium`, `high`. None = not proposed.
+    proposed_pr_complexity: str | None = None
 
 
 def safe_repo_path(rel: str) -> Path:
@@ -1657,6 +1812,56 @@ def tool_submit_review(args: dict[str, Any], state: ReviewState) -> str:
     )
 
 
+def tool_set_pr_description(
+    args: dict[str, Any], state: ReviewState
+) -> str:
+    """Record a proposed PR body. The actual PATCH happens in `main()`
+    after the loop terminates, so the whole lifecycle stays atomic and
+    the marker check can inspect the final resolved body.
+    """
+    body: str = args.get("body", "")
+    if not isinstance(body, str) or not body.strip():
+        return (
+            "Error: `body` must be a non-empty string. Skipped — the "
+            "current PR body will be left unchanged."
+        )
+    if state.proposed_pr_description is not None:
+        return (
+            "Error: set_pr_description was already called this session. "
+            "The first proposal is retained; do not call it again."
+        )
+    state.proposed_pr_description = body
+    return (
+        "PR description proposal recorded. The action will PATCH the PR "
+        "body after this run if the current body is missing/vague and "
+        "does not already carry the autocomplete marker."
+    )
+
+
+def tool_set_pr_complexity(
+    args: dict[str, Any], state: ReviewState
+) -> str:
+    """Record an AI-assessed complexity level. The actual label
+    application happens in `main()` after the loop terminates.
+    """
+    level: str = str(args.get("level", "")).strip().lower()
+    if level not in PR_COMPLEXITY_LEVELS:
+        return (
+            f"Error: `level` must be one of {list(PR_COMPLEXITY_LEVELS)}. "
+            f"Got: {level!r}. Skipped."
+        )
+    if state.proposed_pr_complexity is not None:
+        return (
+            "Error: set_pr_complexity was already called this session. "
+            "The first assessment is retained; do not call it again."
+        )
+    state.proposed_pr_complexity = level
+    return (
+        f"PR complexity `{level}` recorded. The action will apply the "
+        "corresponding label after this run."
+    )
+
+
 def execute_tool(name: str, args: dict[str, Any], state: ReviewState) -> str:
     """Dispatch a tool call to its handler and return a tool_result string."""
     try:
@@ -1670,9 +1875,71 @@ def execute_tool(name: str, args: dict[str, Any], state: ReviewState) -> str:
             return tool_post_inline_comment(args, state)
         if name == "submit_review":
             return tool_submit_review(args, state)
+        if name == "set_pr_description":
+            return tool_set_pr_description(args, state)
+        if name == "set_pr_complexity":
+            return tool_set_pr_complexity(args, state)
         return f"Error: unknown tool `{name}`"
     except Exception as e:  # noqa: BLE001 — surface to model rather than crash
         return f"Tool `{name}` raised {type(e).__name__}: {e}"
+
+
+# ---------------------------------------------------------------------------
+# PR metadata checks (v1.2.0+): description review + complexity labeling.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DescriptionVerdict:
+    """Result of `evaluate_pr_description()`."""
+
+    is_adequate: bool
+    reason: str  # empty when adequate, otherwise a short human-readable reason
+
+
+def evaluate_pr_description(
+    body: str, *, min_length: int
+) -> DescriptionVerdict:
+    """Cheap heuristic — 'missing' if body is empty/whitespace after strip,
+    'vague' if under `min_length` after stripping the autocomplete marker.
+
+    The heuristic is intentionally simple; a smart LLM check would burn
+    tokens on trivia. The maintainer decides the minimum length; the
+    action just enforces it.
+    """
+    stripped: str = (
+        (body or "").replace(PR_DESC_AUTOCOMPLETE_MARKER, "").strip()
+    )
+    if not stripped:
+        return DescriptionVerdict(
+            is_adequate=False, reason="PR description is empty."
+        )
+    if len(stripped) < min_length:
+        return DescriptionVerdict(
+            is_adequate=False,
+            reason=(
+                f"PR description is too short ({len(stripped)} chars); "
+                f"minimum is {min_length}."
+            ),
+        )
+    return DescriptionVerdict(is_adequate=True, reason="")
+
+
+def gh_patch_pr_body(
+    *, token: str, repo: str, pr_number: int, new_body: str
+) -> None:
+    """PATCH the PR body via the GitHub REST API.
+
+    Raises on non-2xx. Callers are expected to wrap this in try/except
+    so PR-description autocomplete failures do not crash the review.
+    """
+    owner, name = repo.split("/", 1)
+    gh_request(
+        "PATCH",
+        f"/repos/{owner}/{name}/pulls/{pr_number}",
+        token=token,
+        body={"body": new_body},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2158,6 +2425,40 @@ def main() -> int:
         or DEFAULT_MAX_TURNS
     )
 
+    # PR description review (v1.2.0+)
+    pr_desc_mode: str = (
+        os.environ.get(
+            "AIPRR_PR_DESCRIPTION_MODE", PR_DESC_MODE_OFF
+        ).strip()
+        or PR_DESC_MODE_OFF
+    )
+    if pr_desc_mode not in PR_DESC_MODES:
+        log(
+            f"Unknown pr-description-mode {pr_desc_mode!r} — falling back "
+            f"to {PR_DESC_MODE_OFF}"
+        )
+        pr_desc_mode = PR_DESC_MODE_OFF
+    pr_desc_min_length: int = int(
+        os.environ.get(
+            "AIPRR_PR_DESCRIPTION_MIN_LENGTH",
+            str(PR_DESC_MIN_LENGTH_DEFAULT),
+        )
+        or PR_DESC_MIN_LENGTH_DEFAULT
+    )
+
+    # PR complexity labeling (v1.2.0+)
+    complexity_labels_enabled: bool = parse_bool(
+        os.environ.get("AIPRR_COMPLEXITY_LABELS_ENABLED", "false"),
+        default=False,
+    )
+    complexity_label_prefix: str = (
+        os.environ.get(
+            "AIPRR_COMPLEXITY_LABEL_PREFIX",
+            PR_COMPLEXITY_LABEL_PREFIX_DEFAULT,
+        ).strip()
+        or PR_COMPLEXITY_LABEL_PREFIX_DEFAULT
+    )
+
     log(
         f"Reviewing {repo}#{pr_number} @ {head_sha[:7]} with "
         f"{provider_id}/{model} (strictness={strictness})"
@@ -2288,6 +2589,20 @@ def main() -> int:
             f"{len(pr_ctx.changed_files)} files"
         )
 
+        # PR description verdict (only computed when the mode is not `off`,
+        # to keep the log clean when the feature is disabled).
+        description_verdict: DescriptionVerdict = DescriptionVerdict(
+            is_adequate=True, reason=""
+        )
+        if pr_desc_mode != PR_DESC_MODE_OFF:
+            description_verdict = evaluate_pr_description(
+                pr_ctx.body, min_length=pr_desc_min_length
+            )
+            log(
+                f"PR description: mode={pr_desc_mode}, "
+                f"adequate={description_verdict.is_adequate}"
+            )
+
         provider: Provider | AgentRunnerProvider = build_provider(
             provider_id, api_key=api_key, model=model
         )
@@ -2325,7 +2640,17 @@ def main() -> int:
             messages: list[dict[str, Any]] = [
                 {"role": "user", "content": render_user_prompt(pr_ctx)}
             ]
-            tools: list[dict[str, Any]] = tools_schema(max_inline_comments)
+            # Expose set_pr_description only in autocomplete mode; expose
+            # set_pr_complexity only when complexity labeling is enabled.
+            tools: list[dict[str, Any]] = tools_schema(
+                max_inline_comments,
+                allow_set_pr_description=(
+                    pr_desc_mode == PR_DESC_MODE_AUTOCOMPLETE
+                    and not description_verdict.is_adequate
+                    and PR_DESC_AUTOCOMPLETE_MARKER not in (pr_ctx.body or "")
+                ),
+                allow_set_pr_complexity=complexity_labels_enabled,
+            )
 
             drive_review(
                 provider=provider,
@@ -2361,6 +2686,25 @@ def main() -> int:
         )
         log("No submit_review captured — posting fallback summary")
 
+    # Append the PR description verdict to the summary when warn/block mode
+    # flagged the description. In autocomplete mode we don't warn — the
+    # feature *fixed* the description.
+    if (
+        pr_desc_mode in (PR_DESC_MODE_WARN, PR_DESC_MODE_BLOCK)
+        and not description_verdict.is_adequate
+    ):
+        result.summary = (
+            result.summary.rstrip()
+            + "\n\n---\n\n"
+            + "> **PR description check**: "
+            + description_verdict.reason
+            + (
+                "  (mode: `block` — the check will fail on this)"
+                if pr_desc_mode == PR_DESC_MODE_BLOCK
+                else "  (mode: `warn` — advisory only)"
+            )
+        )
+
     log(
         f"Submitting review: {len(result.findings)} inline comment(s), "
         f"{len(result.summary)} chars of summary"
@@ -2392,10 +2736,81 @@ def main() -> int:
     log(f"Review posted: {review_url}")
 
     # ------------------------------------------------------------------
+    # PR description autocomplete (v1.2.0+) — best-effort PATCH.
+    # ------------------------------------------------------------------
+    if (
+        pr_desc_mode == PR_DESC_MODE_AUTOCOMPLETE
+        and not description_verdict.is_adequate
+        and PR_DESC_AUTOCOMPLETE_MARKER not in (pr_ctx.body or "")
+        and state.proposed_pr_description
+    ):
+        new_body: str = (
+            state.proposed_pr_description.rstrip()
+            + "\n\n"
+            + PR_DESC_AUTOCOMPLETE_MARKER
+        )
+        try:
+            gh_patch_pr_body(
+                token=gh_token,
+                repo=repo,
+                pr_number=pr_number,
+                new_body=new_body,
+            )
+            log("PR description autocompleted by the reviewer.")
+        except Exception as e:  # noqa: BLE001 — best-effort GH API call
+            log(f"Could not PATCH PR body (non-fatal): {e}")
+
+    # ------------------------------------------------------------------
+    # PR complexity labeling (v1.2.0+) — best-effort label update.
+    # ------------------------------------------------------------------
+    if complexity_labels_enabled and state.proposed_pr_complexity:
+        new_label: str = (
+            f"{complexity_label_prefix}{state.proposed_pr_complexity}"
+        )
+        try:
+            # Remove any prior `complexity:*` label so the labels reflect
+            # the current review's assessment, not a stale one.
+            gh_remove_labels_by_prefix(
+                token=gh_token,
+                repo=repo,
+                pr_number=pr_number,
+                prefix=complexity_label_prefix,
+                except_label=new_label,
+            )
+            gh_apply_label(
+                token=gh_token,
+                repo=repo,
+                pr_number=pr_number,
+                label=new_label,
+            )
+            log(f"Applied complexity label {new_label!r}")
+        except Exception as e:  # noqa: BLE001 — best-effort GH API call
+            log(f"Could not apply complexity label (non-fatal): {e}")
+
+    # ------------------------------------------------------------------
     # Strictness gate
     # ------------------------------------------------------------------
     severity: str = result.overall_severity
     blocked, block_reason = evaluate_strictness(severity, strictness)
+
+    # PR description gate — orthogonal to the strictness gate. When
+    # `pr-description-mode: block`, an inadequate description forces
+    # `blocked=True` regardless of inline-comment severity.
+    if (
+        pr_desc_mode == PR_DESC_MODE_BLOCK
+        and not description_verdict.is_adequate
+    ):
+        blocked = True
+        block_reason = (
+            f"pr-description-mode=block: {description_verdict.reason}"
+        )
+        log(f"PR description gate: blocking — {description_verdict.reason}")
+    elif (
+        pr_desc_mode in (PR_DESC_MODE_WARN, PR_DESC_MODE_BLOCK)
+        and not description_verdict.is_adequate
+    ):
+        log(f"PR description gate: warning — {description_verdict.reason}")
+
     log(
         f"Severity: {severity}; strictness: {strictness}; blocked: {blocked} "
         f"({block_reason})"

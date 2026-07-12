@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **New `pr-description-mode` input** with four values: `off` (default), `warn`, `block`, `autocomplete`. When `autocomplete` is used, the AI writes a first-draft PR body when the current body is missing or too vague. Guarded by a marker so it never overwrites maintainer edits. See [`docs/PR_METADATA_CHECKS.md`](docs/PR_METADATA_CHECKS.md).
+- **New `pr-description-min-length` input** (default `50`) — character threshold below which the body is treated as "missing/vague."
+- **New `complexity-labels-enabled` input** — when `true`, the reviewer assesses PR complexity (`low`/`medium`/`high`) based on cognitive load, files touched, security surface, and coverage delta, then applies a `complexity:*` label.
+- **New `complexity-label-prefix` input** (default `complexity:`) — configurable prefix for the applied complexity label.
+- **New `set_pr_description` and `set_pr_complexity` tools** in the chat-completions tool schema, gated by the new inputs (exposed only when the corresponding feature is enabled).
+- New GitHub API surface used: `PATCH /pulls/{n}` (autocomplete) and `DELETE /issues/{n}/labels/<name>` (complexity relabelling). See [`docs/SECURITY.md`](docs/SECURITY.md) § "PR metadata PATCH surface" for the threat model.
 - **New `prompt-extension-file` input** — APPENDS content to the base system prompt (either the bundled default or a custom `prompt-file`) with a `---` separator. Layer stack-specific severity overrides and house rules without copy-pasting the entire default. Three starter extensions ship in `examples/prompts/` (`python-strict.md`, `typescript-strict.md`, `security-focused.md`).
 - **Meta-prompt** at `examples/prompts/generate-custom-prompt-meta.md` — hand it to your favorite coding AI (Claude Code, Cursor, Codex, ChatGPT, Gemini) with your repo checked out, and the AI produces a repo-tailored `prompt-file`. Solves the blank-page problem for the full-replacement path.
 - **New strictness mode `block-on-any`** — fails the GitHub check when the reviewer posts any inline comment, including `info`. Zero-tolerance mode for security-critical and regulated stacks. See [`docs/STRICTNESS.md`](docs/STRICTNESS.md) for the full decision tree.

@@ -63,6 +63,25 @@ inputs:
     description: 'Hard cap on the number of inline comments the reviewer can queue per run. The model is instructed to stay well under this; the cap is the safety net.'
     required: false
     default: '10'
+
+  # ---------------- PR metadata checks (v1.2.0+) ----------------
+  pr-description-mode:
+    description: 'Behavior when the PR body is missing or too vague. `off` (default) — no check. `warn` — flag in the review summary; the strictness gate is unchanged. `block` — force the check to fail regardless of severity. `autocomplete` — the reviewer AI writes a first-draft body via a PATCH to the PR (guarded by a marker so it never overwrites maintainer edits). See docs/PR_METADATA_CHECKS.md.'
+    required: false
+    default: 'off'
+  pr-description-min-length:
+    description: 'Character threshold below which the PR body is treated as "missing/vague". Applies to `warn`, `block`, and `autocomplete` modes. Default `50`.'
+    required: false
+    default: '50'
+  complexity-labels-enabled:
+    description: 'When `true`, the reviewer assesses PR complexity (`low`/`medium`/`high`) based on the full change and applies a `<prefix><level>` label. Uses AI signals (cognitive load, files touched, security surface, coverage delta) rather than line count. See docs/PR_METADATA_CHECKS.md.'
+    required: false
+    default: 'false'
+  complexity-label-prefix:
+    description: 'Prefix for the applied complexity label. Default `complexity:` produces `complexity:low` / `complexity:medium` / `complexity:high`. Any prior label matching the prefix is removed before the current one is applied.'
+    required: false
+    default: 'complexity:'
+
   max-turns:
     description: 'Hard cap on the agentic loop iterations. Each turn = one Anthropic API call + a batch of tool calls. Only used by chat-completions providers; agent-runner providers use `agent-max-turns` instead.'
     required: false
@@ -215,6 +234,11 @@ runs:
         AIPRR_STRICTNESS: ${{ inputs.strictness }}
         AIPRR_MAX_INLINE_COMMENTS: ${{ inputs.max-inline-comments }}
         AIPRR_MAX_TURNS: ${{ inputs.max-turns }}
+
+        AIPRR_PR_DESCRIPTION_MODE: ${{ inputs.pr-description-mode }}
+        AIPRR_PR_DESCRIPTION_MIN_LENGTH: ${{ inputs.pr-description-min-length }}
+        AIPRR_COMPLEXITY_LABELS_ENABLED: ${{ inputs.complexity-labels-enabled }}
+        AIPRR_COMPLEXITY_LABEL_PREFIX: ${{ inputs.complexity-label-prefix }}
 
         # Agent-runner (CLI) provider parameterisation. Consumed only by the
         # `claude-code`, `cursor`, and `codex` provider branches.
