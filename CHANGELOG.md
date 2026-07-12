@@ -60,7 +60,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Refreshed `.agents/agents/provider-implementer.md`, `.agents/skills/add-provider/SKILL.md`, `.agents/agents/reviewer.md`, and `.agents/docs/skills_agents_catalog.md` for the two-family model.
 
 ### Fixed
-- N/A — additive release. Existing `provider: anthropic` consumers see zero behavioural drift.
+- **CursorProvider E2BIG on large PRs.** The Cursor CLI concatenated review instructions + PR diff and passed the whole string as a positional argv token (`cursor-agent -p <200 KB…>`), which exceeded the Linux `ARG_MAX` (~128 KB) and crashed the review before the CLI could start (`OSError: [Errno 7] Argument list too long`). `_invoke_cli_agent()` now accepts an optional `stdin_input=` parameter; `CursorProvider.run_review()` pipes the prompt via stdin (`cursor-agent -p` with no positional argument), unblocking reviews of PRs whose diff alone can exceed 200 KB. Regression covered by `CursorHeadlessDefaultsTests.test_user_prompt_not_in_argv_and_goes_via_stdin`.
+- Other providers (`anthropic`, `claude-code`, `codex`) were unaffected — Claude Code writes the system prompt to a file via `--append-system-prompt` and Codex's prompt shape stays under `ARG_MAX` in practice.
 
 ### Security
 - `_invoke_cli_agent()` enforces argv-list subprocess invocation (no `shell=True`).

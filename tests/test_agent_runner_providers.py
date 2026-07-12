@@ -360,6 +360,8 @@ class CursorHeadlessDefaultsTests(unittest.TestCase):
     them, the CLI can stall on interactive approval prompts in CI.
     """
 
+    _last_captured: dict[str, Any] = {}
+
     def _run_and_capture_argv(
         self, *, model: str = "", mcp_config_file: str = "", extra_args: str = ""
     ) -> list[str]:
@@ -368,6 +370,7 @@ class CursorHeadlessDefaultsTests(unittest.TestCase):
 
         def fake_invoke(*, argv: list[str], **_kwargs: Any) -> Any:
             captured["argv"] = list(argv)
+            captured["kwargs"] = dict(_kwargs)
             return reviewer.ReviewResult(summary="ok", findings=[])
 
         orig = reviewer._invoke_cli_agent
@@ -398,6 +401,7 @@ class CursorHeadlessDefaultsTests(unittest.TestCase):
                 )
         finally:
             reviewer._invoke_cli_agent = orig  # type: ignore[assignment]
+        CursorHeadlessDefaultsTests._last_captured = captured
         return captured["argv"]
 
     def test_force_and_trust_are_always_present(self) -> None:
@@ -450,6 +454,35 @@ class CursorHeadlessDefaultsTests(unittest.TestCase):
             "agent-extra-args must be appended AFTER the default headless "
             "flags so consumer overrides take precedence in CLI parsing.",
         )
+
+    def test_user_prompt_not_in_argv_and_goes_via_stdin(self) -> None:
+        """Regression: user prompt (which includes the full diff) must NOT be
+        embedded into argv, or the kernel raises E2BIG on large PRs. It must
+        be piped via stdin instead. See PR #9 self-review-cursor failure."""
+        argv = self._run_and_capture_argv()
+        # `-p` MUST be present but with NO positional prompt argument
+        # following it. The token right after `-p` should be another flag,
+        # not the review-instructions payload.
+        self.assertIn("-p", argv, "Cursor headless mode requires -p flag.")
+        p_idx = argv.index("-p")
+        if p_idx + 1 < len(argv):
+            next_tok = argv[p_idx + 1]
+            self.assertTrue(
+                next_tok.startswith("-"),
+                f"Nothing should be passed as a positional after -p, but "
+                f"found {next_tok!r}. Large prompts must go via stdin, not "
+                f"argv (Linux ARG_MAX ~128 KB blows up on 200 KB+ diffs).",
+            )
+        stdin_input = self._last_captured["kwargs"].get("stdin_input")
+        self.assertIsNotNone(
+            stdin_input,
+            "CursorProvider must pipe the user prompt via stdin_input to "
+            "avoid E2BIG. See _invoke_cli_agent's stdin_input parameter.",
+        )
+        # The stdin payload should contain both the review instructions
+        # (findings.json contract) AND the PR context (title/diff header).
+        self.assertIn("findings.json", stdin_input)
+        self.assertIn("# PR Context", stdin_input)
 
 
 if __name__ == "__main__":

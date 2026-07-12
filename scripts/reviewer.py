@@ -912,6 +912,7 @@ def _invoke_cli_agent(
     findings_path: Path,
     env: dict[str, str],
     cli_name: str,
+    stdin_input: str | None = None,
 ) -> ReviewResult:
     """Run a CLI agent subprocess and parse its findings.json output.
 
@@ -920,6 +921,10 @@ def _invoke_cli_agent(
       - Hard timeout via CLI_INVOCATION_TIMEOUT.
       - Structured error on non-zero exit with truncated stderr.
       - Delegation to parse_findings_file() for output validation.
+
+    `stdin_input`, when provided, is piped to the subprocess' stdin. Providers
+    that hit the OS ARG_MAX limit (Linux E2BIG on argv > ~128 KB) pass their
+    large prompt this way instead of via a positional CLI argument.
     """
     log(f"Invoking {cli_name}: {' '.join(shlex.quote(a) for a in argv[:2])} …")
     try:
@@ -931,6 +936,7 @@ def _invoke_cli_agent(
             check=False,
             capture_output=True,
             text=True,
+            input=stdin_input,
         )
     except subprocess.TimeoutExpired as e:
         raise RuntimeError(
@@ -1113,10 +1119,13 @@ class CursorProvider(AgentRunnerProvider):
             self.mcp_config_file, self.MCP_DEST
         )
         try:
+            # Cursor CLI reads the prompt from stdin when `-p` is passed
+            # without a positional argument. This avoids the E2BIG kernel
+            # limit (~128 KB on Linux) which the argv path hits on large
+            # PRs where the diff alone can exceed 200 KB.
             argv: list[str] = [
                 self.CLI_BIN,
                 "-p",
-                user_prompt,
                 "--output-format",
                 "text",
                 # Headless-CI defaults per Cursor's own documentation:
@@ -1144,6 +1153,7 @@ class CursorProvider(AgentRunnerProvider):
                 findings_path=findings_path,
                 env=env,
                 cli_name=self.CLI_NAME,
+                stdin_input=user_prompt,
             )
         finally:
             _restore_mcp_config(mcp_dest, mcp_backup)
