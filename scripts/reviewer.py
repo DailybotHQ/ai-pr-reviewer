@@ -943,12 +943,24 @@ class ClaudeCodeProvider(AgentRunnerProvider):
 class CursorProvider(AgentRunnerProvider):
     """Cursor Agent CLI (headless, local runtime) as an agent-runner provider.
 
-    Auth: `CURSOR_API_KEY` env var (from the consumer's `api-key` input).
+    Auth: `CURSOR_API_KEY` env var (from the consumer's `api-key` input). The
+    key must belong to a Cursor Pro/Pro+/Ultra subscription — usage credits
+    are debited from that subscription (there is no BYOK). Consumers on the
+    Pro plan can select `model: auto` to route through Cursor's dispatch
+    layer and avoid burning monthly credits on premium models.
+
     CLI: `cursor-agent` — installed via `curl -fsSL https://cursor.com/install
     | bash` by the composite step.
 
-    Local runtime only for v1.1.0 (no `/v1/agents` cloud REST path). The CLI
-    operates against `workspace` directly.
+    Headless defaults (v1.2.0+): the invocation always passes `--force` and
+    `--trust`, which are what Cursor's own headless CLI docs recommend for
+    CI (they prevent interactive approval prompts that would otherwise stall
+    the run). When `mcp_config_file` is set, `--approve-mcps` is added so
+    the MCP approval prompt is also non-interactive. Consumers can still
+    override any of this via `agent-extra-args`.
+
+    Local runtime only for v1.1.0+ (no `/v1/agents` cloud REST path). The
+    CLI operates against `workspace` directly.
     """
 
     CLI_NAME: str = "Cursor Agent"
@@ -1009,9 +1021,19 @@ class CursorProvider(AgentRunnerProvider):
                 user_prompt,
                 "--output-format",
                 "text",
+                # Headless-CI defaults per Cursor's own documentation:
+                # `--force` skips interactive tool approvals, `--trust` marks
+                # the workspace as trusted for the run. Without these the
+                # CLI can stall on approval prompts.
+                "--force",
+                "--trust",
             ]
             if self.model:
                 argv += ["--model", self.model]
+            if self.mcp_config_file:
+                # Only relevant when an MCP config was injected; suppresses
+                # the interactive "approve this MCP server" prompt.
+                argv.append("--approve-mcps")
             if self.extra_args:
                 argv += shlex.split(self.extra_args)
 

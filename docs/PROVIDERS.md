@@ -170,3 +170,58 @@ CLI providers wrap the review instructions with `write_findings_prompt_directive
 3. Add to `DEFAULT_MODELS`.
 4. Add a conditional install step in `action.yml` (see the modular-install pattern in Task 07 of the DWP plan).
 5. Add a matrix entry in `.github/workflows/self-review.yml` for dogfooding.
+
+---
+
+## Cursor CLI — billing and model selection
+
+The `provider: cursor` leg has a materially different cost profile from the chat-completions providers, and its subscription-only model surprises consumers who assume they can bring their own API key. This section clarifies what to expect.
+
+### Billing model
+
+- **`CURSOR_API_KEY` must belong to a Cursor subscription** (Pro, Pro+, or Ultra). There is **no BYOK** — Cursor CLI does not accept OpenAI, Anthropic, or self-hosted keys. Every review consumes credits from that subscription.
+- Usage is visible on the [Cursor Dashboard](https://cursor.com/dashboard). Under a Pro plan, the monthly credit allowance is shared between the IDE and CI/CLI usage; large PRs on `composer-2.5` or `sonnet-4.6` can burn credits quickly if you review every push.
+- Pricing terms live at [`cursor.com/pricing`](https://cursor.com/pricing).
+
+### Recommended default: `model: auto`
+
+- Cursor's `auto` selector routes to the best available model based on availability and load. On Pro plans, `auto` is **unlimited** (subject to fair-use rate limits) and is the right default for CI to avoid draining monthly credits on premium models.
+- Set it explicitly in your workflow:
+
+  ```yaml
+  - uses: DailybotHQ/ai-pr-reviewer@v1
+    with:
+      provider: cursor
+      api-key: ${{ secrets.CURSOR_API_KEY }}
+      model: auto
+  ```
+
+- Pin a specific model only when you have a concrete reason (e.g. reproducibility for a research review, or you want to force `sonnet-4.6` for the highest-quality passes). Otherwise `auto` is the cheapest correct choice.
+
+### Headless-CI defaults (v1.2.0+)
+
+The `CursorProvider` always passes these flags on top of anything you set in `agent-extra-args`:
+
+- **`--force`** — skips interactive tool-approval prompts. Without this the CLI can stall in CI when it wants to run a tool that would normally prompt in the IDE.
+- **`--trust`** — marks the workspace as trusted for the duration of the run. Same rationale as `--force`.
+- **`--approve-mcps`** (added conditionally when `mcp-config-file` is set) — suppresses the interactive MCP-approval prompt.
+
+These are Cursor's own recommendations from the [Headless CLI docs](https://cursor.com/docs/cli/headless) for CI usage. Consumers do NOT need to add them via `agent-extra-args`; the action wires them by default. If you need to override (rare), pass a different combination via `agent-extra-args:` — argv appends after the defaults, so the last occurrence of a flag wins in the CLI's own parsing.
+
+### Monitoring cost
+
+Every run logs the resolved model + argv (with the API key redacted). Combine that with the Cursor Dashboard to correlate action runs with credit consumption. If a repo's monthly review load starts costing more than expected, the fix is almost always one of:
+
+1. Switch to `model: auto` (unlimited on Pro).
+2. Use `trigger-mode: label-once` (v1.2.0+) so reviews fire only on-demand.
+3. Use `label-gate` to skip reviews on non-user-facing PRs.
+
+### Comparison with the other providers
+
+| | Cursor | Claude Code | Codex | Anthropic (direct) |
+|---|---|---|---|---|
+| Auth | Subscription API key | Anthropic API key OR `CLAUDE_CODE_USE_BEDROCK` | OpenAI API key | Anthropic API key |
+| Billing | Cursor subscription credits | Anthropic-metered tokens | OpenAI-metered tokens | Anthropic-metered tokens |
+| BYOK | ❌ Not supported | ✅ Bring your own Anthropic key | ✅ Bring your own OpenAI key | ✅ Bring your own Anthropic key |
+| Unlimited plan | ✅ `model: auto` on Pro | ❌ Metered | ❌ Metered | ❌ Metered |
+| Best for | Teams already on Cursor Pro | Teams already on Anthropic | Teams already on OpenAI | Pure API workloads |

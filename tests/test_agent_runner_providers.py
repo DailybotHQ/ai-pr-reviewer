@@ -351,5 +351,106 @@ class SecurityInvariantsTests(unittest.TestCase):
         )
 
 
+class CursorHeadlessDefaultsTests(unittest.TestCase):
+    """CursorProvider default argv includes Cursor's own headless-CI flags.
+
+    v1.2.0+: `--force --trust` are always passed; `--approve-mcps` is
+    added iff `mcp_config_file` is non-empty. These are Cursor's own
+    recommendations from https://cursor.com/docs/cli/headless — without
+    them, the CLI can stall on interactive approval prompts in CI.
+    """
+
+    def _run_and_capture_argv(
+        self, *, model: str = "", mcp_config_file: str = "", extra_args: str = ""
+    ) -> list[str]:
+        """Monkey-patch `_invoke_cli_agent` and return the argv it received."""
+        captured: dict[str, Any] = {}
+
+        def fake_invoke(*, argv: list[str], **_kwargs: Any) -> Any:
+            captured["argv"] = list(argv)
+            return reviewer.ReviewResult(summary="ok", findings=[])
+
+        orig = reviewer._invoke_cli_agent
+        reviewer._invoke_cli_agent = fake_invoke  # type: ignore[assignment]
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                workspace = Path(td)
+                # `_swap_mcp_config` reads the source path — for mcp_config_file
+                # we need a real file. Create one when the test requests it.
+                mcp_arg: str = ""
+                if mcp_config_file:
+                    mcp_arg = str(workspace / "mcp.json")
+                    Path(mcp_arg).write_text('{"mcpServers":{}}', encoding="utf-8")
+                p = reviewer.CursorProvider(
+                    api_key="k",
+                    model=model,
+                    extra_args=extra_args,
+                    mcp_config_file=mcp_arg,
+                )
+                # Override the default MCP_DEST so the swap does not touch the
+                # real ~/.cursor/mcp.json during tests.
+                p.MCP_DEST = workspace / ".cursor" / "mcp.json"  # type: ignore[misc]
+                p.run_review(
+                    pr_context=_make_pr_context(),
+                    review_instructions="review this",
+                    workspace=workspace,
+                    output_dir=workspace,
+                )
+        finally:
+            reviewer._invoke_cli_agent = orig  # type: ignore[assignment]
+        return captured["argv"]
+
+    def test_force_and_trust_are_always_present(self) -> None:
+        argv = self._run_and_capture_argv()
+        self.assertIn(
+            "--force",
+            argv,
+            "Cursor headless CI must pass --force (skip interactive tool "
+            "approvals). See docs/PROVIDERS.md § Cursor CLI.",
+        )
+        self.assertIn(
+            "--trust",
+            argv,
+            "Cursor headless CI must pass --trust (mark workspace trusted).",
+        )
+
+    def test_approve_mcps_absent_when_no_mcp_config(self) -> None:
+        argv = self._run_and_capture_argv(mcp_config_file="")
+        self.assertNotIn(
+            "--approve-mcps",
+            argv,
+            "--approve-mcps is only relevant when an MCP config was injected.",
+        )
+
+    def test_approve_mcps_present_when_mcp_config_set(self) -> None:
+        argv = self._run_and_capture_argv(mcp_config_file="mcp.json")
+        self.assertIn(
+            "--approve-mcps",
+            argv,
+            "When mcp-config-file is set, --approve-mcps must be added to "
+            "prevent the interactive MCP approval prompt from stalling CI.",
+        )
+
+    def test_model_flag_still_honored(self) -> None:
+        argv = self._run_and_capture_argv(model="auto")
+        self.assertIn("--model", argv)
+        model_idx = argv.index("--model")
+        self.assertEqual(argv[model_idx + 1], "auto")
+
+    def test_extra_args_still_appended_after_defaults(self) -> None:
+        argv = self._run_and_capture_argv(extra_args="--custom-flag=value")
+        self.assertIn("--force", argv)
+        self.assertIn("--trust", argv)
+        self.assertIn("--custom-flag=value", argv)
+        # extra_args comes after the built-in flags so the CLI's own parser
+        # resolves conflicts in favor of the consumer's explicit override.
+        self.assertGreater(
+            argv.index("--custom-flag=value"),
+            argv.index("--force"),
+            "agent-extra-args must be appended AFTER the default headless "
+            "flags so consumer overrides take precedence in CLI parsing.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

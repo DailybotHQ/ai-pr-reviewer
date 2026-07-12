@@ -521,8 +521,11 @@ class ToolsSchemaTests(unittest.TestCase):
 class FakeProvider(reviewer.Provider):
     """Provider stub that drives the loop deterministically.
 
-    Emits N tool-call turns (each a no-op read_file) then a final text turn,
-    so we can assert the conversation-pruning invariant without any network.
+    Emits N tool-call turns (each an unknown-tool stub so `execute_tool`
+    returns immediately without touching the filesystem or shelling out)
+    then a final text turn, so we can assert the conversation-pruning
+    invariant without any network AND without any I/O — critical for the
+    40-turn stress test in DriveReviewPruningTests.
     """
 
     def __init__(self, *, tool_turns: int) -> None:
@@ -544,8 +547,11 @@ class FakeProvider(reviewer.Provider):
                     {
                         "type": "tool_use",
                         "id": f"call_{self.calls}",
-                        "name": "grep",
-                        "input": {"pattern": "x"},
+                        # Unknown tool name → execute_tool returns
+                        # "Error: unknown tool" immediately. The pruning
+                        # loop treats it as a tool_result and moves on.
+                        "name": "__pruning_test_stub__",
+                        "input": {},
                     }
                 ],
             }
