@@ -1925,14 +1925,25 @@ class TriggerDecision:
     reason: str  # log line + optional tracking-comment note
 
 
+COUNT_LABEL_EVENTS_MAX_PAGES: int = 20
+
+
 def count_label_events(
     *, token: str, repo: str, pr_number: int, label: str
 ) -> int:
     """Return the number of times `label` was applied to the PR.
 
     Uses `/issues/{n}/timeline`, filtered on `labeled` events with the
-    matching label name. Best-effort: any error returns 0 so the
-    fallback is "no state" and `label-once` will run.
+    matching label name. Best-effort: any error returns the count
+    accumulated so far (possibly 0) — callers use the "was the label
+    present at all?" signal to decide whether that 0 is meaningful.
+
+    Pagination is capped at `COUNT_LABEL_EVENTS_MAX_PAGES` (~2000
+    timeline events) to bound cost on long-lived, high-chatter PRs.
+    When the cap is hit a `WARNING:` is logged; `label-once` may
+    undercount the generation on such PRs, in which case toggling the
+    label twice or switching to `label-added-only` are the documented
+    workarounds (see docs/TRIGGER_MODES.md § "Edge cases").
     """
     if not label:
         return 0
@@ -1965,8 +1976,15 @@ def count_label_events(
         if len(events) < 100:
             break
         page += 1
-        # Safety bound — the timeline can be huge on old PRs.
-        if page > 20:
+        if page > COUNT_LABEL_EVENTS_MAX_PAGES:
+            log(
+                f"WARNING: count_label_events hit the "
+                f"{COUNT_LABEL_EVENTS_MAX_PAGES}-page pagination cap for "
+                f"label {label!r} on PR #{pr_number}. `label-once` "
+                f"generation may be undercounted; if a re-review does not "
+                f"fire, toggle {label!r} off/on twice or switch to "
+                f"`trigger-mode: label-added-only`."
+            )
             break
     return count
 
@@ -2147,7 +2165,16 @@ def resolve_trigger_action(
             return TriggerDecision(
                 False, f"label {label_gate!r} not present"
             )
-        if label_toggle_generation <= last_reviewed_generation:
+        # Only skip on a stale generation if we actually counted at least
+        # one `labeled` event. Otherwise `count_label_events()` returned 0
+        # (transient API error, permissions issue, or empty timeline) —
+        # skipping would silently mask "the label is present but we can't
+        # tell how many times it's been applied." Better to run than to
+        # deliver nothing. Regression for PR #9 self-review comment #4.
+        if (
+            label_toggle_generation > 0
+            and label_toggle_generation <= last_reviewed_generation
+        ):
             return TriggerDecision(
                 False,
                 (

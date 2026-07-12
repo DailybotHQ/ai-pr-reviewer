@@ -174,6 +174,38 @@ class CountLabelEventsTests(unittest.TestCase):
         finally:
             self._restore()
 
+    def test_logs_warning_when_pagination_cap_hit(self) -> None:
+        """Regression for PR #9 self-review comment #5: on long-lived,
+        high-chatter PRs the 20-page cap silently undercounts. The cap
+        stays (cost control) but must announce itself so operators see
+        why `label-once` is stuck."""
+        full_page = [{"event": "labeled", "label": {"name": "ready"}}] * 100
+        # 21 identical full pages → the loop hits the cap on page 21
+        # (after processing page 20) and exits with the warning.
+        self._monkeypatch_gh_request([full_page] * 21)
+
+        captured: list[str] = []
+
+        def fake_log(msg: str, *args: Any, **kwargs: Any) -> None:
+            captured.append(msg)
+
+        orig_log = reviewer.log
+        reviewer.log = fake_log  # type: ignore[assignment]
+        try:
+            n = reviewer.count_label_events(
+                token="t", repo="o/r", pr_number=1, label="ready"
+            )
+            self.assertEqual(n, 2000, "20 pages × 100 events per page")
+            warnings = [m for m in captured if m.startswith("WARNING:")]
+            self.assertEqual(
+                len(warnings), 1, f"expected one WARNING log, got {captured}"
+            )
+            self.assertIn("pagination cap", warnings[0])
+            self.assertIn("label-added-only", warnings[0])
+        finally:
+            reviewer.log = orig_log  # type: ignore[assignment]
+            self._restore()
+
 
 class GhPatchPrBodySignatureTests(unittest.TestCase):
     """Regression: `gh_patch_pr_body` uses positional method+path (matches
@@ -317,6 +349,25 @@ class ResolveTriggerActionTests(unittest.TestCase):
             last_reviewed_generation=1,
         )
         self.assertTrue(d.should_run)
+
+    def test_label_once_runs_when_count_zero_but_label_present(self) -> None:
+        """Regression for PR #9 self-review comment #4: if the timeline
+        API failed (or the PR has no timeline entries yet) and the label
+        IS on the PR, we must NOT skip on `0 <= 0`. Better to run and
+        deliver a review than to skip silently."""
+        d = reviewer.resolve_trigger_action(
+            trigger_mode=reviewer.TRIGGER_LABEL_ONCE,
+            event_action="labeled",
+            label_gate="ready",
+            current_labels=["ready"],
+            label_toggle_generation=0,
+            last_reviewed_generation=0,
+        )
+        self.assertTrue(
+            d.should_run,
+            "label-once with generation=0 and gate label present must "
+            "still run — 0<=0 is not a stale-generation skip signal.",
+        )
 
     def test_label_added_only_ignores_non_labeled_events(self) -> None:
         d = reviewer.resolve_trigger_action(

@@ -44,6 +44,8 @@ The last successful review embeds the generation it was triggered on inside the 
 - **First-run:** last-reviewed generation defaults to 0. If the label was added before the action was configured, the reviewer will still fire on its first opportunity — subsequent toggles behave normally.
 - **Tracking comment disabled** (`tracking-comment: false`): `label-once` still works using the recent-comments API to find any prior marker; if none exists, the mode degrades gracefully to "run and record".
 - **PR closed and re-opened:** the timeline persists — closing/reopening does not reset the generation. Toggling the label does.
+- **Timeline API transiently fails / returns 0:** the reviewer still runs when the gate label is present (`label_toggle_generation=0` is treated as "count unknown," not "already reviewed"). This is the safer default — a review with an inaccurate generation is more useful than a silent skip. When the run completes it persists the current generation, so subsequent runs return to the normal flow.
+- **Long-lived, high-chatter PRs** (thousands of timeline events): the `count_label_events` helper stops paginating after 20 pages (~2000 events) to bound API cost. When the cap is hit the action logs `WARNING: count_label_events hit the 20-page pagination cap …`; if `label-once` refuses to re-fire after the cap, either toggle the label off/on twice (the second toggle enters the visible window) or switch that PR's workflow to `label-added-only`.
 
 ## `label-added-only` — the strictest variant
 

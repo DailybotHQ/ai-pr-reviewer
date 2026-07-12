@@ -167,8 +167,9 @@ Pair with a branch protection rule that requires the PR-review check to pass.
     github-token: ${{ secrets.GITHUB_TOKEN }}
     # Full replacement:
     prompt-file: .github/prompts/our_house_rules.md
-    # Or layer overrides on top of the bundled default (mutually exclusive
-    # with `prompt-file`, or complementary — see docs/PROMPTS.md):
+    # Or layer overrides on top of whichever base is loaded (default OR
+    # a custom `prompt-file`). Both inputs may be used together — see
+    # docs/PROMPTS.md for the "base vs extension vs replacement" guide:
     # prompt-extension-file: examples/prompts/python-strict.md
 ```
 
