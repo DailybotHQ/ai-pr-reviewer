@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **New `trigger-mode` input** with four values: `always`, `label-required`, `label-once`, `label-added-only`. Enables precise control over when the reviewer runs — including a "review once per label application" workflow where re-running requires toggling the label off and on. See [`docs/TRIGGER_MODES.md`](docs/TRIGGER_MODES.md).
+- New helpers `count_label_events`, `resolve_trigger_action`, `read_trigger_state`, `write_trigger_state`. Marker state (a JSON blob in an HTML comment inside the tracking comment) carries the `label_toggle_generation` counter that powers `label-once`.
 - **New `pr-description-mode` input** with four values: `off` (default), `warn`, `block`, `autocomplete`. When `autocomplete` is used, the AI writes a first-draft PR body when the current body is missing or too vague. Guarded by a marker so it never overwrites maintainer edits. See [`docs/PR_METADATA_CHECKS.md`](docs/PR_METADATA_CHECKS.md).
 - **New `pr-description-min-length` input** (default `50`) — character threshold below which the body is treated as "missing/vague."
 - **New `complexity-labels-enabled` input** — when `true`, the reviewer assesses PR complexity (`low`/`medium`/`high`) based on cognitive load, files touched, security surface, and coverage delta, then applies a `complexity:*` label.
@@ -20,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation of the Cursor CLI billing model in `docs/PROVIDERS.md` (subscription-only, no BYOK, `model: auto` unlimited on Pro plans) — resolves consumer confusion about which API keys are compatible with `provider: cursor`.
 
 ### Changed
+- `label-gate` semantics preserved for back-compat, now internally implemented as `trigger-mode: label-required` with `label-gate` supplying the label name. Consumers that only set `label-gate` see zero behavioural drift.
 - `CursorProvider` now passes `--force --trust` by default in its headless invocation, per Cursor's own [Headless CLI docs](https://cursor.com/docs/cli/headless) recommendation for CI. Adds `--approve-mcps` conditionally when `mcp-config-file` is set, so the interactive MCP-approval prompt does not stall unattended runs. Consumers do not need to add these flags manually via `agent-extra-args`; the change is fully backward-compatible.
 - `examples/provider-cursor.yml` now sets `model: auto` explicitly as the recommended CI default.
 - `docs/PERFORMANCE.md` § "Two performance shapes" — added a Billing row clarifying that Cursor consumes subscription credits while other agent-runner providers use metered vendor API tokens.

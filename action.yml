@@ -37,7 +37,11 @@ inputs:
     default: ''
 
   label-gate:
-    description: 'If non-empty, the review only runs when the PR carries this label (e.g. `ready`). Useful to keep work-in-progress noise out of the review queue.'
+    description: 'If non-empty, the review only runs when the PR carries this label (e.g. `ready`). Useful to keep work-in-progress noise out of the review queue. Combined with `trigger-mode`.'
+    required: false
+    default: ''
+  trigger-mode:
+    description: 'When to run the review. `always` (default when no `label-gate`) — every push/synchronize. `label-required` (implicit when `label-gate` is set) — only when the label is present. `label-once` — only once per label application; toggle the label off/on to re-run. `label-added-only` — only on the `labeled` webhook event (workflow must subscribe with `types: [labeled]`). See docs/TRIGGER_MODES.md.'
     required: false
     default: ''
   applied-label:
@@ -228,6 +232,7 @@ runs:
         AIPRR_PROMPT_FILE: ${{ inputs.prompt-file }}
         AIPRR_PROMPT_EXTENSION_FILE: ${{ inputs.prompt-extension-file }}
         AIPRR_LABEL_GATE: ${{ inputs.label-gate }}
+        AIPRR_TRIGGER_MODE: ${{ inputs.trigger-mode }}
         AIPRR_APPLIED_LABEL: ${{ inputs.applied-label }}
         AIPRR_COLLAPSE_PREVIOUS: ${{ inputs.collapse-previous }}
         AIPRR_TRACKING_COMMENT: ${{ inputs.tracking-comment }}

@@ -34,6 +34,9 @@ Environment (set by the composite action's `env:` block; see action.yml):
                             base prompt. Layer overrides without copying
                             the whole default.
     AIPRR_LABEL_GATE         Required label, or empty for no gate.
+    AIPRR_TRIGGER_MODE       `always` | `label-required` | `label-once` |
+                            `label-added-only`. Empty = auto (label-required
+                            when `label-gate` is set, else `always`).
     AIPRR_APPLIED_LABEL      Label to apply on success, or empty.
     AIPRR_COLLAPSE_PREVIOUS  `true`/`false`.
     AIPRR_TRACKING_COMMENT   `true`/`false`.
@@ -186,6 +189,20 @@ PR_COMPLEXITY_LEVELS: tuple[str, ...] = (
     PR_COMPLEXITY_HIGH,
 )
 PR_COMPLEXITY_LABEL_PREFIX_DEFAULT: str = "complexity:"
+
+# Trigger modes (v1.2.0+).
+TRIGGER_ALWAYS: str = "always"
+TRIGGER_LABEL_REQUIRED: str = "label-required"
+TRIGGER_LABEL_ONCE: str = "label-once"
+TRIGGER_LABEL_ADDED_ONLY: str = "label-added-only"
+TRIGGER_MODES: tuple[str, ...] = (
+    TRIGGER_ALWAYS,
+    TRIGGER_LABEL_REQUIRED,
+    TRIGGER_LABEL_ONCE,
+    TRIGGER_LABEL_ADDED_ONLY,
+)
+TRIGGER_STATE_MARKER_OPEN: str = "<!-- ai-pr-reviewer-state: "
+TRIGGER_STATE_MARKER_CLOSE: str = " -->"
 
 # Severity levels — ordered low→high so `max(SEVERITY_RANK)` yields the most
 # severe finding in a review.
@@ -1885,6 +1902,252 @@ def execute_tool(name: str, args: dict[str, Any], state: ReviewState) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Trigger modes (v1.2.0+): decide whether to run based on webhook event
+# + label state + prior-run marker generation.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TriggerDecision:
+    """Result of `resolve_trigger_action()`."""
+
+    should_run: bool
+    reason: str  # log line + optional tracking-comment note
+
+
+def count_label_events(
+    *, token: str, repo: str, pr_number: int, label: str
+) -> int:
+    """Return the number of times `label` was applied to the PR.
+
+    Uses `/issues/{n}/timeline`, filtered on `labeled` events with the
+    matching label name. Best-effort: any error returns 0 so the
+    fallback is "no state" and `label-once` will run.
+    """
+    if not label:
+        return 0
+    owner, name = repo.split("/", 1)
+    count: int = 0
+    page: int = 1
+    while True:
+        try:
+            events: list[dict[str, Any]] = gh_request(
+                "GET",
+                (
+                    f"/repos/{owner}/{name}/issues/{pr_number}/timeline"
+                    f"?per_page=100&page={page}"
+                ),
+                token=token,
+            )
+        except Exception as e:  # noqa: BLE001 — best-effort GH API call
+            log(f"count_label_events: could not read timeline page {page}: {e}")
+            return count
+        if not isinstance(events, list) or not events:
+            break
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            if ev.get("event") != "labeled":
+                continue
+            lbl_field: dict[str, Any] = ev.get("label") or {}
+            if (lbl_field.get("name") or "") == label:
+                count += 1
+        if len(events) < 100:
+            break
+        page += 1
+        # Safety bound — the timeline can be huge on old PRs.
+        if page > 20:
+            break
+    return count
+
+
+def read_trigger_state(tracking_comment_body: str) -> dict[str, Any]:
+    """Parse the ai-pr-reviewer-state HTML comment, or `{}` if absent."""
+    if not tracking_comment_body:
+        return {}
+    body: str = tracking_comment_body
+    open_at: int = body.find(TRIGGER_STATE_MARKER_OPEN)
+    if open_at < 0:
+        return {}
+    close_at: int = body.find(
+        TRIGGER_STATE_MARKER_CLOSE, open_at + len(TRIGGER_STATE_MARKER_OPEN)
+    )
+    if close_at < 0:
+        return {}
+    raw: str = body[
+        open_at + len(TRIGGER_STATE_MARKER_OPEN) : close_at
+    ].strip()
+    try:
+        parsed: Any = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return parsed
+
+
+def write_trigger_state(body: str, state: dict[str, Any]) -> str:
+    """Emit `body` with the ai-pr-reviewer-state marker inserted/updated.
+
+    The state block sits on a line by itself just after the runtime's
+    canonical `<!-- ai-pr-reviewer-marker -->` marker (or at the top if
+    that marker is absent). Round-trips cleanly through `read_trigger_state`.
+    """
+    payload: str = (
+        TRIGGER_STATE_MARKER_OPEN + json.dumps(state, sort_keys=True)
+        + TRIGGER_STATE_MARKER_CLOSE
+    )
+    # Strip any pre-existing state block to keep the body idempotent.
+    prior_open: int = body.find(TRIGGER_STATE_MARKER_OPEN)
+    if prior_open >= 0:
+        prior_close: int = body.find(
+            TRIGGER_STATE_MARKER_CLOSE,
+            prior_open + len(TRIGGER_STATE_MARKER_OPEN),
+        )
+        if prior_close >= 0:
+            body = (
+                body[:prior_open]
+                + body[prior_close + len(TRIGGER_STATE_MARKER_CLOSE) :]
+            )
+            body = body.lstrip("\n")
+    canonical_marker: str = "<!-- ai-pr-reviewer-marker -->"
+    marker_at: int = body.find(canonical_marker)
+    if marker_at < 0:
+        return payload + "\n" + body
+    insert_at: int = marker_at + len(canonical_marker)
+    return body[:insert_at] + "\n" + payload + body[insert_at:]
+
+
+def _read_github_event_action() -> str:
+    """Return the `action` field of the current GitHub event, or `""`.
+
+    Reads `GITHUB_EVENT_PATH` — a JSON file provided by the runner for
+    every workflow event. Best-effort: parsing errors return `""` so
+    the trigger resolver treats the event as generic.
+    """
+    path: str = os.environ.get("GITHUB_EVENT_PATH", "")
+    if not path:
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            payload: Any = json.load(fh)
+    except (OSError, json.JSONDecodeError) as e:
+        log(f"Could not read GITHUB_EVENT_PATH ({path!r}): {e}")
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    action: str = str(payload.get("action", "") or "")
+    return action
+
+
+def _read_existing_tracking_state(
+    *, token: str, repo: str, pr_number: int
+) -> dict[str, Any]:
+    """Fetch prior ai-pr-reviewer tracking-comment state, or `{}`.
+
+    Looks for an issue comment carrying the canonical
+    `<!-- ai-pr-reviewer-marker -->` marker. Returns the parsed state
+    JSON from the same body, or `{}` when no prior comment exists.
+    """
+    owner, name = repo.split("/", 1)
+    try:
+        comments: list[dict[str, Any]] = gh_request(
+            "GET",
+            f"/repos/{owner}/{name}/issues/{pr_number}/comments?per_page=100",
+            token=token,
+        )
+    except Exception as e:  # noqa: BLE001 — best-effort GH API call
+        log(f"Could not list issue comments for trigger state: {e}")
+        return {}
+    if not isinstance(comments, list):
+        return {}
+    marker: str = "<!-- ai-pr-reviewer-marker -->"
+    # Iterate in reverse — the most recent tracking comment wins.
+    for comment in reversed(comments):
+        if not isinstance(comment, dict):
+            continue
+        body: str = str(comment.get("body") or "")
+        if marker not in body:
+            continue
+        return read_trigger_state(body)
+    return {}
+
+
+def resolve_trigger_action(
+    *,
+    trigger_mode: str,
+    event_action: str,
+    label_gate: str,
+    current_labels: list[str],
+    label_toggle_generation: int,
+    last_reviewed_generation: int,
+) -> TriggerDecision:
+    """Decide whether to run the review for the current event.
+
+    See docs/TRIGGER_MODES.md for the full semantics per mode.
+    """
+    if trigger_mode == TRIGGER_ALWAYS:
+        return TriggerDecision(True, "trigger-mode=always")
+
+    if not label_gate:
+        return TriggerDecision(
+            True,
+            f"trigger-mode={trigger_mode} requires label-gate; "
+            "no label-gate set → treating as always.",
+        )
+
+    label_present: bool = label_gate in current_labels
+
+    if trigger_mode == TRIGGER_LABEL_REQUIRED:
+        if not label_present:
+            return TriggerDecision(
+                False, f"label {label_gate!r} not present"
+            )
+        return TriggerDecision(True, f"label {label_gate!r} present")
+
+    if trigger_mode == TRIGGER_LABEL_ONCE:
+        if not label_present:
+            return TriggerDecision(
+                False, f"label {label_gate!r} not present"
+            )
+        if label_toggle_generation <= last_reviewed_generation:
+            return TriggerDecision(
+                False,
+                (
+                    f"already reviewed label generation "
+                    f"{last_reviewed_generation} — toggle "
+                    f"{label_gate!r} off/on to re-run"
+                ),
+            )
+        return TriggerDecision(
+            True,
+            (
+                f"new label generation ({label_toggle_generation} "
+                f"vs. last reviewed {last_reviewed_generation})"
+            ),
+        )
+
+    if trigger_mode == TRIGGER_LABEL_ADDED_ONLY:
+        if event_action != "labeled":
+            return TriggerDecision(
+                False,
+                (
+                    f"event action {event_action!r} is not 'labeled' — "
+                    "workflow must subscribe with `types: [labeled]`"
+                ),
+            )
+        if not label_present:
+            return TriggerDecision(
+                False, f"label {label_gate!r} not present"
+            )
+        return TriggerDecision(True, "labeled event fired")
+
+    return TriggerDecision(
+        False, f"unknown trigger-mode {trigger_mode!r} — no action taken"
+    )
+
+
+# ---------------------------------------------------------------------------
 # PR metadata checks (v1.2.0+): description review + complexity labeling.
 # ---------------------------------------------------------------------------
 
@@ -2459,31 +2722,93 @@ def main() -> int:
         or PR_COMPLEXITY_LABEL_PREFIX_DEFAULT
     )
 
+    # Trigger-mode resolution (v1.2.0+). Empty default falls back to
+    # `always` (or `label-required` when `label-gate` is set) for full
+    # back-compat with v1.1 workflows.
+    trigger_mode_raw: str = (
+        os.environ.get("AIPRR_TRIGGER_MODE", "").strip()
+    )
+    if trigger_mode_raw:
+        trigger_mode: str = trigger_mode_raw
+        if trigger_mode not in TRIGGER_MODES:
+            log(
+                f"Unknown trigger-mode {trigger_mode!r} — falling back to "
+                f"{TRIGGER_ALWAYS}"
+            )
+            trigger_mode = TRIGGER_ALWAYS
+    else:
+        trigger_mode = (
+            TRIGGER_LABEL_REQUIRED if label_gate else TRIGGER_ALWAYS
+        )
+
+    event_action: str = _read_github_event_action()
+
     log(
         f"Reviewing {repo}#{pr_number} @ {head_sha[:7]} with "
-        f"{provider_id}/{model} (strictness={strictness})"
+        f"{provider_id}/{model} (strictness={strictness}, "
+        f"trigger-mode={trigger_mode})"
     )
 
     # ------------------------------------------------------------------
-    # Label gate — exit early if missing the required label
+    # Trigger evaluation (v1.2.0+) — subsumes the v1.x `label-gate` block
     # ------------------------------------------------------------------
-    if label_gate:
+    label_toggle_generation: int = 0
+    last_reviewed_generation: int = 0
+    if trigger_mode in (TRIGGER_LABEL_REQUIRED, TRIGGER_LABEL_ONCE):
         try:
-            present: bool = gh_pr_has_label(
+            label_toggle_generation = count_label_events(
                 token=gh_token,
                 repo=repo,
                 pr_number=pr_number,
                 label=label_gate,
             )
-        except Exception as e:  # noqa: BLE001
-            log(f"Could not read PR labels for gate check: {e}")
-            present = False
-        if not present:
-            log(
-                f"Label gate: PR does not carry {label_gate!r} — skipping review."
+        except Exception as e:  # noqa: BLE001 — best-effort GH API call
+            log(f"Could not count label events (assuming 0): {e}")
+
+    if trigger_mode == TRIGGER_LABEL_ONCE:
+        prior_state: dict[str, Any] = _read_existing_tracking_state(
+            token=gh_token, repo=repo, pr_number=pr_number
+        )
+        try:
+            last_reviewed_generation = int(
+                prior_state.get("label_toggle_generation", 0) or 0
             )
-            write_all_outputs(skipped=True)
-            return 0
+        except (TypeError, ValueError):
+            last_reviewed_generation = 0
+
+    try:
+        current_labels_raw: list[dict[str, Any]] = (
+            gh_request(
+                "GET",
+                f"/repos/{repo.split('/')[0]}/{repo.split('/')[1]}"
+                f"/pulls/{pr_number}",
+                token=gh_token,
+            )
+            .get("labels", [])
+            or []
+        )
+        current_labels: list[str] = [
+            (lbl.get("name") or "") for lbl in current_labels_raw
+        ]
+    except Exception as e:  # noqa: BLE001 — best-effort GH API call
+        log(f"Could not read PR labels for trigger check: {e}")
+        current_labels = []
+
+    trigger_decision: TriggerDecision = resolve_trigger_action(
+        trigger_mode=trigger_mode,
+        event_action=event_action,
+        label_gate=label_gate,
+        current_labels=current_labels,
+        label_toggle_generation=label_toggle_generation,
+        last_reviewed_generation=last_reviewed_generation,
+    )
+    log(
+        f"Trigger decision: should_run={trigger_decision.should_run} "
+        f"({trigger_decision.reason})"
+    )
+    if not trigger_decision.should_run:
+        write_all_outputs(skipped=True)
+        return 0
 
     # ------------------------------------------------------------------
     # Collapse previous bot reviews/comments as outdated
@@ -2817,19 +3142,27 @@ def main() -> int:
     )
 
     attached_inline: int = len(result.findings) - dropped_inline
+    tracking_body: str = render_tracking_body_done(
+        head_sha=head_sha,
+        review_url=review_url,
+        inline_attached=attached_inline,
+        inline_dropped=dropped_inline,
+        severity=severity,
+        blocked=blocked,
+        block_reason=block_reason,
+    )
+    # For `label-once` mode, embed the label-toggle generation so the
+    # next run can detect "already reviewed this label application".
+    if trigger_mode == TRIGGER_LABEL_ONCE and not blocked:
+        tracking_body = write_trigger_state(
+            tracking_body,
+            {"label_toggle_generation": label_toggle_generation},
+        )
     gh_update_issue_comment(
         token=gh_token,
         repo=repo,
         comment_id=tracking_id,
-        body=render_tracking_body_done(
-            head_sha=head_sha,
-            review_url=review_url,
-            inline_attached=attached_inline,
-            inline_dropped=dropped_inline,
-            severity=severity,
-            blocked=blocked,
-            block_reason=block_reason,
-        ),
+        body=tracking_body,
     )
 
     # ------------------------------------------------------------------

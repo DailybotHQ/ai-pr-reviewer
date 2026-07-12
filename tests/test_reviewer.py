@@ -99,6 +99,166 @@ class OverallSeverityTests(unittest.TestCase):
         )
 
 
+class ResolveTriggerActionTests(unittest.TestCase):
+    """Matrix coverage across the four trigger modes."""
+
+    def test_always_runs_regardless_of_state(self) -> None:
+        d = reviewer.resolve_trigger_action(
+            trigger_mode=reviewer.TRIGGER_ALWAYS,
+            event_action="opened",
+            label_gate="",
+            current_labels=[],
+            label_toggle_generation=0,
+            last_reviewed_generation=0,
+        )
+        self.assertTrue(d.should_run)
+
+    def test_missing_label_gate_falls_back_to_always(self) -> None:
+        d = reviewer.resolve_trigger_action(
+            trigger_mode=reviewer.TRIGGER_LABEL_ONCE,
+            event_action="opened",
+            label_gate="",
+            current_labels=[],
+            label_toggle_generation=0,
+            last_reviewed_generation=0,
+        )
+        self.assertTrue(d.should_run)
+        self.assertIn("no label-gate", d.reason)
+
+    def test_label_required_blocks_when_missing(self) -> None:
+        d = reviewer.resolve_trigger_action(
+            trigger_mode=reviewer.TRIGGER_LABEL_REQUIRED,
+            event_action="opened",
+            label_gate="ready",
+            current_labels=["bug"],
+            label_toggle_generation=0,
+            last_reviewed_generation=0,
+        )
+        self.assertFalse(d.should_run)
+        self.assertIn("not present", d.reason)
+
+    def test_label_required_runs_when_present(self) -> None:
+        d = reviewer.resolve_trigger_action(
+            trigger_mode=reviewer.TRIGGER_LABEL_REQUIRED,
+            event_action="synchronize",
+            label_gate="ready",
+            current_labels=["ready", "bug"],
+            label_toggle_generation=1,
+            last_reviewed_generation=0,
+        )
+        self.assertTrue(d.should_run)
+
+    def test_label_once_runs_on_first_generation(self) -> None:
+        d = reviewer.resolve_trigger_action(
+            trigger_mode=reviewer.TRIGGER_LABEL_ONCE,
+            event_action="labeled",
+            label_gate="ready",
+            current_labels=["ready"],
+            label_toggle_generation=1,
+            last_reviewed_generation=0,
+        )
+        self.assertTrue(d.should_run)
+        self.assertIn("new label generation", d.reason)
+
+    def test_label_once_blocks_on_stale_generation(self) -> None:
+        d = reviewer.resolve_trigger_action(
+            trigger_mode=reviewer.TRIGGER_LABEL_ONCE,
+            event_action="synchronize",
+            label_gate="ready",
+            current_labels=["ready"],
+            label_toggle_generation=1,
+            last_reviewed_generation=1,
+        )
+        self.assertFalse(d.should_run)
+        self.assertIn("already reviewed", d.reason)
+
+    def test_label_once_runs_after_toggle(self) -> None:
+        d = reviewer.resolve_trigger_action(
+            trigger_mode=reviewer.TRIGGER_LABEL_ONCE,
+            event_action="labeled",
+            label_gate="ready",
+            current_labels=["ready"],
+            label_toggle_generation=2,
+            last_reviewed_generation=1,
+        )
+        self.assertTrue(d.should_run)
+
+    def test_label_added_only_ignores_non_labeled_events(self) -> None:
+        d = reviewer.resolve_trigger_action(
+            trigger_mode=reviewer.TRIGGER_LABEL_ADDED_ONLY,
+            event_action="synchronize",
+            label_gate="ready",
+            current_labels=["ready"],
+            label_toggle_generation=1,
+            last_reviewed_generation=0,
+        )
+        self.assertFalse(d.should_run)
+        self.assertIn("is not 'labeled'", d.reason)
+
+    def test_label_added_only_fires_on_labeled(self) -> None:
+        d = reviewer.resolve_trigger_action(
+            trigger_mode=reviewer.TRIGGER_LABEL_ADDED_ONLY,
+            event_action="labeled",
+            label_gate="ready",
+            current_labels=["ready"],
+            label_toggle_generation=1,
+            last_reviewed_generation=0,
+        )
+        self.assertTrue(d.should_run)
+
+    def test_unknown_trigger_mode_blocks(self) -> None:
+        d = reviewer.resolve_trigger_action(
+            trigger_mode="whatever",
+            event_action="opened",
+            label_gate="ready",
+            current_labels=["ready"],
+            label_toggle_generation=0,
+            last_reviewed_generation=0,
+        )
+        self.assertFalse(d.should_run)
+
+
+class TriggerStateRoundtripTests(unittest.TestCase):
+    """`write_trigger_state` + `read_trigger_state` roundtrip."""
+
+    def test_write_then_read_recovers_state(self) -> None:
+        body = "<!-- ai-pr-reviewer-marker -->\n\nSome body content."
+        written = reviewer.write_trigger_state(
+            body, {"label_toggle_generation": 3, "reviewed_sha": "abc"}
+        )
+        state = reviewer.read_trigger_state(written)
+        self.assertEqual(state["label_toggle_generation"], 3)
+        self.assertEqual(state["reviewed_sha"], "abc")
+
+    def test_read_returns_empty_when_no_marker(self) -> None:
+        self.assertEqual(reviewer.read_trigger_state(""), {})
+        self.assertEqual(
+            reviewer.read_trigger_state("Just some markdown, no state."),
+            {},
+        )
+
+    def test_write_replaces_prior_state(self) -> None:
+        body = "<!-- ai-pr-reviewer-marker -->\n\nBody."
+        step1 = reviewer.write_trigger_state(
+            body, {"label_toggle_generation": 1}
+        )
+        step2 = reviewer.write_trigger_state(
+            step1, {"label_toggle_generation": 2}
+        )
+        # Only the most recent state should be present.
+        self.assertEqual(step2.count("ai-pr-reviewer-state"), 1)
+        state = reviewer.read_trigger_state(step2)
+        self.assertEqual(state["label_toggle_generation"], 2)
+
+    def test_read_ignores_malformed_json(self) -> None:
+        body = (
+            "<!-- ai-pr-reviewer-marker -->\n"
+            "<!-- ai-pr-reviewer-state: {not valid json} -->\n"
+            "Body."
+        )
+        self.assertEqual(reviewer.read_trigger_state(body), {})
+
+
 class EvaluatePrDescriptionTests(unittest.TestCase):
     """Cheap heuristic covering empty / short / adequate bodies."""
 
