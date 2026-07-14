@@ -99,32 +99,70 @@ git pull origin main
 
 git checkout -b fix/recover-vX.Y.Z-and-harden-auto-release
 git cherry-pick <sync-commit-sha>
-# The sync commit's message already contains [skip release], so
-# auto-release will SKIP re-cutting when this PR merges.
+# The cherry-picked commit's body still carries [skip release], but
+# see the merge-message warning below — the squash commit that
+# auto-release actually reads is a different beast.
 
 git push -u origin HEAD
 gh pr create --title "chore(release): recover vX.Y.Z sync commit + harden auto-release" \
   --body "Recovery for the partial vX.Y.Z release (see docs/RELEASE_RECOVERY.md)."
 ```
 
-Merge the PR normally. Because the head commit's body carries
-`[skip release]`, auto-release will NOT try to cut `vX.Y.Z+1` on merge.
+**IMPORTANT — squash-merge changes the effective commit message.** This
+repo squash-merges by convention (see [`docs/STANDARDS.md`](STANDARDS.md)
+and [`docs/DEVELOPMENT_COMMANDS.md`](DEVELOPMENT_COMMANDS.md)). The
+`[skip release]` marker in the cherry-picked commit's body is
+**invisible** to auto-release after squash — auto-release reads
+`github.event.head_commit.message`, which for a squash push is the
+newly-created merge commit's message (typically the PR title as
+subject, plus whatever body was set at merge time).
+
+To guarantee auto-release skips on merge, do ONE of:
+
+1. **Prefix the PR title with `chore(release):`** — auto-release skips
+   any head commit whose message starts with `chore(release):`
+   (from `auto-release.yml`'s job-level `if:`).
+2. **Include `[skip release]` in the squash commit BODY at merge time**
+   — either via `gh pr merge <n> --squash --body "$(cat <<'EOF'
+   original body
+
+   [skip release]
+   EOF
+   )"` or by editing the body in the GitHub merge dialog.
+
+Without one of these, auto-release will fire on merge, try to bump to
+`vX.Y.Z+1`, run Step 2.5 again (which will re-sed the same SKILL.md
+files to a NEW version), and hit the same branch-protection wall. With
+the `--atomic` hardening in place the tag won't get published, but you'll
+get a spurious failed workflow run and be back to square one.
 
 #### 4. Move the major alias tag
 
-Once main contains the sync commit (= same SHA as `vX.Y.Z`):
+After merge, the squash commit on `main` contains the same SKILL.md
+version bumps as the `vX.Y.Z` tag, but the two commits will have
+different SHAs (cherry-picks and squashes both create new SHAs). If
+the recovery PR carried additional changes (hardening, docs), `main`'s
+tree will also differ from `vX.Y.Z`'s tree — that's fine, those extras
+will ship in a subsequent release.
+
+The relevant invariant for consumers is that `@v1` should point at the
+newest `v1.x.y` release tag, so move it to `vX.Y.Z` (not to `origin/main`):
 
 ```bash
-git fetch origin
-git rev-parse origin/main         # should equal vX.Y.Z's commit SHA
-git rev-parse vX.Y.Z^{commit}     # same
+git fetch origin --tags
+
+# Sanity check — vX.Y.Z's target commit should have the SKILL.md
+# version bumped correctly.
+git show vX.Y.Z:skills/ai-diff-reviewer/SKILL.md | grep '^version:'
+# Expected: version: "X.Y.Z"
 
 # Move v1 to vX.Y.Z. Force is correct — v1 is a moving pointer by design.
 git tag -f v1 vX.Y.Z
 git push origin v1 --force
 
-# Verify remote agrees.
+# Verify remote agrees — both should print the same commit SHA.
 gh api repos/DailybotHQ/ai-diff-reviewer/git/refs/tags/v1 -q .object.sha
+git rev-parse vX.Y.Z^{commit}
 ```
 
 #### 5. Create the GitHub Release
