@@ -2,15 +2,15 @@
 
 ## Reporting a vulnerability
 
-**Please do not open a public GitHub issue.** Instead, use one of the two private channels:
+**Please do not open a public GitHub issue.** Report vulnerabilities
+privately through GitHub's Security Advisory flow:
 
-1. **GitHub Security Advisory (preferred)** — open a private advisory at
-   [`github.com/DailybotHQ/ai-pr-reviewer/security/advisories/new`](https://github.com/DailybotHQ/ai-pr-reviewer/security/advisories/new).
-   This is the fastest path — the advisory is scoped to a small circle of
-   maintainers and lets us collaborate on the fix privately before a
-   coordinated disclosure.
-2. **Email** — write to the address listed in the repository's `CODEOWNERS`
-   file if you cannot use the GitHub advisory flow.
+**→ [Open a private advisory](https://github.com/DailybotHQ/ai-pr-reviewer/security/advisories/new)**
+(`github.com/DailybotHQ/ai-pr-reviewer/security/advisories/new`)
+
+The advisory is scoped to a small circle of maintainers and lets us
+collaborate on the fix privately before a coordinated disclosure. You do
+not need special permissions to open one — any GitHub account can submit.
 
 We aim to acknowledge within **48 hours** and ship a fix or workaround
 within **14 days** for high-severity issues. Lower-severity issues are

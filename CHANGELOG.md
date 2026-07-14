@@ -7,7 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_No unreleased changes since [1.4.1](#141--2026-07-14)._
+### Added
+- **Root-level [`SECURITY.md`](SECURITY.md)** — Marketplace-readiness fix.
+  GitHub's *Report a vulnerability* discovery flow prefers the file at repo
+  root (or `.github/`); until now we only had the long-form model at
+  [`docs/SECURITY.md`](docs/SECURITY.md), which is the least-discoverable of
+  the three canonical locations. The new root file is a thin pointer that
+  carries the private-advisory reporting instructions, a supported-versions
+  table (`v1.x` current major), and highlights that link to the long-form
+  doc for the full trust model, per-provider egress surfaces, and accepted
+  risks. The two files stay in sync trivially (root = pointer; `docs/` =
+  source of truth).
+
+### Changed
+- **Security reporting channel simplified** in both
+  [`SECURITY.md`](SECURITY.md) and [`docs/SECURITY.md`](docs/SECURITY.md).
+  The prior "email the address in `CODEOWNERS`" fallback pointed at a file
+  that does not exist in the repo — a dead end for reporters who could not
+  use the private-advisory UI. Both files now point exclusively at the
+  GitHub Security Advisory (`security/advisories/new`), which any GitHub
+  account can submit against a public repo. No new dependency, no new
+  attack surface (open-advisory URLs are already public), and no spam
+  magnet from publishing a personal email in a Marketplace-facing file.
+
+### Docs
+- **CHANGELOG backfilled for [`1.3.1`](#131--2026-07-14) through
+  [`1.4.1`](#141--2026-07-14)** — the auto-release workflow cuts SemVer tags
+  on every merge to `main` but deliberately does **not** edit the changelog,
+  so five same-day releases had accumulated their bullets in `[Unreleased]`.
+  Each bullet has been redistributed to its owning tag section with headline
+  notes on the `[1.4.0]` release (vendored Dailybot skill + full-coverage
+  self-review + opt-in gate). Compare-URL footer entries added for
+  `[1.3.1]`–`[1.4.1]` so the bracket-link convention is complete for every
+  section.
 
 ## [1.4.1] — 2026-07-14
 
@@ -313,7 +345,12 @@ Initial public release.
 - Self-review workflow dogfooding the action on its own PRs.
 - Repo hygiene: issue/PR templates and Dependabot for GitHub Actions.
 
-[Unreleased]: https://github.com/DailybotHQ/ai-pr-reviewer/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/DailybotHQ/ai-pr-reviewer/compare/v1.4.1...HEAD
+[1.4.1]: https://github.com/DailybotHQ/ai-pr-reviewer/compare/v1.4.0...v1.4.1
+[1.4.0]: https://github.com/DailybotHQ/ai-pr-reviewer/compare/v1.3.3...v1.4.0
+[1.3.3]: https://github.com/DailybotHQ/ai-pr-reviewer/compare/v1.3.2...v1.3.3
+[1.3.2]: https://github.com/DailybotHQ/ai-pr-reviewer/compare/v1.3.1...v1.3.2
+[1.3.1]: https://github.com/DailybotHQ/ai-pr-reviewer/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/DailybotHQ/ai-pr-reviewer/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/DailybotHQ/ai-pr-reviewer/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/DailybotHQ/ai-pr-reviewer/compare/v1.1.0...v1.2.0
