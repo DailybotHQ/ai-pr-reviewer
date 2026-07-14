@@ -580,6 +580,28 @@ class ClaudeCodeInvocationTests(unittest.TestCase):
             "model 'auto' means 'let the CLI pick its default' — no --model.",
         )
 
+    def test_mcp_config_flag_added_when_set(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            mcp_src = str(Path(td) / "mcp.json")
+            Path(mcp_src).write_text('{"mcpServers":{}}', encoding="utf-8")
+            captured = _capture_provider_call(
+                reviewer.ClaudeCodeProvider(
+                    api_key="k", model="", mcp_config_file=mcp_src
+                )
+            )
+            argv = captured["argv"]
+            self.assertIn(
+                "--mcp-config",
+                argv,
+                "Claude Code only loads MCP from --mcp-config; a bare copy to "
+                "~/.claude/mcp.json is ignored.",
+            )
+            self.assertEqual(argv[argv.index("--mcp-config") + 1], mcp_src)
+
+    def test_no_mcp_config_flag_when_unset(self) -> None:
+        argv = self._capture()["argv"]
+        self.assertNotIn("--mcp-config", argv)
+
 
 class CodexInvocationTests(unittest.TestCase):
     """CodexProvider must escape the default read-only sandbox and pipe the

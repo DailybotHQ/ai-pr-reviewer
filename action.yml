@@ -22,7 +22,7 @@ inputs:
     required: false
     default: 'anthropic'
   model:
-    description: 'Model id for the chosen provider. Empty = provider default (Anthropic → `claude-sonnet-4-6`, Cursor → `composer-2.5`, Codex → `gpt-5-codex`, Claude Code → account default).'
+    description: 'Model id for the chosen provider. Empty = provider default (Anthropic → `claude-sonnet-4-6`, Cursor → `auto` (unlimited on Pro plans; pin `composer-2.5` etc. to force a specific model), Codex → `gpt-5-codex`, Claude Code → account default).'
     required: false
     default: ''
 

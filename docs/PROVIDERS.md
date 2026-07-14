@@ -203,7 +203,7 @@ The `provider: cursor` leg has a materially different cost profile from the chat
 ### Recommended default: `model: auto`
 
 - Cursor's `auto` selector routes to the best available model based on availability and load. On Pro plans, `auto` is **unlimited** (subject to fair-use rate limits) and is the right default for CI to avoid draining monthly credits on premium models.
-- Set it explicitly in your workflow:
+- **`auto` is the built-in default for `provider: cursor`** (empty `model:` resolves to it). You only need to set it explicitly if you want to be self-documenting:
 
   ```yaml
   - uses: DailybotHQ/ai-pr-reviewer@v1
@@ -242,3 +242,23 @@ Every run logs the resolved model + argv (with the API key redacted). Combine th
 | BYOK | ❌ Not supported | ✅ Bring your own Anthropic key | ✅ Bring your own OpenAI key | ✅ Bring your own Anthropic key |
 | Unlimited plan | ✅ `model: auto` on Pro | ❌ Metered | ❌ Metered | ❌ Metered |
 | Best for | Teams already on Cursor Pro | Teams already on Anthropic | Teams already on OpenAI | Pure API workloads |
+
+---
+
+## Running more than one provider on the same PR
+
+**In production, pick ONE provider per PR.** The action is designed for a single review per push, and running several providers against the same PR needs care because of how `collapse-previous` works.
+
+`collapse-previous` (default `true`) minimizes **every** prior comment and review authored by the same bot identity — it keys on the author login, not on which provider produced the comment. When you run multiple provider jobs on one PR and they all use the same `github-token` (`secrets.GITHUB_TOKEN` → author `github-actions[bot]`), each job's collapse step will mark the *other* providers' reviews as `OUTDATED`. With the jobs running in parallel (as in a matrix), whichever one collapses last wins, and you end up with only one live review instead of several.
+
+If you genuinely want several providers to comment side-by-side on the same PR, do **all** of the following:
+
+1. **Set `collapse-previous: false`** on every provider job so they stop collapsing each other. (Trade-off: prior-push reviews are no longer auto-outdated — they accumulate.)
+2. **Give each provider a distinct `applied-label`** (e.g. `reviewed:anthropic`, `reviewed:codex`) so you can tell the reviews apart in the conversation tab.
+3. Consider a distinct bot identity (a separate PAT) per provider if you also want each provider to collapse *its own* prior runs without touching the others — with a shared `GITHUB_TOKEN` that isn't possible today.
+
+This repo's own [`self-review.yml`](../.github/workflows/self-review.yml) uses approach (1)+(2) to dogfood all four providers on every PR without them hiding each other.
+
+> **Passing multiple provider API keys** (e.g. both `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` as repo secrets) is fine and does **not** cause cross-contamination: each job forwards only its own provider's key to the CLI subprocess (`_build_cli_env` scrubs everything else), and a single action invocation uses exactly one `provider` + one `api-key`. There is no "both keys in one run" mode — the keys only coexist as separate secrets consumed by separate jobs.
+
+> **Per-provider collapse scoping is a known follow-up.** A future release may embed a provider tag in the review/tracking markers so `collapse-previous` can scope to "this provider's prior runs only", making multi-provider PRs work with the default `true`. Until then, use the manual steps above.

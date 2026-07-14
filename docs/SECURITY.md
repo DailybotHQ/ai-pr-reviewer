@@ -49,6 +49,8 @@ Because a malicious **fork PR** author controls the diff, title, and body that s
 - **Set `persist-credentials: false` on the `actions/checkout` step** so the `GITHUB_TOKEN` is never written into `.git/config` on disk. (Note: `git diff origin/<base>...HEAD` still needs `fetch-depth: 0`.)
 - **Never use `pull_request_target`** with an agent-runner provider — it hands a write-scoped token to a job seeded by fork-controlled content.
 
+As a runtime backstop, the reviewer registers the provider API key and the GitHub token as literal secret values (`register_secret`) and scrubs any occurrence of them out of the review summary, every inline-comment body, and any failure message **before** posting to the PR (`scrub_secrets`). This is defense-in-depth, not a substitute for the trust-boundary controls above: it only catches the two secrets the runtime knows about, and a determined injection could transform a value (base64, reversed, split) to evade the literal match.
+
 The default `provider: anthropic` path is not subject to (1) or (2): its only tools are `read_file`/`grep`/`glob` (all `safe_repo_path`-scoped to the checkout), `post_inline_comment`, and `submit_review` — none can read process env or files outside the repo, so the worst case of a successful injection there is "the reviewer wrote silly comments on this one PR."
 
 ### Cursor installer supply chain

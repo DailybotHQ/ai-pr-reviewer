@@ -1684,5 +1684,81 @@ class DriveReviewPruningTests(unittest.TestCase):
         self.assertEqual(state.final_summary, "ok")
 
 
+class SecretScrubbingTests(unittest.TestCase):
+    """Registered secret VALUES must be scrubbed from any public-facing text.
+
+    Defense-in-depth for the agent-runner path (a prompt-injected vendor CLI
+    could echo its API key into a finding). See docs/SECURITY.md.
+    """
+
+    def setUp(self) -> None:
+        self._saved = set(reviewer._SECRET_VALUES)
+        reviewer._SECRET_VALUES.clear()
+
+    def tearDown(self) -> None:
+        reviewer._SECRET_VALUES.clear()
+        reviewer._SECRET_VALUES.update(self._saved)
+
+    def test_registered_secret_is_scrubbed(self) -> None:
+        reviewer.register_secret("sk-ant-supersecretvalue123")
+        out = reviewer.scrub_secrets(
+            "leaked: sk-ant-supersecretvalue123 end"
+        )
+        self.assertNotIn("sk-ant-supersecretvalue123", out)
+        self.assertIn("***", out)
+
+    def test_short_values_are_not_registered(self) -> None:
+        reviewer.register_secret("abc")  # below MIN_SCRUBBABLE_SECRET_LEN
+        self.assertEqual(reviewer.scrub_secrets("abc def"), "abc def")
+
+    def test_empty_and_none_safe(self) -> None:
+        reviewer.register_secret("")
+        self.assertEqual(reviewer.scrub_secrets(""), "")
+
+    def test_failure_tracking_body_scrubs_secret(self) -> None:
+        reviewer.register_secret("ghp_tokenvalue_1234567890")
+        body = reviewer.render_tracking_body_failed(
+            head_sha="abc1234def",
+            error="RuntimeError: leaked ghp_tokenvalue_1234567890 in stderr",
+        )
+        self.assertNotIn("ghp_tokenvalue_1234567890", body)
+        self.assertIn("***", body)
+
+
+class CliProxyEnvForwardingTests(unittest.TestCase):
+    """Proxy + base-url network config must reach the vendor CLI subprocess
+    (I3) — a CLI behind a corporate proxy can't reach its API otherwise."""
+
+    def test_proxy_and_base_url_vars_forwarded(self) -> None:
+        prev = dict(os.environ)
+        try:
+            os.environ.clear()
+            os.environ.update(
+                {
+                    "PATH": "/usr/bin",
+                    "HTTPS_PROXY": "http://proxy:8080",
+                    "NO_PROXY": "localhost",
+                    "ANTHROPIC_BASE_URL": "https://gw.internal/v1",
+                }
+            )
+            env = reviewer._build_cli_env(extra_vars={})
+            self.assertEqual(env.get("HTTPS_PROXY"), "http://proxy:8080")
+            self.assertEqual(env.get("NO_PROXY"), "localhost")
+            self.assertEqual(
+                env.get("ANTHROPIC_BASE_URL"), "https://gw.internal/v1"
+            )
+        finally:
+            os.environ.clear()
+            os.environ.update(prev)
+
+
+class CursorDefaultModelTests(unittest.TestCase):
+    """Cursor's default model should be `auto` (unlimited on Pro), matching
+    the recommendation in docs/PROVIDERS.md (I2)."""
+
+    def test_cursor_default_is_auto(self) -> None:
+        self.assertEqual(reviewer.DEFAULT_MODELS["cursor"], "auto")
+
+
 if __name__ == "__main__":
     unittest.main()

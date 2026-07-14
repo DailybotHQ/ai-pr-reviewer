@@ -96,7 +96,11 @@ DEFAULT_MODELS: dict[str, str] = {
     # default at runtime" (usually the account-tier default for that vendor).
     # A `model:` input from the consumer overrides this.
     "claude-code": "auto",
-    "cursor": "composer-2.5",
+    # `auto` routes through Cursor's model dispatch and is unlimited on Pro
+    # plans (metered premium models like `composer-2.5` burn monthly credits).
+    # docs/PROVIDERS.md recommends `auto` as the CI default; keep the default
+    # aligned with that guidance. Consumers can still pin a specific model.
+    "cursor": "auto",
     "codex": "gpt-5-codex",
 }
 
@@ -261,6 +265,40 @@ def redact_for_log(args: dict[str, Any]) -> dict[str, Any]:
         k: ("***" if any(s in k.lower() for s in LOG_REDACT_SUBSTRINGS) else v)
         for k, v in args.items()
     }
+
+
+# Registry of literal secret VALUES that must never reach a public surface
+# (a PR comment or review body). `redact_for_log` scrubs by key *name*; this
+# scrubs by exact value. Populated once in `main()` with the provider API key
+# and the GitHub token. Defense-in-depth for the agent-runner path, where a
+# prompt-injected vendor CLI could echo its API key into a finding body (see
+# docs/SECURITY.md § "Agent-runner providers: residual exfiltration surface").
+_SECRET_VALUES: set[str] = set()
+# Below this length a "secret" is too short to scrub without risking mangling
+# ordinary review prose. Real API keys / tokens are far longer.
+MIN_SCRUBBABLE_SECRET_LEN: int = 8
+
+
+def register_secret(value: str) -> None:
+    """Register a secret value for scrubbing from public-facing text."""
+    if value and len(value) >= MIN_SCRUBBABLE_SECRET_LEN:
+        _SECRET_VALUES.add(value)
+
+
+def scrub_secrets(text: str) -> str:
+    """Replace every registered secret value in `text` with `***`.
+
+    Applied to review summaries, inline-comment bodies, and failure messages
+    before they are posted to the PR, so a leaked/echoed key can't surface in
+    a public comment even if the model (or a vendor CLI) was tricked into
+    embedding it.
+    """
+    if not text:
+        return text
+    for secret in _SECRET_VALUES:
+        if secret in text:
+            text = text.replace(secret, "***")
+    return text
 
 
 def truncate_for_tool(text: str, *, label: str) -> str:
@@ -969,6 +1007,19 @@ _CLI_ENV_ALLOWLIST: tuple[str, ...] = (
     "RUNNER_ARCH",
     "GITHUB_ACTIONS",
     "CI",
+    # Outbound-proxy configuration — a CLI on a corporate / self-hosted
+    # runner behind a proxy can't reach its vendor API without these. They
+    # are non-secret network config, not credentials.
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    # Custom / self-hosted API endpoints for the vendor CLIs (e.g. an
+    # Anthropic- or OpenAI-compatible gateway). Non-secret base URLs.
+    "ANTHROPIC_BASE_URL",
+    "OPENAI_BASE_URL",
 )
 
 
@@ -1127,6 +1178,12 @@ class ClaudeCodeProvider(AgentRunnerProvider):
                 "--permission-mode",
                 "bypassPermissions",
             ]
+            # Claude Code only loads MCP servers from an explicit
+            # `--mcp-config <file>` (or project `.mcp.json`) — a bare copy to
+            # ~/.claude/mcp.json is NOT read. Point the flag at the consumer's
+            # file directly so the passthrough actually takes effect.
+            if self.mcp_config_file:
+                argv += ["--mcp-config", self.mcp_config_file]
             if self.model and self.model != "auto":
                 argv += ["--model", self.model]
             if self.extra_args:
@@ -1314,6 +1371,19 @@ class CodexProvider(AgentRunnerProvider):
             + "\n\n---\n\n"
             + render_user_prompt(pr_context, for_agent_runner=True)
         )
+
+        if self.mcp_config_file:
+            # Codex configures MCP servers via `~/.codex/config.toml`
+            # ([mcp_servers] TOML), NOT a JSON file — the copied mcp.json is
+            # ignored. Warn loudly rather than silently no-op so the consumer
+            # knows the passthrough didn't take effect. See docs/PROVIDERS.md.
+            log(
+                "WARNING: mcp-config-file is set but Codex does not read a JSON "
+                "MCP config (it uses ~/.codex/config.toml). The MCP passthrough "
+                "will NOT take effect for provider=codex. Configure MCP via "
+                "agent-extra-args (`-c mcp_servers...`) or a preconfigured "
+                "config.toml instead."
+            )
 
         mcp_dest, mcp_backup = _swap_mcp_config(
             self.mcp_config_file, self.MCP_DEST
@@ -2867,11 +2937,17 @@ def render_tracking_body_done(
 
 
 def render_tracking_body_failed(*, head_sha: str, error: str) -> str:
-    """The terminal 'failed' tracking-comment body."""
+    """The terminal 'failed' tracking-comment body.
+
+    The error text can carry CLI stderr/stdout tails (see `_invoke_cli_agent`),
+    so it is passed through `scrub_secrets` before being embedded in this
+    public comment.
+    """
+    safe_error: str = scrub_secrets(error)[:MAX_TRACKING_ERROR_CHARS]
     return (
         f"{REVIEW_MARKER}\n"
         f"### AI review for `{head_sha[:7]}` — ❌ failed\n\n"
-        f"```\n{error[:MAX_TRACKING_ERROR_CHARS]}\n```\n\n"
+        f"```\n{safe_error}\n```\n\n"
         "_See the workflow logs for the full traceback._"
     )
 
@@ -2903,6 +2979,10 @@ def main() -> int:
         )
         write_all_outputs(skipped=False)
         return 1
+    # Register the two secrets so their literal values are scrubbed from any
+    # text that reaches a public PR comment / review body (see scrub_secrets).
+    register_secret(api_key)
+    register_secret(gh_token)
     pr_number: int = int(pr_number_raw)
 
     model: str = (
@@ -3306,6 +3386,15 @@ def main() -> int:
                 else "  (mode: `warn` — advisory only)"
             )
         )
+
+    # Scrub any registered secret value out of everything that is about to be
+    # posted publicly — the summary and each inline-comment body. On the
+    # agent-runner path these strings originate from a vendor CLI that holds
+    # an API key in its env; this is the last line of defence before a leaked
+    # key could land in a public comment (see docs/SECURITY.md).
+    result.summary = scrub_secrets(result.summary)
+    for _finding in result.findings:
+        _finding.body = scrub_secrets(_finding.body)
 
     log(
         f"Submitting review: {len(result.findings)} inline comment(s), "
