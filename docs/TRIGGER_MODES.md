@@ -172,6 +172,28 @@ Net effect: the per-leg checks stay **honestly Skipped** for humans reading the 
 
 > **Note — this is the opposite trade-off from "Skipped is fine".** If you *want* un-reviewed PRs to stay freely mergeable (the review is advisory, not a gate), skip technique 3 entirely and don't mark anything required — the Skipped legs are exactly right. Add the gate only when a review must be a *precondition* for merge.
 
+**Variant — opt-in gate (skip when no `ready`).** The strict recipe above blocks *every* PR without `ready`. If you instead want "when a review is requested it must pass, but PRs that don't request a review shouldn't carry a red X in the checks list", make the gate skip when this event wasn't a review-request. The most robust way is to have `gate-decision` expose *why* the matrix is empty and gate on that:
+
+```yaml
+  gate-decision:
+    outputs:
+      matrix: ${{ steps.d.outputs.matrix }}
+      # `no-ready-label` (event wasn't a review-request) vs
+      # `no-eligible-provider` (was a review-request but nothing matched).
+      empty_reason: ${{ steps.d.outputs.empty_reason }}
+    # ...
+
+  gate:
+    name: 'Self-review gate'
+    needs: [gate-decision, review]
+    # Runs only when THIS event was a review-request. Otherwise Skipped (grey).
+    if: always() && needs.gate-decision.outputs.empty_reason != 'no-ready-label'
+```
+
+A simpler `if: always() && contains(github.event.pull_request.labels.*.name, 'ready')` works for the common case but has a subtle bug: it treats *"label is on the PR"* as *"this event requested a review"*, so if `ready` is already present and someone adds an unrelated label (`bug`, `documentation`…), the workflow re-fires, the gate runs, and fails on the (expected) empty matrix. Reading `empty_reason` from the decision job avoids that.
+
+Trade-off: since GitHub treats a Skipped required check as *passing*, marking this gate `Required` under the opt-in variant means a PR without `ready` becomes mergeable **without a review**. Pair it with a separate rule that enforces the `ready` label (a lightweight labeler action or a repository ruleset) if you want to force `ready` on every PR. This repo's own [`.github/workflows/self-review.yml`](../.github/workflows/self-review.yml) uses this opt-in variant with the `empty_reason` check.
+
 ## Interaction with `on:` and `concurrency`
 
 - The workflow's `on:` block is the outer gate — GitHub only fires the runner when the subscribed event matches.
