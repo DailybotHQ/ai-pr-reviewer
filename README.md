@@ -15,9 +15,11 @@ Originally built to replace [`anthropics/claude-code-action@v1`](https://github.
 
 - [Quick start](#quick-start)
 - [What you get out of the box](#what-you-get-out-of-the-box)
+- [Providers](#providers)
 - [Inputs](#inputs)
 - [Outputs](#outputs)
 - [Strictness levels](#strictness-levels)
+- [Controlling cost & access](#controlling-cost--access)
 - [Recipes](#recipes)
 - [Required permissions](#required-permissions)
 - [How it works](#how-it-works)
@@ -76,6 +78,58 @@ That's the minimum. Open a PR; the action posts a tracking comment, runs a revie
 
 ---
 
+## Providers
+
+The action ships **four LLM providers** in two families. Pick one with the `provider` input; `api-key` always carries the credential for the chosen provider. The default (`anthropic`) needs no CLI install; the three agent-runner CLIs are installed automatically by the action only when you select them.
+
+| `provider` | Family | `api-key` value | Default model | Billing |
+|---|---|---|---|---|
+| `anthropic` *(default)* | chat-completions | Anthropic API key (`sk-ant-api…`) | `claude-sonnet-4-6` | metered API |
+| `claude-code` | agent-runner CLI | Anthropic API key **or** a `claude setup-token` token (`sk-ant-oat…`) | `claude-sonnet-4-6` | metered API **or** Claude Pro/Max subscription |
+| `cursor` | agent-runner CLI | Cursor subscription key | `auto` | Cursor subscription (unlimited on Pro) |
+| `codex` | agent-runner CLI | OpenAI API key | `gpt-5.6-luna` | metered API |
+
+- **`anthropic`** is the simplest and cheapest to run — no install, a bounded tool-use loop, prompt caching. Recommended for most repos.
+- **The CLI providers** hand the review to a vendor coding agent (deeper code comprehension, vendor-tuned tools) at the cost of an install step and higher token use. They run with broad local access — on public repos use them only on trusted (non-fork) PRs.
+
+### Switching provider
+
+```yaml
+# Cursor — flat-rate on Pro
+- uses: DailybotHQ/ai-pr-reviewer@v1
+  with:
+    provider: cursor
+    api-key: ${{ secrets.CURSOR_API_KEY }}
+    github-token: ${{ secrets.GITHUB_TOKEN }}
+```
+
+```yaml
+# OpenAI Codex
+- uses: DailybotHQ/ai-pr-reviewer@v1
+  with:
+    provider: codex
+    api-key: ${{ secrets.OPENAI_API_KEY }}
+    github-token: ${{ secrets.GITHUB_TOKEN }}
+```
+
+Ready-to-copy workflows per provider: [`examples/provider-claude-code.yml`](examples/provider-claude-code.yml), [`examples/provider-cursor.yml`](examples/provider-cursor.yml), [`examples/provider-codex.yml`](examples/provider-codex.yml).
+
+### Bill Claude Code against a subscription (instead of API tokens)
+
+Like Cursor, `claude-code` can bill against a **Claude Pro/Max subscription**. Run `claude setup-token` on a machine logged into your plan, store the resulting `sk-ant-oat…` token as a secret, and pass it as `api-key` — the action auto-detects the prefix and uses subscription auth:
+
+```yaml
+- uses: DailybotHQ/ai-pr-reviewer@v1
+  with:
+    provider: claude-code
+    api-key: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}   # sk-ant-oat… subscription token
+    github-token: ${{ secrets.GITHUB_TOKEN }}
+```
+
+> **Security:** a subscription token grants broader account access than a scoped API key. On public repos, use the CLI providers only on trusted (non-fork) PRs and set `persist-credentials: false` on `actions/checkout`. Full details: [docs/PROVIDERS.md](docs/PROVIDERS.md) and [docs/SECURITY.md](docs/SECURITY.md).
+
+---
+
 ## Inputs
 
 | Input | Required | Default | Description |
@@ -115,7 +169,19 @@ That's the minimum. Open a PR; the action posts a tracking comment, runs a revie
 | `inline-attached` | int | Inline comments actually attached. |
 | `inline-dropped` | int | Inline comments dropped because GitHub returned 422. |
 | `blocked` | bool | Whether strictness blocked the check. When `true`, the action exits with code 2. |
-| `skipped` | bool | Whether the run was skipped by the label gate. |
+| `skipped` | bool | Whether the run was skipped (label/author gate). |
+
+Consume them in a later step by giving the action step an `id`:
+
+```yaml
+      - id: review
+        uses: DailybotHQ/ai-pr-reviewer@v1
+        with:
+          api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - if: steps.review.outputs.severity == 'critical'
+        run: echo "Critical findings — see ${{ steps.review.outputs.review-url }}"
+```
 
 ---
 
@@ -131,6 +197,39 @@ That's the minimum. Open a PR; the action posts a tracking comment, runs a revie
 The model decides severity per inline comment via the tool's `severity` argument; the bundled default prompt explains the levels in detail. Customise the prompt to make the model more or less aggressive about each tier.
 
 Full guide: [docs/STRICTNESS.md](docs/STRICTNESS.md).
+
+---
+
+## Controlling cost & access
+
+Every review spends tokens, so the action layers three controls, evaluated **cheapest-first** — a denied gate costs **zero API calls**:
+
+**1. Who can trigger a review — `author-association`** (default `OWNER,MEMBER,COLLABORATOR` = write-tier only). This is evaluated **first**, before the diff is even fetched, so an outsider opening PRs from a fork can never burn your budget — the field comes from GitHub's webhook payload and can't be spoofed.
+
+| Want to… | Set |
+|---|---|
+| Only people with write access (default, safe for public repos) | `OWNER,MEMBER,COLLABORATOR` |
+| Also allow returning contributors | `OWNER,MEMBER,COLLABORATOR,CONTRIBUTOR` |
+| Only org members | `OWNER,MEMBER` |
+| Review **every** PR (e.g. private repos) | `''` (empty) |
+
+**2. When it runs — `label-gate` + `trigger-mode`:**
+
+| Behaviour | Set |
+|---|---|
+| Every push (default) | `trigger-mode: always` |
+| Only when the PR has a label | `label-gate: ready` (matching is **case-insensitive**: `ready`/`Ready`/`READY`) |
+| Only once per label application (re-run by toggling the label off/on) | `label-gate: ready` + `trigger-mode: label-once` |
+| Only on the moment the label is added | `trigger-mode: label-added-only` (workflow must subscribe with `types: [labeled]`) |
+
+**3. How much each run spends — `model`, `max-inline-comments`, `max-turns`:**
+
+- Defaults are **quality-tier** for real reviews (Sonnet-class / current-gen). Pin a cheaper model for smoke passes (`model: claude-haiku-4-5` or `gpt-5.4-mini`), or use `provider: cursor` for flat-rate cost on Pro. See [docs/PROVIDERS.md § "Choosing a cost-efficient model"](docs/PROVIDERS.md#choosing-a-cost-efficient-model).
+- `max-inline-comments` (default `10`) caps how many comments a run can post; `max-turns` (default `30`, chat-completions only) is a safety ceiling on the agentic loop.
+
+These compose. For a public open-source repo the safe combination is author-association (default) **+** a label gate — see the [recipe below](#public-open-source-repo-safest-defaults).
+
+Threat model & full detail: [docs/SECURITY.md § "Author-association gate"](docs/SECURITY.md), [docs/TRIGGER_MODES.md](docs/TRIGGER_MODES.md).
 
 ---
 
@@ -265,7 +364,7 @@ The job-level `timeout-minutes: 15` is recommended — the agentic loop has its 
 
 ## How it works
 
-1. **Label gate** — early-exits if `label-gate` is set and missing.
+1. **Access & trigger gates** (cheapest first, no API calls) — `author-association` runs first (skip if the PR author isn't in the whitelist), then the `label-gate` / `trigger-mode` check (skip if the required label is missing or this label application was already reviewed).
 2. **Collapse previous** — marks prior bot reviews/comments as `OUTDATED` via GraphQL.
 3. **Tracking comment** — posts a `Working…` comment with a stable marker.
 4. **Fetch PR** — pulls metadata, file list, and `git diff origin/<base>...HEAD`.
