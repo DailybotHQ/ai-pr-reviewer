@@ -197,11 +197,34 @@ mi-repo/
 └── (project code)
 ```
 
-The skill's auto-detection order (first match wins, all silent-fallback):
+The skill's auto-detection order (first match wins):
 
 1. `.review/extension.md` ← recommended default
-2. `.github/ai-pr-reviewer/extension.md` ← fallback for teams that prefer keeping config next to workflow files
-3. None → use base prompt alone
+2. `.github/ai-diff-reviewer/extension.md` ← fallback for teams that prefer keeping config next to workflow files (pre-v1.5 `.github/ai-pr-reviewer/extension.md` also accepted for back-compat)
+3. None found → the skill enters the **first-run bootstrap prompt** (see below) unless `.review/.skip-bootstrap` exists
+
+### First-run bootstrap prompt
+
+The first time the review flow activates on a repo without an extension file, the skill asks ONE question:
+
+> No `.review/extension.md` found. Bootstrap one now? (yes / no / never)
+
+- **yes** → invokes the `generate-extension` sub-skill (see below), then re-enters the review with the fresh extension layered on top of the base prompt.
+- **no** → runs the review this once with the base prompt only. The prompt fires again the next time the skill activates.
+- **never** → creates `.review/.skip-bootstrap` (a 0-byte tracked marker). The prompt never fires again in this repo. Commit the marker so the whole team inherits the same UX; delete it to re-enable the offer.
+
+**The base prompt alone is fully functional** — it's the same [`prompts/default.md`](../prompts/default.md) that the CI action uses when no `prompt-file`/`prompt-extension-file` are configured, and it catches the ~90% of general-purpose issues (SQL injection, unhandled promises, missing input validation, obvious perf regressions). The bootstrap prompt exists to nudge repos into the higher-value tailored-review path without blocking impatient users or forcing Discovery on repos that genuinely don't need customization.
+
+### The `.review/.skip-bootstrap` marker
+
+| Property | Value |
+|---|---|
+| **Path** | `.review/.skip-bootstrap` (relative to repo root) |
+| **Content** | 0 bytes (presence is the signal) |
+| **Created by** | The skill, when the developer answers **never** at the bootstrap prompt |
+| **Committed?** | Yes — the whole point is that the team inherits the preference. If left uncommitted, every teammate sees the prompt on their first review run. |
+| **To re-enable the offer** | `rm .review/.skip-bootstrap && git commit -am "chore(review): re-enable AI Diff Reviewer bootstrap offer"` |
+| **Interaction with extension** | Orthogonal — if you later run `generate-extension` explicitly and end up with both files, the extension is loaded normally (Step 2 wins over Step 2.5). |
 
 Reference the same file from your CI workflow so both surfaces produce the same review:
 

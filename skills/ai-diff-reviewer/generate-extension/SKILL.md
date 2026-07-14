@@ -34,9 +34,22 @@ bugs."
 - "Tailor the reviewer to our stack"
 - "Bootstrap the extension file"
 
-The parent [`ai-diff-reviewer`](../SKILL.md) skill routes to this sub-skill
-automatically when the developer asks for setup/customization instead
-of running a review.
+The parent [`ai-diff-reviewer`](../SKILL.md) skill also routes to this
+sub-skill in two situations:
+
+1. **Explicit intent** — the developer asks for setup/customization
+   instead of running a review (any of the triggers above).
+2. **Automatic bootstrap** — the developer runs the review on a repo
+   with no `.review/extension.md` and no `.review/.skip-bootstrap`
+   marker, and answers **yes** at the Step 2.5 prompt in the parent
+   skill. In this case, when this sub-skill finishes writing the file,
+   control returns to the parent skill's Step 2 which layers the fresh
+   extension onto the base prompt and continues the review.
+
+Both entry paths run the same Discovery + Write flow below. **Do not
+skip Discovery** just because the invocation came from the bootstrap
+offer — the whole value of the extension is the file-anchored
+Discovery evidence, not the file itself.
 
 ---
 

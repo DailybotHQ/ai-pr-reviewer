@@ -65,6 +65,15 @@ Two coordinated capabilities, routed by intent:
 Both share the same shipped [`prompt.md`](prompt.md) as the base — one
 runs it, the other tailors what layers on top.
 
+**First-time bootstrap.** The first time the review flow runs on a repo
+with no `.review/extension.md`, the skill asks a single question
+(**yes** / **no** / **never**) offering to invoke the `generate-extension`
+sub-skill so the review has repo-tailored overrides layered on top of
+the base prompt from day one. Declining once (`no`) or forever
+(`never`, persists as `.review/.skip-bootstrap`) is fine — the base
+prompt still catches ~90% of general-purpose issues. Full flow in Step
+2.5 below.
+
 ## Activation
 
 **Default flow (run a review) — triggers:**
@@ -95,18 +104,27 @@ check the harness's skill-invocation docs.
 
 ## Step 0 — Trust boundary
 
-This skill is **read-only** on the working tree and does **not** call any
-remote API. It:
+This skill is **near read-only** on the working tree and does **not**
+call any remote API. It:
 
 - Reads files from the current git checkout (`Read`, `Grep`, `Glob`).
 - Runs `git diff` and `git log` locally (no push, no fetch).
 - Composes the review prompt in the agent's context and produces the
   review as terminal output.
 
+The **only** writes it may perform, and only with explicit developer
+consent in Step 2.5:
+
+- Create `.review/` and write `.review/extension.md` — if the developer
+  answers **yes** to the bootstrap offer (invokes the
+  `generate-extension` sub-skill).
+- Create `.review/` and touch `.review/.skip-bootstrap` (0 bytes) — if
+  the developer answers **never** to the bootstrap offer.
+
 It does **not**:
 
 - Post inline comments to GitHub (that's the CI action's job).
-- Modify any file in the working tree.
+- Modify any source file, workflow, or config file in the working tree.
 - Call the LLM provider directly — it uses the coding agent that's
   already running you.
 - Send any data off your machine.
@@ -157,15 +175,80 @@ Then check for a **repo-specific extension** in this order of precedence
    `.github/ai-pr-reviewer/extension.md` also accepted for back-compat
    with the pre-v1.5 skill name)
 
-Read the matching file (if any) and append its content to the base prompt
-verbatim. If neither exists, use the base prompt alone — no error, no
-warning.
+**If a match is found** — read it, append its content to the base prompt
+verbatim, and skip to Step 3.
+
+**If no match is found**:
+
+- If `.review/.skip-bootstrap` exists → the developer opted out of the
+  bootstrap offer previously. Use the base prompt alone (no announcement),
+  skip to Step 3.
+- Otherwise → go to **Step 2.5** (first-time bootstrap offer).
 
 Announce the composed configuration in one line, e.g.
 `Reviewing feat/foo (a1b2c3d) against main. Base prompt + .review/extension.md.`
 
 The final composed prompt is what governs the review — the severity
 definitions, the "what NOT to comment on" rules, the output shape.
+
+---
+
+## Step 2.5 — Offer to bootstrap the extension (first-time only)
+
+This step fires only when Step 2 found no extension file **and** no
+`.review/.skip-bootstrap` marker exists. It's the one moment the skill
+educates the developer about the extension convention. After the answer
+is recorded (either as generated content or an opt-out marker), the
+skill never asks again in this repo unless the developer removes the
+marker.
+
+Ask the developer ONE question:
+
+> **No `.review/extension.md` found for this repo.**
+>
+> I can run the review right now with the shipped default prompt — that
+> catches ~90% of general-purpose issues (SQL injection, unhandled
+> promises, missing input validation, obvious perf regressions, etc.).
+>
+> But it will miss the **repo-specific** stuff: your money-handling
+> conventions, the modules where `console.log` is banned, the RFC-014
+> pattern, the always-critical SQL patterns tied to YOUR schema. That's
+> what a `.review/extension.md` gives you — file-anchored severity
+> overrides written against THIS codebase.
+>
+> Want to bootstrap one now? (~30 seconds of Discovery + a ~100-line
+> file of concrete overrides.)
+>
+> - **yes** — I'll route to the `generate-extension` sub-skill, then
+>   come back and run the review with the fresh extension layered on.
+> - **no** — run the review this once with the base prompt only. I'll
+>   ask again the next time the skill activates.
+> - **never** — never ask again in this repo. I'll create
+>   `.review/.skip-bootstrap` (a tracked 0-byte marker). Commit it so
+>   your whole team inherits the same preference. To re-enable the
+>   offer later, delete the marker.
+
+Handle the response:
+
+- **yes** → invoke the `generate-extension` sub-skill in extension mode
+  (see [`generate-extension/SKILL.md`](generate-extension/SKILL.md)).
+  When the sub-skill finishes writing `.review/extension.md`, re-enter
+  Step 2 from the top — the freshly-written file will be picked up and
+  layered onto the base prompt. Do NOT skip the sub-skill's Discovery
+  phase (12+ tool calls); that's where the value is.
+- **no** → skip to Step 3 with the base prompt alone. Do NOT persist
+  anything. The offer fires again next time.
+- **never** → run:
+  ```bash
+  mkdir -p .review
+  touch .review/.skip-bootstrap
+  ```
+  Then skip to Step 3 with the base prompt alone. Suggest the developer
+  commit the marker: `git add .review/.skip-bootstrap && git commit -m
+  "chore(review): opt out of AI Diff Reviewer bootstrap offer"`.
+
+If the developer's response is ambiguous, default to **no** (the
+minimally-disruptive choice) — do not silently opt them out.
 
 ---
 
@@ -233,8 +316,24 @@ local review says X, so CI will say X too."
 
 ## Step 5 — Extension file convention (for consumers)
 
-If a maintainer wants repo-specific rules layered on top of the base
-prompt, create **either**:
+Three ways to end up with an extension file, all valid:
+
+1. **Automated bootstrap** — say "review my branch" on a fresh repo,
+   answer **yes** at the Step 2.5 prompt. The `generate-extension`
+   sub-skill runs its 12+ tool-call Discovery and writes
+   `.review/extension.md` for you. Simplest path — recommended for the
+   first setup.
+2. **Explicit sub-skill invocation** — say "generate a
+   `.review/extension.md` for this repo" (or one of the other triggers
+   listed in Activation). Same result as (1) but skips the bootstrap
+   prompt. Use this to regenerate or refine an existing file.
+3. **Hand-written** — create the file yourself, using the schema and
+   examples below. Best when you know exactly what overrides you want
+   and don't need the Discovery walkthrough.
+
+Whichever path you take, the layout options are the same:
+
+**Option A — `.review/extension.md`** (recommended):
 
 **Option A — `.review/extension.md`** (recommended):
 
@@ -298,6 +397,13 @@ Full authoring guide (structure, tips, worked examples):
   tooling.** If your `.review/extension.md` says something different
   from what your CI workflow's `prompt-extension-file:` points at, you
   get drift. Keep them at the same path.
+- **Opt-out marker (`.review/.skip-bootstrap`).** A 0-byte tracked
+  marker file that tells the skill "don't offer to bootstrap the
+  extension anymore in this repo — the team knows the option exists
+  and chose to stick with the base prompt." Created by answering
+  **never** at the Step 2.5 prompt. Delete the file to re-enable the
+  offer. Committing it is the intended behaviour so the whole team
+  inherits the same UX.
 - **Bugs, feature requests, and extension patterns to add to the
   starter templates:**
   [`github.com/DailybotHQ/ai-diff-reviewer/issues`](https://github.com/DailybotHQ/ai-diff-reviewer/issues).

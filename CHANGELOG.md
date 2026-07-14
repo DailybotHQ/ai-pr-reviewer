@@ -57,6 +57,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   migrate.
 
 ### Added
+- **First-run bootstrap prompt in the `ai-diff-reviewer` skill** — when
+  the review flow activates on a repo with no `.review/extension.md`
+  (and no `.review/.skip-bootstrap` marker), the skill asks ONE
+  question — **yes / no / never** — offering to route to
+  `generate-extension` so the review is layered on repo-tailored
+  overrides from day one. Choosing **yes** invokes the sub-skill and
+  re-runs the review with the fresh extension; **no** proceeds with
+  the base prompt just this once (offer fires again next time);
+  **never** creates `.review/.skip-bootstrap` (a 0-byte tracked
+  marker) so the offer never fires again in this repo. Committing the
+  marker is the intended workflow — the whole team inherits the same
+  UX. Deletion re-enables the offer. Documented in the skill's Step
+  2.5, [`docs/PROMPTS.md` § "First-run bootstrap prompt"](docs/PROMPTS.md),
+  and the `README.md` § "First-run bootstrap prompt" section. Trust
+  boundary updated: the skill is still near read-only, but now writes
+  to `.review/` in exactly two consented cases (bootstrap → extension
+  file, opt-out → skip marker).
 - **Sub-skill: [`generate-extension`](skills/ai-diff-reviewer/generate-extension/SKILL.md)** —
   bootstraps a repo-tailored `.review/extension.md` (or, in advanced
   mode, a full-replacement `.github/prompts/pr-review.md`) by inspecting
