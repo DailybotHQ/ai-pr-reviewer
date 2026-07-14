@@ -36,6 +36,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [`docs/TRIGGER_MODES.md`](docs/TRIGGER_MODES.md).
 
 ### Changed
+- **Self-review dogfood now runs on EVERY `ready`-labeled PR** — no more
+  critical-surface filter. Previously the three CLI provider legs
+  (`claude-code`, `cursor`, `codex`) only ran when the diff touched a small
+  hardcoded list of "critical" paths (`action.yml`, `scripts/reviewer.py`,
+  `prompts/*`, the workflows, the main test files), and the Anthropic
+  baseline was the only always-on reviewer. That optimized for cost but
+  created a coverage hole: docs-only, `.agents/**` (vendored skills) and
+  other AI-tooling PRs got zero review unless `ANTHROPIC_API_KEY` was
+  configured — and when it wasn't, the merge gate failed red on legitimate
+  PRs (e.g. the Dailybot-skill-vendoring PR that lit up this fix). Since
+  vendored skills, workflow tweaks, prompt edits, and docs are exactly the
+  surface where prompt injection or malicious content can hide, every
+  configured provider now reviews every ready-labeled PR regardless of the
+  diff shape. A leg is only absent from the matrix when its secret isn't
+  configured on the repo. The scope job's `empty_reason` output renamed
+  `no-eligible-provider` → `no-provider-secret` to match. The gate's error
+  message now instructs "set at least one of ANTHROPIC_API_KEY,
+  CLAUDE_CODE_OAUTH_TOKEN, CURSOR_API_KEY, or OPENAI_API_KEY" rather than
+  the older "configure ANTHROPIC_API_KEY or touch a critical surface". The
+  scope job also no longer checks out the repo (nothing left to diff), so
+  the decision runs faster. See
+  [`.github/workflows/self-review.yml`](.github/workflows/self-review.yml)
+  header comment (Design goals #2 and #3).
 - **Self-review gate is now opt-in per PR** (this repo's dogfood only, no
   runtime/action.yml change). The `Self-review gate` job in
   [`.github/workflows/self-review.yml`](.github/workflows/self-review.yml) now

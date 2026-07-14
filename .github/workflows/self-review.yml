@@ -9,16 +9,21 @@ name: Self-review
 #      already carries `ready`), NOT on every push — so to re-review you remove
 #      and re-add the `ready` label. This keeps the maintainer in explicit
 #      control of when tokens burn.
-#   2. SCOPE — the Anthropic baseline reviews whenever the gate opens; the three
-#      CLI-provider legs review only when the diff touches
-#      runtime/action/prompt/workflow surfaces where provider parity can
-#      realistically regress (keeps a `ready` toggle on a docs-only PR cheap).
+#   2. FULL COVERAGE — every configured provider (Anthropic + the three CLI
+#      providers: claude-code, cursor, codex) reviews EVERY ready-labeled PR,
+#      including docs-only and AI-tooling-only diffs. Rationale is trust
+#      surface: skill vendors under `.agents/`, workflow tweaks under
+#      `.github/`, prompt edits under `prompts/`, and doc changes are exactly
+#      the paths where prompt injection or malicious content can hide, so
+#      they deserve a review even when no runtime code changed. A leg is
+#      absent from the matrix only when its secret is not configured on the
+#      repo — never based on the diff shape.
 #   3. HONEST STATUS — the single `scope` job builds the matrix of provider legs
 #      that will ACTUALLY review this event. A leg that shouldn't run (no
-#      `ready` label, an unset provider secret, or a non-critical diff) is
-#      simply absent from the matrix, so it never shows a misleading green
-#      Success; when nothing is eligible the whole review job reports as
-#      **Skipped** (grey). A green leg means it actually reviewed.
+#      `ready` label, or an unset provider secret) is simply absent from the
+#      matrix, so it never shows a misleading green Success; when nothing is
+#      eligible the whole review job reports as **Skipped** (grey). A green
+#      leg means it actually reviewed.
 #   4. MERGE GATE (OPT-IN) — a final `gate` job with a STABLE name
 #      (`Self-review gate`) is the one check you mark as *Required* in branch
 #      protection under an opt-in review flow. It ONLY runs when THIS event
@@ -84,15 +89,14 @@ jobs:
       matrix: ${{ steps.decide.outputs.matrix }}
       # Why the matrix is empty, surfaced in the scope job's log for humans and
       # consumed by the gate when it runs (`ready` applied path only). Values:
-      # `no-ready-label` (the gate is skipped, no error), `no-eligible-provider`
-      # (gate fails — label is on but nothing matched, needs a baseline or a
-      # critical surface). Empty when the matrix is non-empty.
+      # `no-ready-label` (the gate is skipped, no error), `no-provider-secret`
+      # (gate fails — `ready` is applied but no provider secret is configured
+      # on the repo, so nothing can review). Empty when the matrix is
+      # non-empty.
       empty_reason: ${{ steps.decide.outputs.empty_reason }}
     steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          persist-credentials: false
+      # No checkout: the decision only reads event context and secret presence,
+      # never the diff (full coverage = every provider on every ready PR).
       - name: Decide which provider legs run
         id: decide
         shell: bash
@@ -100,7 +104,6 @@ jobs:
           EVENT_ACTION: ${{ github.event.action }}
           EVENT_LABEL: ${{ github.event.label.name }}
           LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
           # Whether each provider's secret is configured. `!= ''` yields the
           # string "true"/"false" — the secret VALUE never enters the shell.
           HAS_ANTHROPIC: ${{ secrets.ANTHROPIC_API_KEY != '' }}
@@ -135,22 +138,13 @@ jobs:
             exit 0
           fi
 
-          # 2. CRITICAL-SURFACE detection — which CLI legs are worth running.
-          #    Test files are listed explicitly (not globbed) so a docs-only
-          #    test-doc change doesn't trigger all legs; add new provider/runtime
-          #    test files here. Safe degradation if forgotten: only the Anthropic
-          #    baseline reviews that PR.
-          critical=false
-          while IFS= read -r path; do
-            case "$path" in
-              action.yml|scripts/reviewer.py|prompts/*|.github/workflows/self-review.yml|.github/workflows/code_check.yml|.github/scripts/validate_action.py|tests/test_reviewer.py|tests/test_agent_runner_providers.py|tests/test_findings_parser.py|tests/test_end_to_end_roundtrip.py)
-                critical=true ;;
-            esac
-          done < <(git diff --name-only "origin/${BASE_REF}...HEAD")
-
-          # 3. Build the matrix. A leg is included only if its secret is set AND
-          #    its policy allows it (Anthropic = always-on baseline; the CLI legs
-          #    only on critical changes). Omitted legs show as absent/Skipped,
+          # 2. Build the matrix. Every configured provider reviews EVERY
+          #    ready-labeled PR — no critical-surface filtering — because the
+          #    non-runtime paths (`.agents/**` vendored skills, workflows,
+          #    prompts, docs) are exactly where prompt injection or malicious
+          #    content can hide, and deserve the same scrutiny as runtime
+          #    code. A leg is omitted only when its provider secret isn't
+          #    configured on the repo — omitted legs show as absent/Skipped,
           #    never a green no-op. Each entry pins an explicit cost-efficient
           #    model — never `auto` for metered providers; Cursor uses `auto`
           #    deliberately (flat-rate on Pro).
@@ -160,36 +154,20 @@ jobs:
               --arg p "$1" --arg s "$2" --arg l "$3" --arg m "$4" \
               '. += [{provider:$p, secret:$s, label:$l, model:$m}]')
           }
-          [ "$HAS_ANTHROPIC" = "true" ] && add anthropic ANTHROPIC_API_KEY "self-reviewed:anthropic" claude-haiku-4-5
-          if [ "$critical" = "true" ]; then
-            # Claude Code dogfoods the SUBSCRIPTION auth path: CLAUDE_CODE_OAUTH_TOKEN
-            # holds a `claude setup-token` OAuth token (`sk-ant-oat…`) which the
-            # action auto-detects and bills against a Claude Pro/Max plan.
-            [ "$HAS_CLAUDE_CODE" = "true" ] && add claude-code CLAUDE_CODE_OAUTH_TOKEN "self-reviewed:claude-code" claude-haiku-4-5
-            [ "$HAS_CURSOR" = "true" ]      && add cursor CURSOR_API_KEY "self-reviewed:cursor" auto
-            [ "$HAS_OPENAI" = "true" ]      && add codex OPENAI_API_KEY "self-reviewed:codex" gpt-5.4-mini
-          fi
-          # Explain a common surprise: the CLI legs are gated to critical
-          # changes to save cost, and Anthropic is the only always-on baseline.
-          # So with ONLY a CLI provider configured (e.g. just CURSOR_API_KEY) a
-          # non-critical (docs-only) diff yields an empty matrix — which the
-          # merge gate then treats as "did not review" (red). Surface it so the
-          # empty matrix isn't a mystery: configure ANTHROPIC_API_KEY for a
-          # baseline that reviews every PR, or make the change touch a critical
-          # surface to exercise the CLI legs.
-          if [ "$critical" != "true" ] \
-            && { [ "$HAS_CLAUDE_CODE" = "true" ] || [ "$HAS_CURSOR" = "true" ] || [ "$HAS_OPENAI" = "true" ]; }; then
-            if [ "$HAS_ANTHROPIC" = "true" ]; then
-              echo "::notice::CLI provider legs (claude-code/cursor/codex) review only critical changes (runtime/action/prompt/workflow); this diff is docs/other-only, so only the always-on Anthropic baseline reviews it."
-            else
-              echo "::notice::CLI provider legs (claude-code/cursor/codex) review only critical changes (runtime/action/prompt/workflow), and no always-on Anthropic baseline is configured — so this docs/other-only diff yields an empty matrix. Set ANTHROPIC_API_KEY for full coverage, or touch a critical surface to exercise the CLI legs."
-            fi
-          fi
+          [ "$HAS_ANTHROPIC" = "true" ]   && add anthropic ANTHROPIC_API_KEY "self-reviewed:anthropic" claude-haiku-4-5
+          # Claude Code dogfoods the SUBSCRIPTION auth path: CLAUDE_CODE_OAUTH_TOKEN
+          # holds a `claude setup-token` OAuth token (`sk-ant-oat…`) which the
+          # action auto-detects and bills against a Claude Pro/Max plan.
+          [ "$HAS_CLAUDE_CODE" = "true" ] && add claude-code CLAUDE_CODE_OAUTH_TOKEN "self-reviewed:claude-code" claude-haiku-4-5
+          [ "$HAS_CURSOR" = "true" ]      && add cursor CURSOR_API_KEY "self-reviewed:cursor" auto
+          [ "$HAS_OPENAI" = "true" ]      && add codex OPENAI_API_KEY "self-reviewed:codex" gpt-5.4-mini
+
           # Record WHY the matrix ended up empty (if it did) so the merge gate can
           # print an accurate hint. Reaching here means `ready` is applied, so an
-          # empty matrix is "no eligible provider", never "no label".
+          # empty matrix means "no provider secret is configured on this repo".
           if [ "$matrix" = "[]" ]; then
-            echo 'empty_reason=no-eligible-provider' >> "$GITHUB_OUTPUT"
+            echo "::error::No provider secret configured. Set at least one of ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, CURSOR_API_KEY, or OPENAI_API_KEY as a repo secret so the self-review gate can run."
+            echo 'empty_reason=no-provider-secret' >> "$GITHUB_OUTPUT"
           else
             echo 'empty_reason=' >> "$GITHUB_OUTPUT"
           fi
@@ -320,10 +298,10 @@ jobs:
           fi
           # Empty matrix == this run WAS a review-request event (the gate's
           # `if:` already filtered out `no-ready-label` runs) but no provider
-          # leg was eligible. That's a real config bug worth surfacing — a
-          # review was requested but nothing can run it.
+          # secret is configured on the repo. That's a real config bug worth
+          # surfacing — a review was requested but nothing can run it.
           if [ "${MATRIX:-[]}" = "[]" ]; then
-            echo "::error::Self-review did not run — a review was requested (via 'ready' label) but no provider leg was eligible. Configure ANTHROPIC_API_KEY for an always-on baseline, or touch a critical surface (runtime/action/prompt/workflow) so the CLI legs (cursor/codex/claude-code) run. See the scope job's notice for the exact reason."
+            echo "::error::Self-review did not run — a review was requested (via 'ready' label) but no provider secret is configured on this repo. Set at least one of ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, CURSOR_API_KEY, or OPENAI_API_KEY as a repo secret to unblock the merge gate."
             exit 1
           fi
           # Count the `Self-review — <provider>` legs of THIS run that concluded
