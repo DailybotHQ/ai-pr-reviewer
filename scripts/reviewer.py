@@ -1164,7 +1164,9 @@ def _invoke_cli_agent(
             f"stderr tail: {stderr_tail!r}. stdout tail: {stdout_tail!r}."
         )
 
-    return parse_findings_file(findings_path)
+    return parse_findings_file(
+        findings_path, allow_malformed_summary_fallback=True
+    )
 
 
 class ClaudeCodeProvider(AgentRunnerProvider):
@@ -1518,53 +1520,51 @@ class CodexProvider(AgentRunnerProvider):
                 codex_home=codex_home, api_key=self.api_key
             )
 
-            mcp_dest, mcp_backup = _swap_mcp_config(
-                self.mcp_config_file, self.MCP_DEST
-            )
-            try:
-                # Codex CLI headless is `codex exec`. Two CI-critical flags:
-                #   --dangerously-bypass-approvals-and-sandbox: `codex exec`
-                #     defaults to a READ-ONLY sandbox, so without this the agent
-                #     physically cannot write findings.json and every review
-                #     fails. This flag is documented as "intended solely for
-                #     running in environments that are externally sandboxed" —
-                #     exactly a GitHub-hosted runner. Mirrors Cursor's
-                #     `--force --trust`.
-                #   `-` positional: read the (diff-carrying, potentially >128 KB)
-                #     prompt from stdin instead of argv, avoiding the OS E2BIG
-                #     single-argument limit.
-                argv: list[str] = [
-                    self.CLI_BIN,
-                    "exec",
-                    "--skip-git-repo-check",
-                    "--dangerously-bypass-approvals-and-sandbox",
-                ]
-                if self.model:
-                    argv += ["--model", self.model]
-                if self.extra_args:
-                    argv += shlex.split(self.extra_args)
-                # The stdin sentinel must be the final positional argument.
-                argv.append("-")
+            # Do not copy `mcp-config-file` to `~/.codex/mcp.json`: Codex
+            # ignores that JSON file, and this run uses an isolated CODEX_HOME
+            # anyway. The warning above points users at the supported
+            # `config.toml` / `agent-extra-args` path.
+            # Codex CLI headless is `codex exec`. Two CI-critical flags:
+            #   --dangerously-bypass-approvals-and-sandbox: `codex exec`
+            #     defaults to a READ-ONLY sandbox, so without this the agent
+            #     physically cannot write findings.json and every review
+            #     fails. This flag is documented as "intended solely for
+            #     running in environments that are externally sandboxed" —
+            #     exactly a GitHub-hosted runner. Mirrors Cursor's
+            #     `--force --trust`.
+            #   `-` positional: read the (diff-carrying, potentially >128 KB)
+            #     prompt from stdin instead of argv, avoiding the OS E2BIG
+            #     single-argument limit.
+            argv: list[str] = [
+                self.CLI_BIN,
+                "exec",
+                "--skip-git-repo-check",
+                "--dangerously-bypass-approvals-and-sandbox",
+            ]
+            if self.model:
+                argv += ["--model", self.model]
+            if self.extra_args:
+                argv += shlex.split(self.extra_args)
+            # The stdin sentinel must be the final positional argument.
+            argv.append("-")
 
-                # CODEX_HOME redirects the CLI to read our apikey auth.json
-                # (0.122+ requirement). OPENAI_API_KEY stays in the env for
-                # back-compat with < 0.122 which read it directly.
-                env: dict[str, str] = _build_cli_env(
-                    extra_vars={
-                        "OPENAI_API_KEY": self.api_key,
-                        "CODEX_HOME": str(codex_home),
-                    }
-                )
-                return _invoke_cli_agent(
-                    argv=argv,
-                    workspace=workspace,
-                    findings_path=findings_path,
-                    env=env,
-                    cli_name=self.CLI_NAME,
-                    stdin_input=user_prompt,
-                )
-            finally:
-                _restore_mcp_config(mcp_dest, mcp_backup)
+            # CODEX_HOME redirects the CLI to read our apikey auth.json
+            # (0.122+ requirement). OPENAI_API_KEY stays in the env for
+            # back-compat with < 0.122 which read it directly.
+            env: dict[str, str] = _build_cli_env(
+                extra_vars={
+                    "OPENAI_API_KEY": self.api_key,
+                    "CODEX_HOME": str(codex_home),
+                }
+            )
+            return _invoke_cli_agent(
+                argv=argv,
+                workspace=workspace,
+                findings_path=findings_path,
+                env=env,
+                cli_name=self.CLI_NAME,
+                stdin_input=user_prompt,
+            )
         finally:
             # Best-effort cleanup of the isolated CODEX_HOME. The temp dir
             # is 0700 so cross-process leakage during the run is bounded;
@@ -2862,7 +2862,39 @@ def state_to_review_result(state: "ReviewState") -> ReviewResult:
     )
 
 
-def parse_findings_file(path: Path) -> ReviewResult:
+def _extract_summary_from_malformed_findings(raw_text: str) -> str | None:
+    """Best-effort extraction for malformed agent-runner JSON.
+
+    Some vendor CLIs occasionally hand-write invalid JSON while still leaving
+    a valid top-level `summary` string. Recovering that summary lets the action
+    post a review instead of failing the whole check; inline findings are
+    intentionally not recovered from malformed JSON.
+    """
+    key_index: int = raw_text.find('"summary"')
+    if key_index < 0:
+        return None
+    colon_index: int = raw_text.find(":", key_index + len('"summary"'))
+    if colon_index < 0:
+        return None
+    value_start: int = colon_index + 1
+    while value_start < len(raw_text) and raw_text[value_start].isspace():
+        value_start += 1
+    if value_start >= len(raw_text) or raw_text[value_start] != '"':
+        return None
+
+    decoder = json.JSONDecoder()
+    try:
+        value, _end_index = decoder.raw_decode(raw_text[value_start:])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(value, str):
+        return None
+    return value
+
+
+def parse_findings_file(
+    path: Path, *, allow_malformed_summary_fallback: bool = False
+) -> ReviewResult:
     """Parse an agent-runner `findings.json` into a `ReviewResult`.
 
     Strict validation:
@@ -2887,10 +2919,34 @@ def parse_findings_file(path: Path) -> ReviewResult:
             "missing the write-to-file directive, or the workspace path is "
             "wrong. See docs/PROVIDERS.md for the contract."
         )
+    raw_text: str = path.read_text(encoding="utf-8")
     try:
-        raw: Any = json.loads(path.read_text(encoding="utf-8"))
+        raw: Any = json.loads(raw_text)
     except json.JSONDecodeError as e:
-        snippet: str = path.read_text(encoding="utf-8")[:MAX_ERROR_BODY_CHARS]
+        if allow_malformed_summary_fallback:
+            recovered_summary: str | None = (
+                _extract_summary_from_malformed_findings(raw_text)
+            )
+            if recovered_summary:
+                log(
+                    "WARNING: Agent-runner provider wrote malformed "
+                    f"findings.json ({e}). Posting summary-only review; "
+                    "inline findings were dropped because the JSON could "
+                    "not be trusted."
+                )
+                summary: str = (
+                    recovered_summary.rstrip()
+                    + "\n\n---\n\n"
+                    + "**AI PR Reviewer note:** The CLI wrote malformed "
+                    + "`findings.json`, so this run posted the recovered "
+                    + "summary only and dropped inline findings."
+                )
+                return ReviewResult(
+                    summary=summary,
+                    findings=[],
+                    overall_severity=SEVERITY_NONE,
+                )
+        snippet: str = raw_text[:MAX_ERROR_BODY_CHARS]
         raise ValueError(
             f"Malformed findings.json ({e}). Content head: {snippet!r}"
         ) from e
@@ -3009,7 +3065,10 @@ def write_findings_prompt_directive(
         + "(new code); use `LEFT` for removed code.\n"
         + "- Empty `findings` is valid — it means "
         + '"no issues found; just the summary".\n'
-        + "- Only write the file once, at the end. Do NOT stream partials."
+        + "- Only write the file once, at the end. Do NOT stream partials.\n"
+        + "- The file MUST parse with Python `json.load()`. Do not hand-write "
+        + "JSON when the content contains Markdown, quotes, or code blocks; "
+        + "use a JSON serializer so strings are escaped correctly."
     )
 
 

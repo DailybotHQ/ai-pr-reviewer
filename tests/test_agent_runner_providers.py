@@ -607,10 +607,19 @@ class CodexInvocationTests(unittest.TestCase):
     """CodexProvider must escape the default read-only sandbox and pipe the
     prompt via stdin."""
 
-    def _capture(self, *, model: str = "", extra_args: str = "") -> dict[str, Any]:
+    def _capture(
+        self,
+        *,
+        model: str = "",
+        extra_args: str = "",
+        mcp_config_file: str = "",
+    ) -> dict[str, Any]:
         return _capture_provider_call(
             reviewer.CodexProvider(
-                api_key="k", model=model, extra_args=extra_args
+                api_key="k",
+                model=model,
+                extra_args=extra_args,
+                mcp_config_file=mcp_config_file,
             )
         )
 
@@ -648,6 +657,30 @@ class CodexInvocationTests(unittest.TestCase):
             argv.index("--foo"),
             argv.index("-"),
             "extra_args must come before the '-' stdin sentinel.",
+        )
+
+    def test_mcp_config_file_does_not_copy_ignored_json(self) -> None:
+        calls: list[tuple[str, Path]] = []
+
+        def fake_swap(src_file: str, dest_path: Path) -> tuple[Path | None, str | None]:
+            calls.append((src_file, dest_path))
+            return None, None
+
+        orig = reviewer._swap_mcp_config
+        reviewer._swap_mcp_config = fake_swap  # type: ignore[assignment]
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                mcp_src = Path(td) / "mcp.json"
+                mcp_src.write_text('{"mcpServers":{}}', encoding="utf-8")
+                self._capture(mcp_config_file=str(mcp_src))
+        finally:
+            reviewer._swap_mcp_config = orig  # type: ignore[assignment]
+
+        self.assertEqual(
+            calls,
+            [],
+            "Codex ignores JSON MCP files and runs with an isolated CODEX_HOME; "
+            "provider=codex must warn without copying to ~/.codex/mcp.json.",
         )
 
 
