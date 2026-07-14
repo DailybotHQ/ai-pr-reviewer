@@ -61,9 +61,9 @@ This mode fires the workflow only when GitHub emits a `labeled` event with the m
 
 **The webhook-vs-gate distinction (v1.2.0+):** GitHub's `labeled` event fires for *any* label. If `label-gate: ai-review` is already on the PR and someone adds an unrelated label (e.g. `bug`, `dependencies`), the workflow *would* fire — but the action inspects `event.label.name` and skips when it doesn't match `label-gate`, logging `Trigger decision: should_run=False (labeled event was for 'bug', not 'ai-review')`. So you don't have to worry about accidentally paying for a review every time a bot bumps a dependency label.
 
-## Recipe: run once when labelled `ready`, and show **Skipped** (not green) otherwise
+## Recipe: run once when labelled `ready`, block merge until it passes
 
-A common ask: "only review when I apply a `ready` label, review exactly once per application, and — importantly — when it *doesn't* review, the check should read **Skipped**, not a misleading green **Success**." This repo's own [`.github/workflows/self-review.yml`](../.github/workflows/self-review.yml) is the reference implementation. Two techniques combine:
+A common ask: "only review when I apply a `ready` label, review exactly once per application, when it *doesn't* review show **Skipped** (not a misleading green **Success**) — **and** don't let me merge until a review has actually passed." This repo's own [`.github/workflows/self-review.yml`](../.github/workflows/self-review.yml) is the reference implementation. Three techniques combine:
 
 **1. Fire on the label event, not on push.** Subscribe to `labeled` (and `opened` to catch a PR created with the label already on it), and *not* `synchronize`. Pushes then don't re-review — re-review happens by removing and re-adding `ready`. Guard against unrelated labels by checking the event's label:
 
@@ -109,6 +109,36 @@ jobs:
 ```
 
 **Why not a job-level `if:` directly on the matrix?** GitHub Actions does **not** expose the `matrix` context to a job-level `if:`, so a static matrix can only be skipped per-step (leaving the job green). For a **multi-provider matrix**, have the decision job emit the matrix of legs that should run and consume it with `strategy.matrix.include: ${{ fromJSON(needs.gate.outputs.matrix) }}` — ineligible legs are then simply absent (never a green no-op), and when nothing is eligible the whole job is **Skipped** via `if: needs.gate.outputs.matrix != '[]'`. See `self-review.yml` for the full four-provider version, including per-provider secret detection.
+
+**3. Gate the *merge* with a stable-named job — because a Skipped required check does NOT block.** This is the subtle part. GitHub's branch protection treats a required check whose conclusion is **Skipped** as *passing* — the PR stays mergeable. (Only *failure* or a never-reported *pending* check blocks a merge.) So marking the `review` / `Self-review — <provider>` legs as "Required" does **not** stop someone from merging a PR that was never reviewed — GitHub will happily say *"All checks have passed — 1 skipped"* and enable the merge button. It is also a mistake to require the dynamic leg names directly: they vary per run and vanish when skipped.
+
+The fix is a final job with a **fixed name** that you mark as the required check. It runs with `if: always()` and **fails** (red → blocks merge) unless the review actually ran and passed:
+
+```yaml
+  gate:
+    name: 'Self-review gate'          # ← mark THIS as the required check
+    needs: [gate-decision, review]    # your decision job + the review job
+    if: always()                      # report on every event, even when review skipped
+    runs-on: ubuntu-latest
+    steps:
+      - shell: bash
+        env:
+          MATRIX: ${{ needs.gate-decision.outputs.matrix }}
+          REVIEW_RESULT: ${{ needs.review.result }}
+        run: |
+          set -euo pipefail
+          if [ "${MATRIX:-[]}" = "[]" ]; then
+            echo "::error::Review did not run — apply the 'ready' label so the required review executes, then merge once it passes."
+            exit 1                     # no ready label → block merge
+          fi
+          [ "$REVIEW_RESULT" = "success" ] || {
+            echo "::error::Review ran but did not pass (result=$REVIEW_RESULT)."; exit 1; }
+          echo "Merge gate satisfied."
+```
+
+Net effect: the per-leg checks stay **honestly Skipped** for humans reading the list (technique 2), while the single `Self-review gate` check is **red until a `ready`-triggered review passes** — so `Required` on that one check actually blocks the merge. In branch protection, require **only** `Self-review gate`, not the individual legs.
+
+> **Note — this is the opposite trade-off from "Skipped is fine".** If you *want* un-reviewed PRs to stay freely mergeable (the review is advisory, not a gate), skip technique 3 entirely and don't mark anything required — the Skipped legs are exactly right. Add the gate only when a review must be a *precondition* for merge.
 
 ## Interaction with `on:` and `concurrency`
 

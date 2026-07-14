@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Self-review dogfood now has a real merge gate.** Added a stable-named
+  `Self-review gate` job to [`.github/workflows/self-review.yml`](.github/workflows/self-review.yml)
+  that **fails (blocks merge)** when the label-gated review did not run (no
+  `ready` label) or a leg failed — because GitHub's branch protection treats a
+  *Skipped* required check as *passing*, so the per-leg Skipped status alone
+  never blocked a merge. Mark **only** `Self-review gate` as the required check.
+  Documented as a reusable consumer recipe in
+  [`docs/TRIGGER_MODES.md` § "Recipe: run once when labelled `ready`, block merge until it passes"](docs/TRIGGER_MODES.md).
+
 ## [1.3.0] — 2026-07-14
 
 **Headline:** the "safe-for-open-source" release. Public-repo abuse defense (new [`author-association`](#author-association-gate-decision-table) gate, defaults ON), deterministic cost defaults for the CLI providers, Claude Code accepts a subscription OAuth token as `api-key`, Codex CLI 0.122+ auth breakage re-fixed, and the Marketplace listing goes live at [`github.com/marketplace/actions/ai-pr-reviewer`](https://github.com/marketplace/actions/ai-pr-reviewer). Consumers pinning `@v1` pick everything up automatically.
