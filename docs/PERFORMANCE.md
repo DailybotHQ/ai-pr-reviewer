@@ -20,12 +20,12 @@ As of v1.1.0 the action ships two provider families with different cost/latency 
 | Aspect | Chat-completions family (`anthropic`) | Agent-runner family (`claude-code`, `cursor`, `codex`) |
 |---|---|---|
 | Loop owner | This action drives the turn loop | Vendor CLI drives its own loop |
-| Cost knob you control | `max-turns` × `max_tokens` × conversation pruning | `agent-max-turns` (forwarded verbatim to the CLI) + whatever the vendor bills per invocation |
+| Cost knob you control | `max-turns` × `max_tokens` × conversation pruning | Workflow/job timeout + whatever the vendor bills per invocation; `agent-extra-args` can pass vendor-native budget flags |
 | Latency floor | ~5–15 s per turn × 5–15 turns typical | Wallclock of a single vendor CLI invocation (typically 30–180 s end-to-end for a mid-size PR) |
 | Cold-start cost | Zero — action starts and immediately hits the provider API | One-off install of the selected CLI (~10–40 s wallclock on `ubuntu-latest`, cached in the runner image on subsequent steps of the same job but not across jobs) |
-| Predictability | High — every constant is enforced by our runtime | Medium — the vendor CLI decides how many turns it needs; we only cap the wall clock via `agent-max-turns` and the workflow-level `timeout-minutes` |
+| Predictability | High — every constant is enforced by our runtime | Medium — the vendor CLI decides how many turns it needs; we only cap the wall clock via `CLI_INVOCATION_TIMEOUT` and workflow-level `timeout-minutes` |
 | Findings contract | Model calls the `post_inline_comment` tool; we accumulate `ReviewState` in-process | Vendor CLI writes `.aiprr/findings.json`; we parse it, cap at `max-inline-comments`, and submit |
-| Billing model | Metered API tokens (Anthropic account) | `claude-code`/`codex`: metered API tokens (Anthropic/OpenAI accounts, BYOK). **`cursor`: consumes credits from your Cursor Pro/Pro+/Ultra subscription — no BYOK. Use `model: auto` on Pro for unlimited routing.** See [docs/PROVIDERS.md § Cursor CLI — billing and model selection](PROVIDERS.md#cursor-cli--billing-and-model-selection). |
+| Billing model | Metered API tokens (Anthropic account) | `codex`: metered OpenAI API tokens (BYOK). **`claude-code`: metered Anthropic API tokens, OR a Claude Pro/Max subscription — pass a `claude setup-token` OAuth token (`sk-ant-oat…`) as `api-key` (see [docs/PROVIDERS.md § "Billing Claude Code against a subscription"](PROVIDERS.md#billing-claude-code-against-a-subscription-instead-of-api-tokens)). `cursor`: consumes credits from your Cursor Pro/Pro+/Ultra subscription — no BYOK; use `model: auto` on Pro for unlimited routing.** |
 
 Both families converge on the same `ReviewResult` payload before `POST /pulls/{n}/reviews`, so downstream behaviour (severity gating, 422 fallback, tracking comment) is identical.
 
@@ -56,7 +56,7 @@ For the `claude-code`, `cursor`, and `codex` providers, we don't run a turn loop
 
 | Knob | Effect |
 |---|---|
-| `agent-max-turns` (forwarded to the CLI's own turn cap) | Upper bound on turns inside the vendor's loop. Consulted differently per vendor: Claude Code respects it directly, Cursor Agent honours it as `--max-steps`, Codex maps it to its own agentic-budget flag. Default `30`. |
+| `agent-max-turns` | Currently logs a warning for CLI providers instead of enforcing a limit. None of the shipping CLIs expose one stable cross-provider turn-count flag, so the effective runtime cap is `CLI_INVOCATION_TIMEOUT` plus the workflow job timeout. |
 | `agent-extra-args` | Escape hatch to pass raw vendor flags (e.g. `--model`, `--verbose`). Not cost-capped by us — misuse (`--max-turns 999`) will bill you exactly what the CLI bills you. |
 | `mcp-config-file` | Path to an MCP config the CLI loads. Extra tools = more turns = more spend. Same "you pay what you enable" principle. |
 | `max-inline-comments` | Hard cap on findings we ingest from `.aiprr/findings.json`. Extra findings are dropped and counted in the `inline-dropped` action output. Default `10`. |
@@ -132,13 +132,13 @@ Chat-completions family only:
 
 Agent-runner family only:
 
-- **`agent-max-turns`** (default `30`) — forwarded to the vendor CLI; the vendor decides how strictly to honour it.
+- **`agent-max-turns`** — currently warns on CLI providers instead of enforcing a cap. Use `agent-extra-args` for vendor-native budget flags when a CLI exposes one.
 - **`agent-extra-args`** — free-form vendor flags. Not cost-capped by us.
 - **`mcp-config-file`** — path to an MCP config for the vendor CLI. Extra tools = more turns = more spend.
 
 ## Local performance measurement
 
-There is no benchmark suite (adding one would violate the stdlib-only rule for the runtime). The dogfooding channel via [`.github/workflows/self-review.yml`](../.github/workflows/self-review.yml) is the real measurement: it runs against every PR to this repo as a **4-leg matrix** (one per shipping provider) and its Actions logs record turn count, per-turn latency, and total wallclock — separately for each provider so you can compare their performance apples-to-apples on the same PR diff. See [`docs/PR_REVIEW_WORKFLOW.md`](PR_REVIEW_WORKFLOW.md) for how to read those logs and how to tell which review came from which leg (via the per-provider `self-reviewed:*` labels).
+There is no benchmark suite (adding one would violate the stdlib-only rule for the runtime). The dogfooding channel via [`.github/workflows/self-review.yml`](../.github/workflows/self-review.yml) is the real measurement: it always runs the direct Anthropic baseline leg and runs the CLI-provider legs only when critical action/runtime files change. Its Actions logs record turn count, per-turn latency, and total wallclock for every leg that actually invokes the reviewer. See [`docs/PR_REVIEW_WORKFLOW.md`](PR_REVIEW_WORKFLOW.md) for how to read those logs and how to tell which review came from which leg (via the per-provider `self-reviewed:*` labels).
 
 ## Related docs
 

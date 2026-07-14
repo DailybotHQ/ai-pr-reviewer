@@ -1,4 +1,4 @@
-name: 'Dailybot AI PR Reviewer'
+name: 'AI PR Reviewer'
 description: 'Run an LLM-driven code review on every pull request — inline comments, severity-based gating, no infra required.'
 author: 'DailybotHQ'
 
@@ -6,11 +6,16 @@ author: 'DailybotHQ'
 # scopes how the listing tile renders. Purple is closest to the "review" hue
 # in the GitHub UI.
 #
-# The Marketplace listing is titled "Dailybot AI PR Reviewer" — the vendor
-# prefix is required to avoid a slug collision with an unrelated third-party
-# `ai-pr-review` action that squats on the `ai-pull-request-reviewer` slug.
-# Product copy across README, docs, and commit messages continues to use
-# "AI PR Reviewer" (see AGENTS.md § "Marketplace branding stable").
+# Marketplace listing title = "AI PR Reviewer" — slugifies to `ai-pr-reviewer`,
+# matching this repo's slug exactly. There IS a related-but-distinct third-party
+# incumbent titled "AI Pull Request Reviewer" (`appchoose/ai-pr-review`) at the
+# `ai-pull-request-reviewer` slug; our abbreviated form ("PR" vs "Pull Request")
+# yields a different slug, so both listings coexist without collision. Vendor
+# attribution is handled by the `author:` field above — GitHub renders it as
+# "by DailybotHQ" beneath the listing title automatically, so we do NOT prefix
+# the name with "Dailybot" (see AGENTS.md § "Marketplace branding stable" for
+# the rationale — universal / community-tool positioning matches the project
+# reality of MIT + BYOK + zero-backend).
 branding:
   icon: 'check-circle'
   color: 'purple'
@@ -28,7 +33,7 @@ inputs:
     required: false
     default: 'anthropic'
   model:
-    description: 'Model id for the chosen provider. Empty = provider default (Anthropic → `claude-sonnet-4-6`, Cursor → `auto` (unlimited on Pro plans; pin `composer-2.5` etc. to force a specific model), Codex → `gpt-5-codex`, Claude Code → account default).'
+    description: 'Model id for the chosen provider. Empty = provider default. Defaults balance review quality against cost: Anthropic → `claude-sonnet-4-6`; Claude Code → `claude-sonnet-4-6` (the quality/price sweet spot for code review; never `auto`, which can silently be Opus; pin `claude-haiku-4-5` for a cheaper/shallower smoke review); Cursor → `auto` (unlimited on Pro plans; pin `composer-2.5` etc. to force a specific model); Codex → `gpt-5.6-luna` (current-gen budget model, the OpenAI parallel of the Sonnet-class choice — `gpt-5-codex` is deprecated; pin the cheaper `gpt-5.4-mini` for a shallower smoke review). Note the `api-key` input for Claude Code also accepts a `claude setup-token` subscription OAuth token (`sk-ant-oat…`) to bill against a Claude Pro/Max plan instead of API usage. See docs/PROVIDERS.md § "Choosing a cost-efficient model".'
     required: false
     default: ''
 
@@ -115,7 +120,7 @@ inputs:
   # These inputs only affect the CLI providers (`claude-code`, `cursor`, `codex`).
   # Ignored by `anthropic`. Empty = provider default.
   agent-max-turns:
-    description: 'Cap on the CLI provider''s internal turn count. Empty = provider default. Ignored for chat-completions providers.'
+    description: 'Reserved budget hint for CLI providers. Currently logs a warning instead of enforcing a cap because the shipping CLIs do not expose one stable cross-provider turn-count flag. Ignored for chat-completions providers.'
     required: false
     default: ''
   agent-extra-args:

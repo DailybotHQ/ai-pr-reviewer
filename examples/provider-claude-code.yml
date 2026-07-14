@@ -5,8 +5,15 @@
 # this path gets the vendor-tuned coding-agent baseline system prompt, LSP
 # integration, and semantic-search tools that Claude Code ships out of the box.
 #
-# Auth: your Anthropic API key. The action forwards it as ANTHROPIC_API_KEY
-# to the CLI subprocess — same secret as `provider: anthropic`.
+# Auth (two options):
+#   1. Anthropic API key (metered) — forwarded as ANTHROPIC_API_KEY, same
+#      secret as `provider: anthropic`. This is what the example below uses.
+#   2. Claude Pro/Max SUBSCRIPTION — run `claude setup-token` on a machine
+#      logged into your plan, store the resulting `sk-ant-oat…` token as a
+#      secret, and pass it as `api-key`. The action auto-detects the prefix
+#      and bills against your subscription instead of API tokens (like Cursor).
+#      See the commented `api-key:` line below and docs/PROVIDERS.md
+#      § "Billing Claude Code against a subscription".
 
 name: PR review (Claude Code)
 on:
@@ -45,8 +52,20 @@ jobs:
       - uses: DailybotHQ/ai-pr-reviewer@v1
         with:
           provider: claude-code
+          # Metered API key (default). OR bill against a Claude Pro/Max
+          # subscription by pointing this at a `claude setup-token` OAuth
+          # token secret instead — the action auto-detects the `sk-ant-oat…`
+          # prefix. Only one of these lines should be active.
           api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # api-key: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}   # sk-ant-oat… subscription token
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Cost/quality: the default is `claude-sonnet-4-6` — the quality/
+          # price sweet spot for code review (finds subtle bugs at ~1/5th of
+          # Opus cost). The action never uses `auto` (which defers to the
+          # account default and can silently be Opus at ≈$5/$25). For a
+          # cheaper but shallower smoke review, pin `claude-haiku-4-5`
+          # (≈$1/$5) — good for obvious issues, weaker on subtle bugs.
+          # model: claude-haiku-4-5
           # Optional: pin the CLI so a mid-week vendor release doesn't
           # change review behaviour under you.
           # claude-code-version: '2.0.4'

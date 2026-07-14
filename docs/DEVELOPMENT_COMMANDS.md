@@ -77,7 +77,7 @@ export AIPRR_MAX_TURNS=30                   # the action's own turn cap
 Agent-runner family only:
 
 ```bash
-export AIPRR_AGENT_MAX_TURNS=30             # forwarded to the vendor CLI
+export AIPRR_AGENT_MAX_TURNS=30             # warns today; no universal CLI cap
 export AIPRR_AGENT_EXTRA_ARGS='--verbose'   # raw vendor flags (shlex-split)
 export AIPRR_MCP_CONFIG_FILE=$PWD/mcp.json  # optional MCP passthrough
 ```

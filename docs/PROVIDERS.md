@@ -256,11 +256,11 @@ Every run logs the resolved model + argv (with the API key redacted). Combine th
 
 | | Cursor | Claude Code | Codex | Anthropic (direct) |
 |---|---|---|---|---|
-| Auth | Subscription API key | Anthropic API key OR `CLAUDE_CODE_USE_BEDROCK` | OpenAI API key | Anthropic API key |
-| Billing | Cursor subscription credits | Anthropic-metered tokens | OpenAI-metered tokens | Anthropic-metered tokens |
+| Auth | Subscription API key | Anthropic API key **or** `sk-ant-oat…` subscription token (`claude setup-token`) | OpenAI API key | Anthropic API key |
+| Billing | Cursor subscription credits | Anthropic-metered tokens **or** Claude Pro/Max subscription | OpenAI-metered tokens | Anthropic-metered tokens |
 | BYOK | ❌ Not supported | ✅ Bring your own Anthropic key | ✅ Bring your own OpenAI key | ✅ Bring your own Anthropic key |
-| Unlimited plan | ✅ `model: auto` on Pro | ❌ Metered | ❌ Metered | ❌ Metered |
-| Best for | Teams already on Cursor Pro | Teams already on Anthropic | Teams already on OpenAI | Pure API workloads |
+| Subscription plan | ✅ `model: auto` on Pro | ✅ via `sk-ant-oat…` token (see "Billing Claude Code against a subscription") | ❌ Metered (no clean CI path) | ❌ Metered |
+| Best for | Teams already on Cursor Pro | Teams already on Anthropic (API or Pro/Max plan) | Teams already on OpenAI | Pure API workloads |
 
 ---
 
@@ -275,10 +275,70 @@ To run multiple providers cleanly:
 1. Keep `collapse-previous` at its default (`true`) — the per-provider scoping does the right thing.
 2. **Give each provider a distinct `applied-label`** (e.g. `reviewed:anthropic`, `reviewed:codex`) so you can tell the reviews apart in the conversation tab.
 
-This repo's own [`self-review.yml`](../.github/workflows/self-review.yml) dogfoods all four providers on every PR this way.
+This repo's own [`self-review.yml`](../.github/workflows/self-review.yml) uses this pattern when CLI-provider dogfooding is enabled by the workflow's critical-file scope gate. The direct Anthropic baseline runs on every PR/push; the other provider legs run only when provider-sensitive files changed.
 
 > **Passing multiple provider API keys** (e.g. both `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` as repo secrets) is fine and does **not** cause cross-contamination: each job forwards only its own provider's key to the CLI subprocess (`_build_cli_env` scrubs everything else), and a single action invocation uses exactly one `provider` + one `api-key`. There is no "both keys in one run" mode — the keys only coexist as separate secrets consumed by separate jobs.
 
 > **Transition note.** A review posted by a version **before** per-provider scoping shipped has no provider marker, so the first run after upgrading won't auto-collapse that one pre-upgrade review (it stays live until you manually mark it outdated). Every review from the upgraded version onward collapses correctly.
 
 > **Scoping keys on the marker, not the author.** A useful side effect: `collapse-previous` no longer collapses unrelated `github-actions[bot]` comments (a coverage bot, a labeler) — only comments carrying this action's provider marker are ever minimized.
+
+---
+
+## Choosing a cost-efficient model
+
+Two things drive review cost: **how often it runs** and **which model it uses**.
+
+- **Frequency** is the biggest lever. Running several providers on every push is N× the reviews. Pick one provider for routine use, or gate the expensive legs (this repo's `self-review.yml` runs a cheap Anthropic baseline on every PR and only invokes the CLI providers when the diff touches runtime/action/prompt surfaces).
+- **Model** matters most for the agent-runner CLIs (`claude-code`, `codex`), which are autonomous agents that explore the repo and spend far more tokens than the bounded chat-completions path — and whose turn count can't be capped from the action (only the 900 s timeout bounds them).
+
+### Quality is not optional for review
+
+Code review's value is catching **subtle** bugs — logic errors, race conditions, security issues. That's exactly where model capability pays off, so the cheapest model is not always the best *value*:
+
+- **Haiku 4.5 / mini-tier models** are great for obvious bugs, style, and fast smoke passes, but noticeably weaker at the subtle bugs that justify running a reviewer. A cheap review that misses real issues can be worse than none (false confidence).
+- **Sonnet-class** models are the sweet spot for real review — strong bug-finding at roughly 1/5th of Opus cost.
+- **Opus-class** is best but usually overkill for routine PRs.
+
+### Default models (chosen for quality/cost balance)
+
+| Provider | Default model | Approx. API price (in / out per 1M) | Rationale |
+|---|---|---|---|
+| `anthropic` | `claude-sonnet-4-6` | $3 / $15 | Sweet spot for review quality. |
+| `claude-code` | `claude-sonnet-4-6` | $3 / $15 | Sweet spot. Never `auto` (could be Opus $5/$25). Pin `claude-haiku-4-5` for a cheaper/shallower smoke review. |
+| `cursor` | `auto` | subscription (flat) | Unlimited on Cursor Pro → ~$0 marginal. `auto` is the right choice here. |
+| `codex` | `gpt-5.6-luna` | $1 / $6 | Current-gen budget model — the OpenAI parallel of the Sonnet-class choice: strong enough for subtle bugs, far below codex-tier (`gpt-5-codex` ≈$1.75/$14, and deprecated). Pin the cheaper `gpt-5.4-mini` ($0.75/$4.50) for a shallower smoke review. |
+
+Prices are indicative (mid-2026) and change — check each vendor's pricing page. Anthropic has no separate "mini" tier: **Haiku 4.5 is the small/cheap Claude**; OpenAI's mini is `gpt-5.4-mini`. The consumer defaults for the metered providers are all **quality-tier** (Sonnet-class / current-gen budget) — the mini/Haiku tiers are reserved for smoke/dogfood passes (see `self-review.yml`), never a consumer default.
+
+### Recommendations
+
+- **Real reviews (consumers):** keep the Sonnet-class defaults — the quality is the point.
+- **Cheapest predictable setup:** `provider: anthropic` (bounded loop + prompt caching keep it low and stable).
+- **Cheapest if you're on Cursor Pro:** `provider: cursor`, `model: auto` (flat rate).
+- **Smoke/dogfood reviews** (backed by human review, e.g. this repo's self-review baseline): `claude-haiku-4-5` / `gpt-5.4-mini` are fine — a cheap sanity pass, with deeper providers reserved for high-risk changes.
+- **`max-turns` (chat-completions only):** the default `30` is a *safety ceiling*, not a target — the loop stops as soon as the model calls `submit_review` (usually well under 10 turns), so it rarely drives cost. It does not apply to the CLI providers. Lower it (e.g. `12`, as `self-review.yml` does for its smoke baseline) only to bound a pathological run.
+
+### Billing Claude Code against a subscription (instead of API tokens)
+
+Like Cursor's subscription model, `provider: claude-code` can bill reviews against a **Claude Pro/Max subscription** instead of metered API usage — useful if you already pay for a plan and want a flat cost.
+
+1. On a machine logged into Claude Code with your subscription, run:
+   ```bash
+   claude setup-token
+   ```
+   It prints a long-lived OAuth token (starts with `sk-ant-oat…`).
+2. Store that token as a repository secret and pass it as the action's `api-key`:
+   ```yaml
+   - uses: DailybotHQ/ai-pr-reviewer@v1
+     with:
+       provider: claude-code
+       api-key: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}   # sk-ant-oat… token
+       github-token: ${{ secrets.GITHUB_TOKEN }}
+   ```
+
+The action detects the `sk-ant-oat…` prefix and passes the value to Claude Code as `CLAUDE_CODE_OAUTH_TOKEN` (subscription auth); a normal `sk-ant-api…` key is passed as `ANTHROPIC_API_KEY` (metered) as before. No new input — the same `api-key` accepts either.
+
+> **Security:** a subscription OAuth token grants broader account access than a scoped API key. It lives in the CLI subprocess env like any provider credential, so the [agent-runner exfiltration controls](SECURITY.md) apply with extra force — use it only with `persist-credentials: false` and on **trusted (non-fork) PRs**, never with `pull_request_target`.
+>
+> **Codex has no clean equivalent:** its ChatGPT-subscription auth (`codex login`) is an interactive OAuth flow whose `auth.json` tokens rotate, and using a ChatGPT plan for CI automation likely violates OpenAI's terms. Keep `provider: codex` on an API key (`gpt-5.6-luna` / `gpt-5.4-mini` are already cheap).

@@ -12,7 +12,7 @@
 | [`strict.yml`](strict.yml) | Fail the GitHub check on critical (or critical + warning) findings — pair with a branch-protection rule that requires the check to pass. |
 | [`custom-prompt.yml`](custom-prompt.yml) | Point the action at a house-rules prompt inside the consumer's own repo (full replacement). |
 | [`custom-prompt-per-stack.yml`](custom-prompt-per-stack.yml) | Layer a stack-specific extension on top of the bundled default prompt. See [`prompts/`](prompts/). |
-| [`provider-claude-code.yml`](provider-claude-code.yml) | Use the Claude Code CLI (agent-runner) instead of the direct Anthropic API. |
+| [`provider-claude-code.yml`](provider-claude-code.yml) | Use the Claude Code CLI (agent-runner) instead of the direct Anthropic API. Shows both auth modes: a metered Anthropic API key **or** a Claude Pro/Max **subscription** token (`claude setup-token` → `sk-ant-oat…`). |
 | [`provider-cursor.yml`](provider-cursor.yml) | Use the Cursor Agent CLI (agent-runner) for review. |
 | [`provider-codex.yml`](provider-codex.yml) | Use the OpenAI Codex CLI (agent-runner) for review. |
 | [`mcp-passthrough.yml`](mcp-passthrough.yml) | Inject a custom MCP servers config into whichever CLI provider you picked. |

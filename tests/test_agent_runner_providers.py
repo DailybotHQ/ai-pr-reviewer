@@ -106,9 +106,9 @@ class ProviderConstructionTests(unittest.TestCase):
 
     def test_codex_stores_all_fields(self) -> None:
         p = reviewer.CodexProvider(
-            api_key="AK", model="gpt-5-codex", extra_args="", mcp_config_file=""
+            api_key="AK", model="gpt-5.4-mini", extra_args="", mcp_config_file=""
         )
-        self.assertEqual(p.model, "gpt-5-codex")
+        self.assertEqual(p.model, "gpt-5.4-mini")
 
     def test_default_extras_are_empty(self) -> None:
         p = reviewer.ClaudeCodeProvider(api_key="k", model="m")
@@ -847,6 +847,48 @@ class AgentRunnerPromptHygieneTests(unittest.TestCase):
         text = reviewer.render_user_prompt(_make_pr_context())
         self.assertIn("post_inline_comment", text)
         self.assertIn("submit_review", text)
+
+
+class ClaudeCodeSubscriptionAuthTests(unittest.TestCase):
+    """`api-key` maps to metered API auth OR subscription OAuth auth based on
+    the token prefix — so a Claude Pro/Max subscription can bill the review
+    instead of API usage (parallel to Cursor's subscription model)."""
+
+    def test_api_key_maps_to_anthropic_api_key(self) -> None:
+        p = reviewer.ClaudeCodeProvider(
+            api_key="sk-ant-api03-abc123", model=""
+        )
+        self.assertEqual(
+            p.auth_env_vars(), {"ANTHROPIC_API_KEY": "sk-ant-api03-abc123"}
+        )
+
+    def test_oauth_token_maps_to_oauth_env(self) -> None:
+        p = reviewer.ClaudeCodeProvider(
+            api_key="sk-ant-oat01-subtoken", model=""
+        )
+        self.assertEqual(
+            p.auth_env_vars(),
+            {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-subtoken"},
+        )
+
+    def test_oauth_token_never_sets_api_key_var(self) -> None:
+        """Regression: an OAuth token must NOT be exported as
+        ANTHROPIC_API_KEY, or Claude Code would try metered API auth with a
+        subscription token and fail."""
+        p = reviewer.ClaudeCodeProvider(
+            api_key="sk-ant-oat01-subtoken", model=""
+        )
+        self.assertNotIn("ANTHROPIC_API_KEY", p.auth_env_vars())
+
+    def test_oauth_env_forwarded_into_subprocess_env(self) -> None:
+        captured = _capture_provider_call(
+            reviewer.ClaudeCodeProvider(
+                api_key="sk-ant-oat01-subtoken", model=""
+            )
+        )
+        env = captured["kwargs"]["env"]
+        self.assertEqual(env.get("CLAUDE_CODE_OAUTH_TOKEN"), "sk-ant-oat01-subtoken")
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
 
 
 if __name__ == "__main__":

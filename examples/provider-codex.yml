@@ -45,7 +45,12 @@ jobs:
           provider: codex
           api-key: ${{ secrets.OPENAI_API_KEY }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          # Optional: override the default gpt-5-codex model.
-          # model: 'gpt-5-codex'
+          # Optional: override the default model. The default is
+          # `gpt-5.6-luna` (≈$1/$6 per 1M tokens) — the current-gen budget
+          # model, strong enough to find subtle bugs while far cheaper than
+          # codex-tier models (`gpt-5-codex` is deprecated). Pin the cheaper
+          # `gpt-5.4-mini` (≈$0.75/$4.50) for a shallower smoke review, or a
+          # codex-tier model for the deepest passes.
+          # model: 'gpt-5.4-mini'
           # Optional: pin the CLI version.
           # codex-version: '0.6.1'

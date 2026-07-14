@@ -4,7 +4,7 @@ The testing strategy for AI PR Reviewer is deliberately pragmatic. The runtime i
 
 1. **Static check.** Does the script parse and compile?
 2. **Unit tests.** Do the pure-logic paths (parsers, dispatch, subprocess boundary, roundtrip serialization) behave correctly on a vanilla runner with nothing installed?
-3. **Dogfood.** Does the action successfully review its own PRs — for **every** shipping provider?
+3. **Dogfood.** Does the action successfully review its own PRs, with the direct Anthropic leg always on and the CLI-provider legs enabled when provider-sensitive surfaces change?
 
 That's the entire test suite. The bar is deliberate: enough to catch every regression that `py_compile` alone would miss, cheap enough to run in seconds on a stdlib-only setup.
 
@@ -20,7 +20,7 @@ The [`.github/workflows/code_check.yml`](../.github/workflows/code_check.yml) wo
 | `cli-install-smoke` (matrix: `claude-code`, `cursor`, `codex`) | Runs each agent-runner CLI's install command on a fresh runner, verifies `--version`, then imports `scripts/reviewer.py` and asserts `build_provider(PROVIDER_ID)` returns an `AgentRunnerProvider` instance. | Catches upstream CLI-installer breakage before it hits consumers. |
 | `actionlint` | Downloads the official actionlint binary and runs it across `.github/workflows/`. | Catches malformed workflow YAML, unsafe `${{ }}` interpolations in `run:` blocks, and shellcheck issues in inline shell. |
 
-The [`.github/workflows/self-review.yml`](../.github/workflows/self-review.yml) workflow runs on every PR and **invokes the action under review against itself**, as a `strategy.matrix` job with four legs (`anthropic`, `claude-code`, `cursor`, `codex`), each applying a distinct `self-reviewed:<provider>` label so the four reviews are individually identifiable in the PR conversation. The local checkout (`uses: ./`) is what gets executed, so the version of the action proposed by the PR is what reviews the PR.
+The [`.github/workflows/self-review.yml`](../.github/workflows/self-review.yml) workflow runs on every PR and **invokes the action under review against itself**. The `anthropic` leg runs on every PR/push as the baseline reviewer with a tighter self-review turn cap. The `claude-code`, `cursor`, and `codex` legs are present in the matrix but invoke the LLM only when the diff touches critical action/runtime surfaces (`action.yml`, `scripts/reviewer.py`, prompts, core workflow files, or provider/runtime tests). Each active leg applies a distinct `self-reviewed:<provider>` label so reviews are identifiable in the PR conversation. The local checkout (`uses: ./`) is what gets executed, so the version of the action proposed by the PR is what reviews the PR.
 
 If a leg's API-key secret isn't set on the repo, the leg gracefully skips (emits a `::notice::` and short-circuits before checkout) rather than failing red — this keeps fork PRs and secret-less consumer setups from breaking CI.
 
@@ -110,7 +110,7 @@ export AIPRR_TRACKING_COMMENT=true
 export AIPRR_COLLAPSE_PREVIOUS=true
 export AIPRR_MAX_INLINE_COMMENTS=10
 export AIPRR_MAX_TURNS=30                   # chat-completions family
-# export AIPRR_AGENT_MAX_TURNS=30           # agent-runner family (forwarded to the CLI)
+# export AIPRR_AGENT_MAX_TURNS=30           # agent-runner family (warns; no universal CLI cap)
 # export AIPRR_MCP_CONFIG_FILE=$PWD/mcp.json # agent-runner family, optional
 # export AIPRR_AGENT_EXTRA_ARGS='--verbose' # agent-runner family, optional
 
@@ -129,10 +129,10 @@ The script will:
 Whenever you touch the agentic loop, the prompt, the review-submission path, or a provider implementation:
 
 1. Open a PR in this repo with your change.
-2. `self-review.yml` runs the action against itself across the 4-leg matrix.
-3. Watch the four tracking comments (one per provider). Each should transition `Working… → done`.
-4. Verify the inline comments and the summary look right for **the provider you touched**. If your change also affected shared code (`state_to_review_result`, the submission path, the strictness gate), verify all four legs.
-5. If anything is off — comment posted on a wrong line, summary missing a section, severity mis-assigned — fix it on the same PR. Each push re-triggers the 4-leg matrix against the new HEAD.
+2. `self-review.yml` runs the action against itself. The Anthropic baseline leg always invokes the reviewer; the three CLI-provider legs invoke it when provider-sensitive files changed.
+3. Watch the active tracking comments. Each should transition `Working… → done`.
+4. Verify the inline comments and the summary look right for **the provider you touched**. If your change also affected shared code (`state_to_review_result`, the submission path, the strictness gate), make sure the diff trips the critical-file scope gate and verify all active provider legs.
+5. If anything is off — comment posted on a wrong line, summary missing a section, severity mis-assigned — fix it on the same PR. Each push re-triggers self-review against the new HEAD.
 
 The PR description should explicitly reference which self-review runs validated the change (per provider, if the change is not provider-agnostic).
 
@@ -142,7 +142,7 @@ Prompt changes are particularly tricky because the same prompt + same diff + sam
 
 1. Write the new prompt in `prompts/default.md` (or your custom prompt file).
 2. Open a PR with the change.
-3. **Compare reviews on the same PR**: `self-review.yml` will produce four reviews using the new prompt. Compare them with a manual run of the *old* prompt against the same PR for an apples-to-apples view.
+3. **Compare reviews on the same PR**: prompt changes trip the critical-file scope gate, so `self-review.yml` will produce provider reviews using the new prompt. Compare them with a manual run of the *old* prompt against the same PR for an apples-to-apples view.
 4. Run on 3–5 representative PRs (covering different types of changes — feature, bugfix, refactor, docs) to see the prompt's behaviour spread.
 5. Paste the before/after reviews into the PR description.
 
@@ -183,4 +183,4 @@ We already crossed some of the thresholds from earlier versions of this doc (the
 2. A class of bug ships repeatedly that `py_compile` + the unit suite + dogfooding doesn't catch.
 3. We add features that aren't safely dogfoodable (e.g. `block-on-warning` exercising paths that don't fire on this repo's own PRs).
 
-Until any of those hit: keep the bar at compile + 109 unit tests + 4-leg dogfood, and keep the contributor experience friction-free.
+Until any of those hit: keep the bar at compile + unit tests + scoped dogfood, and keep the contributor experience friction-free.
