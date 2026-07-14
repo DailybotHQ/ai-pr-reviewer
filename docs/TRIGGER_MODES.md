@@ -61,6 +61,55 @@ This mode fires the workflow only when GitHub emits a `labeled` event with the m
 
 **The webhook-vs-gate distinction (v1.2.0+):** GitHub's `labeled` event fires for *any* label. If `label-gate: ai-review` is already on the PR and someone adds an unrelated label (e.g. `bug`, `dependencies`), the workflow *would* fire — but the action inspects `event.label.name` and skips when it doesn't match `label-gate`, logging `Trigger decision: should_run=False (labeled event was for 'bug', not 'ai-review')`. So you don't have to worry about accidentally paying for a review every time a bot bumps a dependency label.
 
+## Recipe: run once when labelled `ready`, and show **Skipped** (not green) otherwise
+
+A common ask: "only review when I apply a `ready` label, review exactly once per application, and — importantly — when it *doesn't* review, the check should read **Skipped**, not a misleading green **Success**." This repo's own [`.github/workflows/self-review.yml`](../.github/workflows/self-review.yml) is the reference implementation. Two techniques combine:
+
+**1. Fire on the label event, not on push.** Subscribe to `labeled` (and `opened` to catch a PR created with the label already on it), and *not* `synchronize`. Pushes then don't re-review — re-review happens by removing and re-adding `ready`. Guard against unrelated labels by checking the event's label:
+
+```yaml
+on:
+  pull_request:
+    types: [opened, labeled]   # NOT synchronize → run-once per label application
+```
+
+**2. Gate at the JOB level so a skipped run is grey, not green.** A step-level skip (`steps.*.if`) leaves the *job* green; only a **job-level `if:`** that evaluates false renders as **Skipped**. So compute the decision once and gate the job on it. For a **single provider**, a decision job + `needs` does it (case-insensitive label check in bash):
+
+```yaml
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.d.outputs.run }}
+    steps:
+      - id: d
+        env:
+          ACTION: ${{ github.event.action }}
+          EVENT_LABEL: ${{ github.event.label.name }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        shell: bash
+        run: |
+          lc() { tr '[:upper:]' '[:lower:]'; }
+          run=false
+          if [ "$ACTION" = labeled ] && [ "$(printf %s "$EVENT_LABEL" | lc)" = ready ]; then run=true; fi
+          if [ "$ACTION" = opened ] && printf %s "$LABELS" | lc | grep -qE '"ready"'; then run=true; fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+  review:
+    needs: gate
+    if: needs.gate.outputs.run == 'true'   # false → this job shows as *Skipped*
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: DailybotHQ/ai-pr-reviewer@v1
+        with:
+          api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          label-gate: ready   # defense-in-depth; the action's gate agrees
+```
+
+**Why not a job-level `if:` directly on the matrix?** GitHub Actions does **not** expose the `matrix` context to a job-level `if:`, so a static matrix can only be skipped per-step (leaving the job green). For a **multi-provider matrix**, have the decision job emit the matrix of legs that should run and consume it with `strategy.matrix.include: ${{ fromJSON(needs.gate.outputs.matrix) }}` — ineligible legs are then simply absent (never a green no-op), and when nothing is eligible the whole job is **Skipped** via `if: needs.gate.outputs.matrix != '[]'`. See `self-review.yml` for the full four-provider version, including per-provider secret detection.
+
 ## Interaction with `on:` and `concurrency`
 
 - The workflow's `on:` block is the outer gate — GitHub only fires the runner when the subscribed event matches.

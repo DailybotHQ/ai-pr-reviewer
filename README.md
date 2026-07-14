@@ -288,7 +288,7 @@ Run only when you signal readiness by adding a label; toggle the label off/on to
     label-gate: ai-review
 ```
 
-Full guide: [docs/TRIGGER_MODES.md](docs/TRIGGER_MODES.md).
+Full guide: [docs/TRIGGER_MODES.md](docs/TRIGGER_MODES.md). Want unlabeled PRs to show the check as **Skipped** (grey) instead of a green **Success** — and the review to fire only when you apply the label, once per application? See [docs/TRIGGER_MODES.md § "Recipe: run once when labelled `ready`, and show Skipped (not green)"](docs/TRIGGER_MODES.md), the exact pattern this repo's own `self-review.yml` uses.
 
 ### Auto-fill missing PR descriptions
 
