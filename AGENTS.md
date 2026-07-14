@@ -2,7 +2,7 @@
 
 **Purpose:** Single source of truth for every AI coding assistant working on this repository (Claude Code, Cursor, OpenAI Codex, Google Gemini, GitHub Copilot, OpenClaw, and others). Human contributors are also welcome readers — this file is the fastest way to get oriented.
 
-The product name in user-facing strings is **"AI PR Reviewer"** (capitalised exactly that way). The action repository slug is `ai-pr-reviewer` (lowercase, hyphenated). On the GitHub Marketplace the listing is titled **"Dailybot AI PR Reviewer"** (the `action.yml` `name:` field) — the vendor prefix is required to avoid a slug collision with an unrelated third-party `ai-pr-review` action that already claims `ai-pull-request-reviewer`. This split is display-only; workflows still reference `DailybotHQ/ai-pr-reviewer@v1` and product copy stays "AI PR Reviewer" everywhere else.
+The product name in user-facing strings is **"AI PR Reviewer"** (capitalised exactly that way). The action repository slug, the Marketplace listing slug, and the `action.yml` `name:` field all resolve to the same string: **`ai-pr-reviewer`**. Workflows reference `DailybotHQ/ai-pr-reviewer@v1`; the Marketplace URL is `github.com/marketplace/actions/ai-pr-reviewer`. Vendor attribution is handled by GitHub automatically via the `author:` field (`DailybotHQ`) — the Marketplace tile renders "by DailybotHQ" beneath the title, so we do NOT embed "Dailybot" in the `name:` field. See Rule #9 for the earlier vendor-prefix experiment that was reverted.
 
 ---
 
@@ -174,12 +174,14 @@ Releases follow Semantic Versioning. Tags are `vX.Y.Z`. The `release.yml` workfl
 `action.yml` `name`, `description`, `branding.icon`, and `branding.color` are visible in the GitHub Marketplace listing. Once published, treat them as immutable for cosmetic reasons (consumers' search results and tile UI depend on them). Editorial changes are fine; identity changes need a deliberate decision.
 
 The current values are:
-- `name: 'Dailybot AI PR Reviewer'` (Marketplace tile + listing title)
+- `name: 'AI PR Reviewer'` (Marketplace tile + listing title; slugifies to `ai-pr-reviewer`, matching the repo slug exactly)
 - `description: 'Run an LLM-driven code review on every pull request — inline comments, severity-based gating, no infra required.'`
 - `branding.icon: 'check-circle'`
 - `branding.color: 'purple'`
 
-The `name:` field carries the vendor prefix intentionally — a legacy `appchoose/ai-pr-review` action already owns the un-prefixed `ai-pull-request-reviewer` slug. Do not remove the prefix; doing so re-triggers the collision and rejects the next publish attempt.
+There IS a related third-party listing titled "AI Pull Request Reviewer" (`appchoose/ai-pr-review`) at slug `ai-pull-request-reviewer`. Our abbreviated form ("PR" instead of "Pull Request") yields a **different** slug — `ai-pr-reviewer` — so both listings coexist and neither collides with the other. This distinction is load-bearing: renaming our listing to spell out "Pull Request" would collide and reject the publish.
+
+The `Dailybot`-prefix experiment (v1.2.1, reverted in v1.3.0): during the first publish attempt we misdiagnosed the collision as being on the abbreviated form too, so `name:` was set to `Dailybot AI PR Reviewer` (slug `dailybot-ai-pr-reviewer`) as a defensive workaround. Re-checking Marketplace slug availability showed `ai-pr-reviewer` was actually free; we reverted the prefix in v1.3.0 for cleaner branding (vendor attribution is auto-rendered by GitHub via `author: DailybotHQ` in the listing footer). Do not re-add the prefix — the current name is deliberate and matches the "MIT / BYOK / community tool" positioning of the product.
 
 ### 10. Dogfooding is Required
 
@@ -314,7 +316,7 @@ Reusable **Skills** (slash commands and one-shot workflows) and **Agents** (spec
 10. Add a new top-level `action.yml` input "just to support a one-off use case" — every input is a long-lived public contract.
 11. Hardcode anything that should be a constant — magic numbers, paths, severity ranks. The top of `scripts/reviewer.py` is the canonical place for runtime constants.
 12. Edit content in `.claude/...` or `CLAUDE.md` — both are symlinks. Edit the canonical paths under `.agents/...` and `AGENTS.md`.
-13. Spell the action name "AI-PR-reviewer" / "AIPR" / "AI/PR Reviewer" in user-facing copy — the canonical user-facing capitalisation is **"AI PR Reviewer"** and the repo slug is `ai-pr-reviewer`. The GitHub Marketplace listing is "Dailybot AI PR Reviewer" (see Rule #9) but that name belongs only to the Marketplace tile — never rewrite `README.md`, `docs/`, or product copy to use it.
+13. Spell the action name "AI-PR-reviewer" / "AIPR" / "AI/PR Reviewer" in user-facing copy — the canonical user-facing capitalisation is **"AI PR Reviewer"**, the repo slug is `ai-pr-reviewer`, and the GitHub Marketplace listing is `AI PR Reviewer` (same slug, same title — Rule #9). All three strings match; do not introduce a variant.
 
 ### DO
 
