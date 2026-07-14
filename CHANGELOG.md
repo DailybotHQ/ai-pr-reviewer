@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_No unreleased changes since [1.4.1](#141--2026-07-14)._
+
+## [1.4.1] — 2026-07-14
+
+### Changed
+- **Self-review dogfood promoted from `lenient` to `block-on-critical`**
+  (dogfood-only, no product change). Every provider leg in
+  [`.github/workflows/self-review.yml`](.github/workflows/self-review.yml)
+  now passes `strictness: block-on-critical` to the action, so a `critical`
+  finding on a self-review'd PR turns the check red and blocks the merge
+  gate. `warning` and `info` still post inline but don't gate. This is the
+  calibrated default recommended in [`docs/STRICTNESS.md`](docs/STRICTNESS.md)
+  once a repo has run in `lenient` long enough to trust the model's
+  severity assignments. Consumers are unaffected — the action's own
+  default remains `lenient` (safe rollout) and `action.yml` is unchanged.
+
+## [1.4.0] — 2026-07-14
+
+**Headline:** vendored the Dailybot agent skill (v3.10.3) into `.agents/skills/dailybot/` and adopted the `skills.sh` lockfile mechanism (`skills-lock.json` at repo root) for pinning both vendored dogfood skills; also closed a coverage hole in the self-review dogfood so every configured provider reviews every `ready`-labeled PR regardless of diff shape. Consumer impact: **none** — the vendored skills live entirely inside `.agents/` and are invisible to the composite-action runtime; the dogfood policy is workflow-only.
+
 ### Added
 - **Vendored `dailybot` agent skill (v3.10.3) + `skills-lock.json` lockfile at
   repo root.** Both vendored skills — [`.agents/skills/dailybot/`](.agents/skills/dailybot/)
@@ -30,22 +50,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sections), [`.agents/docs/skills_agents_catalog.md`](.agents/docs/skills_agents_catalog.md)
   (new `dailybot` row + a "Vendored skills and the lockfile" subsection with
   the common `npx skills` workflows).
-- **README recipe: "Require a passing review before merge (branch protection)"** —
-  documents the merge-gate pattern (a stable-named job that *fails* rather than
-  *skips* so a required check actually blocks the merge), cross-linked to
-  [`docs/TRIGGER_MODES.md`](docs/TRIGGER_MODES.md).
 
 ### Changed
-- **Self-review dogfood promoted from `lenient` to `block-on-critical`**
-  (dogfood-only, no product change). Every provider leg in
-  [`.github/workflows/self-review.yml`](.github/workflows/self-review.yml)
-  now passes `strictness: block-on-critical` to the action, so a `critical`
-  finding on a self-review'd PR turns the check red and blocks the merge
-  gate. `warning` and `info` still post inline but don't gate. This is the
-  calibrated default recommended in [`docs/STRICTNESS.md`](docs/STRICTNESS.md)
-  once a repo has run in `lenient` long enough to trust the model's
-  severity assignments. Consumers are unaffected — the action's own
-  default remains `lenient` (safe rollout) and `action.yml` is unchanged.
 - **Self-review dogfood now runs on EVERY `ready`-labeled PR** — no more
   critical-surface filter. Previously the three CLI provider legs
   (`claude-code`, `cursor`, `codex`) only ran when the diff touched a small
@@ -89,14 +95,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [`docs/TRIGGER_MODES.md` § "Variant — opt-in gate"](docs/TRIGGER_MODES.md)
   documents both flavors (strict = fail without label; opt-in = skip without
   a review-request) with the `empty_reason`-based predicate.
-- **Self-review dogfood has a real merge gate.** The stable-named
-  `Self-review gate` job **fails (blocks merge)** when the review ran but no
-  leg passed — because GitHub's branch protection treats a *Skipped* required
-  check as *passing*, so the per-leg Skipped status alone never blocked a
-  merge. Mark **only** `Self-review gate` as the required check (never the
-  dynamic `Self-review — <provider>` legs). Documented as a reusable consumer
-  recipe in
-  [`docs/TRIGGER_MODES.md` § "Recipe: run once when labelled `ready`, block merge until it passes"](docs/TRIGGER_MODES.md).
+
+## [1.3.3] — 2026-07-14
+
+### Added
+- **README recipe: "Require a passing review before merge (branch protection)"** —
+  documents the merge-gate pattern (a stable-named job that *fails* rather than
+  *skips* so a required check actually blocks the merge), cross-linked to
+  [`docs/TRIGGER_MODES.md`](docs/TRIGGER_MODES.md).
+
+### Changed
 - **Merge gate passes when ≥1 provider leg passes** (not all). A single flaky or
   failing provider no longer blocks a merge that another provider reviewed
   cleanly — the gate counts successful `Self-review — <provider>` legs from the
@@ -105,7 +113,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configured (e.g. just `CURSOR_API_KEY`) and the diff is non-critical, it emits
   a `::notice::` clarifying that CLI legs review only critical changes and
   Anthropic is the always-on baseline — so the resulting empty matrix (and red
-  merge gate) isn't a mystery.
+  merge gate) isn't a mystery. (Superseded in [1.4.0](#140--2026-07-14) when the
+  critical-surface filter was removed entirely.)
+
+## [1.3.2] — 2026-07-14
+
+### Changed
+- **Self-review dogfood has a real merge gate.** The stable-named
+  `Self-review gate` job **fails (blocks merge)** when the review ran but no
+  leg passed — because GitHub's branch protection treats a *Skipped* required
+  check as *passing*, so the per-leg Skipped status alone never blocked a
+  merge. Mark **only** `Self-review gate` as the required check (never the
+  dynamic `Self-review — <provider>` legs). Documented as a reusable consumer
+  recipe in
+  [`docs/TRIGGER_MODES.md` § "Recipe: run once when labelled `ready`, block merge until it passes"](docs/TRIGGER_MODES.md).
+
+## [1.3.1] — 2026-07-14
+
+### Changed
+- **Post-release documentation polish for v1.3.0** — CHANGELOG promotion,
+  Upgrade guide rewrite, and release-notes rewrite. Documentation-only; no
+  behavior change to the runtime or `action.yml` contract.
 
 ## [1.3.0] — 2026-07-14
 
