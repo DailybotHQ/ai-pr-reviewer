@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **New `author-association` input** — comma-separated whitelist of GitHub `pull_request.author_association` values allowed to trigger a review. Defaults to `OWNER,MEMBER,COLLABORATOR` (the "write-tier" allow-list), which is the safe baseline for public open-source repos: it blocks external contributors' PRs before any LLM API call is made, closing the LLM-budget-abuse vector where an attacker opens N PRs to burn the maintainer's provider tokens. Case- and whitespace-insensitive; empty string disables the gate. Composes AND-style with `label-gate` and `trigger-mode` and is evaluated *first* (cheapest gate — no API calls, just reads the webhook payload). See [`docs/SECURITY.md` § "Author-association gate"](docs/SECURITY.md) and [`examples/open-source-safe.yml`](examples/open-source-safe.yml).
+
+### Changed
+- **Default behavior tightening (soft-breaking).** With the new default (`author-association: OWNER,MEMBER,COLLABORATOR`), external-contributor PRs (`author_association` = `CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR`, `FIRST_TIMER`, `NONE`) are **no longer reviewed automatically** after upgrading. Consumers on private repos or who deliberately want to review every PR must set `author-association: ''` (empty) to restore v1.2.x behaviour. Public-repo consumers get safer defaults for free. This will be the headline of the next `v1.3.0` release; the SemVer minor bump reflects that the behavioural change is opt-out.
+
 ## [1.2.1] — 2026-07-14
 
 **Headline:** the "actually-works-on-Marketplace" release — renames the Marketplace listing to unblock the first-time publish (a squatting `appchoose/ai-pr-review` action already owns the un-prefixed slug) and ships two provider-side fix batches that landed on `main` after `v1.2.0` was tagged (`claude-code` and `codex` were both broken out of the box in `v1.2.0`; this patch is what makes those providers actually usable). Consumers pinning `@v1` pick everything up automatically.

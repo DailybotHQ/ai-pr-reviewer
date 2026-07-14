@@ -33,6 +33,12 @@ Environment (set by the composite action's `env:` block; see action.yml):
     AIPRR_PROMPT_EXTENSION_FILE  Path to a markdown file APPENDED to the
                             base prompt. Layer overrides without copying
                             the whole default.
+    AIPRR_AUTHOR_ASSOCIATION Comma-separated whitelist of accepted
+                             GitHub `pull_request.author_association`
+                             values. Default `OWNER,MEMBER,COLLABORATOR`
+                             (write-tier only). Empty disables the gate.
+                             See docs/SECURITY.md § "Author-association
+                             gate" for rationale.
     AIPRR_LABEL_GATE         Required label, or empty for no gate.
     AIPRR_TRIGGER_MODE       `always` | `label-required` | `label-once` |
                             `label-added-only`. Empty = auto (label-required
@@ -207,6 +213,35 @@ TRIGGER_MODES: tuple[str, ...] = (
 )
 TRIGGER_STATE_MARKER_OPEN: str = "<!-- ai-pr-reviewer-state: "
 TRIGGER_STATE_MARKER_CLOSE: str = " -->"
+
+# Author-association gate (v1.3.0+). GitHub attaches `author_association`
+# to every `pull_request` / `pull_request_target` payload; the field is
+# server-computed and cannot be spoofed by the PR author, which makes it
+# the primary line of defense against LLM-budget abuse on public repos
+# (an attacker opens N PRs → each burns ~50–200K tokens).
+#
+# The canonical values are the full enum accepted by GitHub. See
+# https://docs.github.com/en/graphql/reference/enums#commentauthorassociation.
+VALID_AUTHOR_ASSOCIATIONS: tuple[str, ...] = (
+    "OWNER",
+    "MEMBER",
+    "COLLABORATOR",
+    "CONTRIBUTOR",
+    "FIRST_TIME_CONTRIBUTOR",
+    "FIRST_TIMER",
+    "MANNEQUIN",
+    "NONE",
+)
+
+# The default write-tier — what `action.yml`'s `author-association` input
+# defaults to and what the runtime falls back to when the env var is
+# unset. Any consumer who wants to allow external contributors sets the
+# input explicitly (see docs/SECURITY.md § "Author-association gate").
+AUTHOR_ASSOCIATION_WRITE_TIER: tuple[str, ...] = (
+    "OWNER",
+    "MEMBER",
+    "COLLABORATOR",
+)
 
 # Severity levels — ordered low→high so `max(SEVERITY_RANK)` yields the most
 # severe finding in a review.
@@ -2172,6 +2207,109 @@ def execute_tool(name: str, args: dict[str, Any], state: ReviewState) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Author-association gate (v1.3.0+): the first / cheapest gate. Runs before
+# `trigger-mode` so a rejected PR never consumes a single API call.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AuthorAssociationDecision:
+    """Result of `resolve_author_association_gate()`.
+
+    - `should_run` — True when the PR author is allowed through the gate.
+    - `reason` — one-line explanation for the runtime log.
+    - `author_association` — the association we compared, uppercase.
+    - `allowed_associations` — the parsed whitelist, for downstream log
+      messages (`Skipping: author X not in [OWNER, MEMBER, …]`).
+    """
+
+    should_run: bool
+    reason: str
+    author_association: str
+    allowed_associations: tuple[str, ...]
+
+
+def resolve_author_association_gate(
+    *, gate: str, actual_association: str
+) -> AuthorAssociationDecision:
+    """Decide whether the review should run given the author-association
+    whitelist `gate` and the PR's actual `author_association`.
+
+    Semantics:
+
+    - **Empty `gate`** — gate disabled, every author allowed.
+    - **Empty `actual_association`** — no PR context (local run,
+      `workflow_dispatch`, malformed event payload). Fail-open: the
+      operator running locally already has write access, and CI-time
+      failures to read the payload are already logged elsewhere.
+    - **`actual_association` in whitelist** — allowed.
+    - **`actual_association` not in whitelist** — denied.
+
+    Parsing is case-insensitive and tolerates whitespace between commas.
+    Unknown values in the whitelist are logged as a warning and can
+    never match (fail-safe).
+    """
+    normalized_gate: str = gate.strip()
+    if not normalized_gate:
+        return AuthorAssociationDecision(
+            should_run=True,
+            reason="no author-association gate configured",
+            author_association=(actual_association or "").upper(),
+            allowed_associations=(),
+        )
+
+    allowed: tuple[str, ...] = tuple(
+        piece.strip().upper()
+        for piece in normalized_gate.split(",")
+        if piece.strip()
+    )
+    unknown: list[str] = [
+        a for a in allowed if a not in VALID_AUTHOR_ASSOCIATIONS
+    ]
+    if unknown:
+        log(
+            f"WARNING: author-association gate lists unknown value(s) "
+            f"{unknown}; they will never match. Valid values: "
+            f"{list(VALID_AUTHOR_ASSOCIATIONS)}."
+        )
+
+    normalized_actual: str = (actual_association or "").upper()
+
+    if not normalized_actual:
+        return AuthorAssociationDecision(
+            should_run=True,
+            reason=(
+                "author-association gate fail-open: no PR "
+                "author_association in event payload (likely a local "
+                "run, workflow_dispatch, or malformed event)"
+            ),
+            author_association="",
+            allowed_associations=allowed,
+        )
+
+    if normalized_actual in allowed:
+        return AuthorAssociationDecision(
+            should_run=True,
+            reason=(
+                f"author_association '{normalized_actual}' matches "
+                f"gate {list(allowed)}"
+            ),
+            author_association=normalized_actual,
+            allowed_associations=allowed,
+        )
+
+    return AuthorAssociationDecision(
+        should_run=False,
+        reason=(
+            f"author_association '{normalized_actual}' not in gate "
+            f"{list(allowed)}"
+        ),
+        author_association=normalized_actual,
+        allowed_associations=allowed,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Trigger modes (v1.2.0+): decide whether to run based on webhook event
 # + label state + prior-run marker generation.
 # ---------------------------------------------------------------------------
@@ -2346,6 +2484,23 @@ def _read_github_event_label() -> str:
     if not isinstance(label, dict):
         return ""
     return str(label.get("name", "") or "")
+
+
+def _read_github_event_pr_author_association() -> str:
+    """Return `pull_request.author_association` from the event payload
+    in uppercase, or `""` when unavailable.
+
+    GitHub attaches this field to every `pull_request` /
+    `pull_request_target` webhook — it is derived server-side and
+    cannot be spoofed by the PR author. When empty, the caller is
+    outside a PR-event context (local run, `workflow_dispatch`, etc.)
+    and the caller should fail-open on the author gate.
+    """
+    payload = _read_github_event_payload()
+    pr = payload.get("pull_request")
+    if not isinstance(pr, dict):
+        return ""
+    return str(pr.get("author_association", "") or "").upper()
 
 
 def _read_existing_tracking_state(
@@ -3143,6 +3298,34 @@ def main() -> int:
         f"{provider_id}/{model} (strictness={strictness}, "
         f"trigger-mode={trigger_mode})"
     )
+
+    # ------------------------------------------------------------------
+    # Author-association gate (v1.3.0+) — cheapest gate, runs first so a
+    # denied PR never consumes an LLM API call. Defaults to write-tier
+    # only, which is the safe baseline for public open-source repos.
+    # ------------------------------------------------------------------
+    author_gate_raw: str = os.environ.get(
+        "AIPRR_AUTHOR_ASSOCIATION",
+        ",".join(AUTHOR_ASSOCIATION_WRITE_TIER),
+    )
+    pr_author_association: str = _read_github_event_pr_author_association()
+    author_decision: AuthorAssociationDecision = (
+        resolve_author_association_gate(
+            gate=author_gate_raw,
+            actual_association=pr_author_association,
+        )
+    )
+    log(f"Author-association gate: {author_decision.reason}")
+    if not author_decision.should_run:
+        log(
+            "Skipping review — this is the abuse-prevention default. To "
+            "allow this author, add their association to "
+            "`author-association` (see docs/SECURITY.md § "
+            "'Author-association gate') or set the input to an empty "
+            "string to disable the gate entirely."
+        )
+        write_all_outputs(skipped=True)
+        return 0
 
     # ------------------------------------------------------------------
     # Trigger evaluation (v1.2.0+) — subsumes the v1.x `label-gate` block

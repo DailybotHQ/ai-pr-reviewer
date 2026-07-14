@@ -86,6 +86,7 @@ That's the minimum. Open a PR; the action posts a tracking comment, runs a revie
 | `model` | | provider default | Model id. Anthropic → `claude-sonnet-4-6`, Cursor → `composer-2.5`, Codex → `gpt-5-codex`, Claude Code → account default. |
 | `prompt-file` | | bundled `prompts/default.md` | Path **inside the consumer checkout** to a markdown system prompt. FULLY REPLACES the base. Customising the prompt is the main lever for adapting the review to your codebase — see [docs/PROMPTS.md](docs/PROMPTS.md). |
 | `prompt-extension-file` | | _(empty)_ | Path **inside the consumer checkout** to a markdown file APPENDED to the base prompt. Use to layer overrides without copying the whole default. Combines with `prompt-file` (base + extension). Starter templates in [`examples/prompts/`](examples/prompts/). |
+| `author-association` | | `OWNER,MEMBER,COLLABORATOR` | Comma-separated whitelist of GitHub `pull_request.author_association` values allowed to trigger a review. Default is write-tier only — the safe baseline for public open-source repos (prevents external-contributor PR spam from burning your LLM budget). Add `CONTRIBUTOR` to allow returning contributors, or set to empty string to disable the gate. See [docs/SECURITY.md § "Author-association gate"](docs/SECURITY.md). |
 | `label-gate` | | `''` | If non-empty, the review only runs when the PR carries this label (e.g. `ready`). Combined with `trigger-mode`. |
 | `trigger-mode` | | _(auto)_ | `always` / `label-required` / `label-once` / `label-added-only` — see [docs/TRIGGER_MODES.md](docs/TRIGGER_MODES.md). Empty picks `label-required` when `label-gate` is set, else `always`. |
 | `applied-label` | | `''` | If non-empty, this label is applied to the PR after a successful, non-blocked review (e.g. `pr-reviewed`). The label is auto-created if it doesn't exist. |
@@ -226,6 +227,21 @@ If you want the review attributed to a specific bot account (e.g. so branch prot
     api-key: ${{ secrets.ANTHROPIC_API_KEY }}
     github-token: ${{ secrets.AUTOMATION_GITHUB_TOKEN }}   # PAT for your bot account
 ```
+
+### Public open-source repo (safest defaults)
+
+For a public repo, external contributors can open PRs — and each review costs real money (~50K–200K tokens per PR). The `author-association` input (default `OWNER,MEMBER,COLLABORATOR`, v1.3.0+) gates reviews on the PR author's relationship to the repo; the field comes from GitHub's payload and cannot be spoofed. Belt-and-suspenders combined with a label gate:
+
+```yaml
+- uses: DailybotHQ/ai-pr-reviewer@v1
+  with:
+    api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+    author-association: 'OWNER,MEMBER,COLLABORATOR,CONTRIBUTOR'  # optional: allow returning contributors
+    label-gate: 'ai-review'                                       # maintainer opt-in per PR
+    trigger-mode: label-once
+```
+
+Result: an outsider opening PRs cannot trigger the review at all (gate fails, zero API calls); returning contributors get a review only when a maintainer applies the `ai-review` label; the review runs exactly once per label application. See [docs/SECURITY.md § "Author-association gate"](docs/SECURITY.md) and [`examples/open-source-safe.yml`](examples/open-source-safe.yml).
 
 More recipes: [`examples/`](examples/).
 
