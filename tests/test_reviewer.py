@@ -775,6 +775,41 @@ class ResolveTriggerActionTests(unittest.TestCase):
         )
         self.assertTrue(d.should_run)
 
+    def test_label_match_is_case_insensitive(self) -> None:
+        """`ready`/`Ready`/`READY` all satisfy `label-gate: ready` — label
+        matching must lowercase both sides."""
+        for gate, present in (
+            ("ready", "Ready"),
+            ("Ready", "ready"),
+            ("ready", "READY"),
+            ("READY", "  ready  "),
+        ):
+            d = reviewer.resolve_trigger_action(
+                trigger_mode=reviewer.TRIGGER_LABEL_REQUIRED,
+                event_action="synchronize",
+                label_gate=gate,
+                current_labels=[present, "bug"],
+                label_toggle_generation=1,
+                last_reviewed_generation=0,
+            )
+            self.assertTrue(
+                d.should_run, f"gate={gate!r} vs label={present!r} should match"
+            )
+
+    def test_label_added_only_matches_event_label_case_insensitively(
+        self,
+    ) -> None:
+        d = reviewer.resolve_trigger_action(
+            trigger_mode=reviewer.TRIGGER_LABEL_ADDED_ONLY,
+            event_action="labeled",
+            label_gate="ready",
+            current_labels=["Ready"],
+            label_toggle_generation=1,
+            last_reviewed_generation=0,
+            event_label="READY",
+        )
+        self.assertTrue(d.should_run)
+
     def test_label_once_runs_on_first_generation(self) -> None:
         d = reviewer.resolve_trigger_action(
             trigger_mode=reviewer.TRIGGER_LABEL_ONCE,

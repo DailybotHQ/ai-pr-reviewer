@@ -1,10 +1,17 @@
 name: Self-review
 
-# Dogfood: review every PR to this action's own `main` with the action itself.
-# To keep token spend controlled, the direct Anthropic leg runs on every
-# PR/push as the baseline reviewer. The three CLI-provider legs run only when
-# the diff touches runtime/action/prompt/workflow surfaces where provider
-# parity can realistically regress.
+# Dogfood: review PRs to this action's own `main` with the action itself.
+# Cost control has three gates, cheapest first:
+#   1. LABEL GATE — the whole dogfood only runs when the PR carries a `ready`
+#      label (case-insensitive: `ready`/`Ready`/`READY`). No label → nothing
+#      runs. This puts the maintainer in explicit control of when tokens burn.
+#   2. RUN-ONCE — via `trigger-mode: label-once` on the action, it reviews
+#      only ONCE per label application; to re-run, remove the `ready` label
+#      and add it back.
+#   3. SCOPE — when it does run, the Anthropic baseline always reviews, but the
+#      three CLI-provider legs only review when the diff touches
+#      runtime/action/prompt/workflow surfaces where provider parity can
+#      realistically regress (keeps a `ready` toggle on a docs PR cheap).
 #
 # Accepted tradeoff of the scope gate: when a CLI leg is SKIPPED on a
 # follow-up push (e.g. a docs-only push after a critical one), it doesn't run
@@ -22,7 +29,9 @@ name: Self-review
 on:
   pull_request:
     branches: [main]
-    types: [opened, synchronize]
+    # `labeled` is needed so re-adding the `ready` label re-triggers the
+    # dogfood (see `trigger-mode: label-once` on the action step below).
+    types: [opened, synchronize, labeled]
 
 concurrency:
   group: self-review-${{ github.event.pull_request.number }}
@@ -116,8 +125,24 @@ jobs:
           PROVIDER: ${{ matrix.provider }}
           RUN_POLICY: ${{ matrix.run-policy }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
+          # JSON array of the PR's current label names.
+          LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
         run: |
           set -euo pipefail
+
+          # LABEL GATE (case-insensitive): the dogfood only runs when a
+          # `ready` label is present. This is the cheapest gate — no LLM
+          # call, no checkout diff needed to decide it. The action itself
+          # also enforces `label-gate: ready` + `trigger-mode: label-once`
+          # (see the run step) so re-review needs a label off/on toggle; this
+          # workflow-level check just avoids spinning up jobs with no label.
+          if ! printf '%s' "${LABELS_JSON}" \
+            | tr '[:upper:]' '[:lower:]' \
+            | grep -qiE '"ready"'; then
+            echo "run=false" >> "${GITHUB_OUTPUT}"
+            echo "::notice::${PROVIDER} self-review skipped; add the 'ready' label to run."
+            exit 0
+          fi
 
           changed_file_list="${RUNNER_TEMP}/self-review-changed-files.txt"
           git diff --name-only "origin/${BASE_REF}...HEAD" > "${changed_file_list}"
@@ -158,6 +183,13 @@ jobs:
           provider: ${{ matrix.provider }}
           api-key: ${{ secrets[matrix.api-key-secret] }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Run only while a `ready` label is present (case-insensitive), and
+          # only ONCE per label application — remove + re-add `ready` to
+          # re-review. The workflow-level scope step above short-circuits when
+          # the label is absent; these two inputs are what make the action
+          # itself enforce the gate + the run-once semantics.
+          label-gate: ready
+          trigger-mode: label-once
           # Explicit cost-efficient model per leg (see the matrix above) —
           # never `auto`/implicit for the metered providers, so the dogfood
           # spend is deterministic. Anthropic + Claude Code → Haiku 4.5

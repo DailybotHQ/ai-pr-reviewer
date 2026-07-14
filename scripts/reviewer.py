@@ -662,13 +662,17 @@ def gh_apply_label(
 def gh_pr_has_label(
     *, token: str, repo: str, pr_number: int, label: str
 ) -> bool:
-    """Return True if the PR currently has the given label."""
+    """Return True if the PR currently has the given label.
+
+    Matching is case-insensitive (`ready` == `Ready` == `READY`).
+    """
     owner, name = repo.split("/", 1)
     pr: dict[str, Any] = gh_request(
         "GET", f"/repos/{owner}/{name}/pulls/{pr_number}", token=token
     )
     labels: list[dict[str, Any]] = pr.get("labels", []) or []
-    return any((lbl.get("name") or "") == label for lbl in labels)
+    target: str = label.strip().lower()
+    return any((lbl.get("name") or "").strip().lower() == target for lbl in labels)
 
 
 def gh_remove_labels_by_prefix(
@@ -2487,7 +2491,9 @@ def count_label_events(
             if ev.get("event") != "labeled":
                 continue
             lbl_field: dict[str, Any] = ev.get("label") or {}
-            if (lbl_field.get("name") or "") == label:
+            # Case-insensitive match (`ready` == `Ready`) — consistent with
+            # gh_pr_has_label / resolve_trigger_action.
+            if (lbl_field.get("name") or "").strip().lower() == label.strip().lower():
                 count += 1
         if len(events) < 100:
             break
@@ -2684,7 +2690,15 @@ def resolve_trigger_action(
             "no label-gate set → treating as always.",
         )
 
-    label_present: bool = label_gate in current_labels
+    # Label matching is CASE-INSENSITIVE: `ready`, `Ready`, and `READY` all
+    # satisfy `label-gate: ready`. GitHub label names are case-sensitive as
+    # stored, but gating on exact case is a foot-gun, so we compare on a
+    # lowercased, whitespace-trimmed basis throughout. (Display strings below
+    # keep the configured casing via `label_gate!r`.)
+    label_gate_lc: str = label_gate.strip().lower()
+    current_labels_lc: list[str] = [c.strip().lower() for c in current_labels]
+    event_label_lc: str = event_label.strip().lower()
+    label_present: bool = label_gate_lc in current_labels_lc
 
     if trigger_mode == TRIGGER_LABEL_REQUIRED:
         if not label_present:
@@ -2740,7 +2754,7 @@ def resolve_trigger_action(
         # `labeled` fires for ANY label — reject when it's not our gate.
         # Without this, adding an unrelated label (e.g. `bug`) triggers
         # a full review as long as `label_gate` was already present.
-        if event_label and event_label != label_gate:
+        if event_label_lc and event_label_lc != label_gate_lc:
             return TriggerDecision(
                 False,
                 (
