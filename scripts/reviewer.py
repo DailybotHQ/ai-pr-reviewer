@@ -1088,28 +1088,44 @@ class ClaudeCodeProvider(AgentRunnerProvider):
         findings_path: Path = output_dir / FINDINGS_JSON_REL
         findings_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Write review instructions (with findings-contract directive) to a
-        # file so we can pass it via --append-system-prompt.
-        instructions_file: Path = output_dir / ".aiprr" / "instructions.md"
-        instructions_file.write_text(
-            write_findings_prompt_directive(review_instructions, findings_path),
-            encoding="utf-8",
+        # The review instructions + findings-contract directive go into the
+        # system prompt as LITERAL TEXT via `--append-system-prompt <text>`.
+        # (The flag takes a prompt string, not a path — passing a path would
+        # deliver the literal filename to the model and the rubric/contract
+        # would never arrive.) The instructions are a few KB, well under the
+        # per-argv byte limit; only the diff-carrying user prompt is large,
+        # and that goes via stdin below.
+        enriched_instructions: str = write_findings_prompt_directive(
+            review_instructions, findings_path
         )
 
         mcp_dest, mcp_backup = _swap_mcp_config(
             self.mcp_config_file, self.MCP_DEST
         )
         try:
-            user_prompt: str = render_user_prompt(pr_context)
+            # User prompt (PR metadata + full diff) is piped via stdin, not
+            # argv: the diff can exceed the OS single-argument limit (~128 KB
+            # E2BIG on Linux). `claude -p` reads the prompt from stdin when no
+            # positional prompt is given.
+            user_prompt: str = render_user_prompt(
+                pr_context, for_agent_runner=True
+            )
             argv: list[str] = [
                 self.CLI_BIN,
                 "-p",
-                user_prompt,
                 "--append-system-prompt",
-                str(instructions_file),
+                enriched_instructions,
                 "--output-format",
                 "stream-json",
                 "--verbose",
+                # Headless CI: the runner is already an isolated, ephemeral
+                # sandbox, so bypass the interactive permission gate that
+                # would otherwise block the Write tool (used to emit
+                # findings.json) in non-interactive mode. Mirrors Cursor's
+                # `--force --trust`. Consumers can override via
+                # `agent-extra-args`.
+                "--permission-mode",
+                "bypassPermissions",
             ]
             if self.model and self.model != "auto":
                 argv += ["--model", self.model]
@@ -1125,10 +1141,10 @@ class ClaudeCodeProvider(AgentRunnerProvider):
                 findings_path=findings_path,
                 env=env,
                 cli_name=self.CLI_NAME,
+                stdin_input=user_prompt,
             )
         finally:
             _restore_mcp_config(mcp_dest, mcp_backup)
-            instructions_file.unlink(missing_ok=True)
 
 
 class CursorProvider(AgentRunnerProvider):
@@ -1199,7 +1215,7 @@ class CursorProvider(AgentRunnerProvider):
         user_prompt: str = (
             enriched_instructions
             + "\n\n---\n\n"
-            + render_user_prompt(pr_context)
+            + render_user_prompt(pr_context, for_agent_runner=True)
         )
 
         mcp_dest, mcp_backup = _swap_mcp_config(
@@ -1296,26 +1312,36 @@ class CodexProvider(AgentRunnerProvider):
         user_prompt: str = (
             enriched_instructions
             + "\n\n---\n\n"
-            + render_user_prompt(pr_context)
+            + render_user_prompt(pr_context, for_agent_runner=True)
         )
 
         mcp_dest, mcp_backup = _swap_mcp_config(
             self.mcp_config_file, self.MCP_DEST
         )
         try:
-            # Codex CLI headless is `codex exec` (fully non-interactive since
-            # ~v0.2). Older versions used `--print`; the `exec` subcommand
-            # is the stable surface as of Codex CLI 0.5+.
+            # Codex CLI headless is `codex exec`. Two CI-critical flags:
+            #   --dangerously-bypass-approvals-and-sandbox: `codex exec`
+            #     defaults to a READ-ONLY sandbox, so without this the agent
+            #     physically cannot write findings.json and every review
+            #     fails. This flag is documented as "intended solely for
+            #     running in environments that are externally sandboxed" —
+            #     exactly a GitHub-hosted runner. Mirrors Cursor's
+            #     `--force --trust`.
+            #   `-` positional: read the (diff-carrying, potentially >128 KB)
+            #     prompt from stdin instead of argv, avoiding the OS E2BIG
+            #     single-argument limit.
             argv: list[str] = [
                 self.CLI_BIN,
                 "exec",
                 "--skip-git-repo-check",
-                user_prompt,
+                "--dangerously-bypass-approvals-and-sandbox",
             ]
             if self.model:
                 argv += ["--model", self.model]
             if self.extra_args:
                 argv += shlex.split(self.extra_args)
+            # The stdin sentinel must be the final positional argument.
+            argv.append("-")
 
             env: dict[str, str] = _build_cli_env(
                 extra_vars={"OPENAI_API_KEY": self.api_key}
@@ -1326,6 +1352,7 @@ class CodexProvider(AgentRunnerProvider):
                 findings_path=findings_path,
                 env=env,
                 cli_name=self.CLI_NAME,
+                stdin_input=user_prompt,
             )
         finally:
             _restore_mcp_config(mcp_dest, mcp_backup)
@@ -1502,13 +1529,45 @@ def fetch_pr_context(
     )
 
 
-def render_user_prompt(ctx: PRContext) -> str:
-    """Produce the first user message — PR metadata + diff."""
+def render_user_prompt(ctx: PRContext, *, for_agent_runner: bool = False) -> str:
+    """Produce the first user message — PR metadata + diff.
+
+    The closing paragraph differs by provider family:
+      - Chat-completions (`for_agent_runner=False`): references the built-in
+        `read_file`/`grep`/`glob`/`post_inline_comment`/`submit_review` tools
+        that this action owns.
+      - Agent-runner (`for_agent_runner=True`): those tools do NOT exist for a
+        vendor CLI, which uses its own file/search tools and returns findings
+        via the `findings.json` output contract (see
+        `write_findings_prompt_directive`). Emitting the chat-completions tool
+        names here would give the CLI contradictory, unfollowable instructions.
+    """
     files_block: str = "\n".join(
         f"- {f['path']} ({f['status']}) +{f['additions']}/-{f['deletions']}"
         for f in ctx.changed_files
     )
     body_block: str = ctx.body.strip() or "(no body)"
+    if for_agent_runner:
+        closing: str = (
+            "Review this PR using the rubric in the instructions above. Use "
+            "your own file-reading and search tools to verify findings "
+            "against the broader codebase before reporting them. Only comment "
+            "on lines that appear in the diff, and set each finding's "
+            "`severity` honestly — it drives the gating behaviour configured "
+            "by the consumer. When you're done, write your review to the "
+            "findings file exactly as described in the output contract."
+        )
+    else:
+        closing = (
+            "Review this PR using the system prompt's rubric. Use `read_file`, "
+            "`grep`, and `glob` to verify findings against the broader "
+            "codebase before reporting them. Queue inline comments with "
+            "`post_inline_comment` (only on lines that appear in the diff) and "
+            "set the `severity` argument honestly — it drives the gating "
+            "behaviour configured by the consumer. When you're done, call "
+            "`submit_review` exactly once with the summary markdown — that "
+            "signals the end of the session and posts the review."
+        )
     return (
         f"# PR Context\n\n"
         f"**Title:** {ctx.title}\n"
@@ -1520,14 +1579,7 @@ def render_user_prompt(ctx: PRContext) -> str:
         f"## Changed Files\n\n{files_block or '(none)'}\n\n"
         f"## Full Diff\n\n```diff\n{ctx.diff}\n```\n\n"
         "---\n\n"
-        "Review this PR using the system prompt's rubric. Use `read_file`, "
-        "`grep`, and `glob` to verify findings against the broader codebase "
-        "before reporting them. Queue inline comments with "
-        "`post_inline_comment` (only on lines that appear in the diff) and "
-        "set the `severity` argument honestly — it drives the gating "
-        "behaviour configured by the consumer. When you're done, call "
-        "`submit_review` exactly once with the summary markdown — that "
-        "signals the end of the session and posts the review."
+        + closing
     )
 
 

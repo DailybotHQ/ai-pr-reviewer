@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`provider: claude-code` and `provider: codex` now actually produce reviews.** Both were broken out of the box and failed on essentially every PR:
+  - **Claude Code** received its review rubric + `findings.json` output contract as a literal *file path* (`--append-system-prompt <path>`) instead of text, so the instructions never reached the model — it was never told to write findings and the run failed with `FileNotFoundError`. Now the instructions are passed as text via `--append-system-prompt`.
+  - **Claude Code** ran in the default headless permission mode, which denies the `Write` tool in non-interactive CI, so it could not emit `findings.json` even when instructed. Now invoked with `--permission-mode bypassPermissions` (the runner is already an isolated ephemeral sandbox; mirrors Cursor's `--force --trust`).
+  - **Codex** ran `codex exec` in its default read-only sandbox and physically could not write `findings.json`. Now invoked with `--dangerously-bypass-approvals-and-sandbox` (documented for externally-sandboxed CI environments).
+- **Large PRs no longer crash `claude-code` / `codex` with `E2BIG`.** Both embedded the full diff (up to 200 KB) in a single argv argument, exceeding the Linux ~128 KB per-argument limit. The prompt is now piped via stdin (`claude -p` reads stdin; `codex exec -`), matching the fix Cursor already had.
+- **Agent-runner prompt hygiene.** The user prompt handed to the CLI providers referenced the chat-completions-only tools `post_inline_comment` / `submit_review`, which don't exist for a vendor CLI. Agent-runner providers now get a tailored prompt that points at the `findings.json` output contract instead of contradictory tool names.
+
+### Security
+- **`docs/SECURITY.md`** now documents the real exfiltration surface of the agent-runner providers (vendor API key in the CLI subprocess env + `GITHUB_TOKEN` persisted by `actions/checkout` in `.git/config`, both reachable by an injected CLI) and corrects the prior blast-radius claim, which only held for `provider: anthropic`. Recommends running agent-runner providers on trusted/non-fork PRs only and setting `persist-credentials: false`.
+
 ## [1.2.0] — 2026-07-11
 
 **Headline:** the "configurable review workflow" release — five new inputs that let consumers control when the review fires, how the prompt is composed, whether the PR description is auto-completed, whether complexity labels are applied, and a fourth strictness tier for zero-tolerance stacks. Every knob is additive and opt-in; consumers on `@v1` see zero behavioural drift.

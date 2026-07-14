@@ -171,6 +171,23 @@ CLI providers wrap the review instructions with `write_findings_prompt_directive
 4. Add a conditional install step in `action.yml` (see the modular-install pattern in Task 07 of the DWP plan).
 5. Add a matrix entry in `.github/workflows/self-review.yml` for dogfooding.
 
+### Headless-CI invocation requirements (per CLI)
+
+Each vendor CLI needs three things to work headlessly: the review instructions delivered as **text** (not a path), the ability to **write** `findings.json` without an interactive approval prompt, and the (large) user prompt passed via **stdin** to avoid the OS `E2BIG` single-argument limit.
+
+| CLI | Instructions | Write-permission flag | Prompt input |
+|-----|--------------|-----------------------|--------------|
+| Claude Code | `--append-system-prompt <text>` | `--permission-mode bypassPermissions` | stdin (`claude -p`) |
+| Cursor | inlined into the prompt | `--force --trust` | stdin (`cursor-agent -p`) |
+| Codex | inlined into the prompt | `--dangerously-bypass-approvals-and-sandbox` | stdin (`codex exec -`) |
+
+The write-permission flags are load-bearing: the runner is already an isolated ephemeral sandbox, but the CLIs default to gating file writes (Claude Code's permission prompt) or a read-only sandbox (Codex `exec`), either of which silently prevents `findings.json` from being written. See [`docs/SECURITY.md`](SECURITY.md) § "Agent-runner providers: residual exfiltration surface" for the trust-boundary implications of these flags.
+
+### Known limitations of the agent-runner path
+
+- **`agent-max-turns` is not yet wired for the CLI providers.** The input exists in `action.yml` but the CLI invocations do not currently pass a turn cap — the only bound on a run is the `CLI_INVOCATION_TIMEOUT` (900 s). Cap cost via PR scope / the timeout for now.
+- **`mcp-config-file` passthrough is verified for Cursor only.** For `claude-code` (needs `--mcp-config <file>`) and `codex` (configures MCP via `~/.codex/config.toml`, not a JSON file), the copied config may be ignored. Prefer `provider: cursor` if you rely on MCP passthrough, or supply the vendor-native flag via `agent-extra-args`.
+
 ---
 
 ## Cursor CLI — billing and model selection
