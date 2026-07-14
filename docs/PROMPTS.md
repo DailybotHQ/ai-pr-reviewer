@@ -272,6 +272,18 @@ The sub-skill asks a single clarifying question ("extension or full replacement?
 
 **Zero-install alternative:** if you don't want to vendor the skill (e.g. using a web chatbot without file-system access), the same discovery-and-generation flow is still available as a copy-paste meta-prompt at [`examples/prompts/generate-custom-prompt-meta.md`](../examples/prompts/generate-custom-prompt-meta.md).
 
+### Bootstrap the GitHub Action with the `setup` sub-skill
+
+The same skill package includes a **`setup` sub-skill** that installs the CI action from scratch — for repos that don't have a `pr-review.yml` workflow yet. Natural-language triggers:
+
+- *"Set up AI Diff Reviewer for this repo"*
+- *"Install the AI Diff Reviewer GitHub Action"*
+- *"Configure the reviewer action"*
+
+The wizard asks six questions (provider, strictness, trigger mode, external-contributor policy, PR-description mode, complexity labels), uses light Discovery to pre-fill defaults from the repo's stack + visibility + default branch, writes `.github/workflows/pr-review.yml` with only the inputs that differ from defaults, and prints the exact URL to add the required GitHub Secret. At the end it offers to also invoke `generate-extension`, closing the loop from **zero setup → installed → tailored** in a single conversation.
+
+The sub-skill also doubles as the **reference manual** for every `action.yml` input — its [`reference.md`](../skills/ai-diff-reviewer/setup/reference.md) sibling documents each input with description, default, choices, and per-scenario recommendations. Any coding agent with the skill installed can answer *"what does `pr-description-mode: autocomplete` do?"* or *"how do I pin the Claude Code CLI version?"* without opening the action source. Full flow: [`skills/ai-diff-reviewer/setup/SKILL.md`](../skills/ai-diff-reviewer/setup/SKILL.md).
+
 ---
 
 ## Sharing prompts

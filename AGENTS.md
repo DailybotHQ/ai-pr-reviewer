@@ -165,6 +165,7 @@ Whenever you change runtime behaviour:
 - `CHANGELOG.md` → entry under `[Unreleased]`.
 - `docs/STRICTNESS.md` / `PROMPTS.md` / `PROVIDERS.md` → update the section that covers the area you touched.
 - `examples/` → add an example if you added an input that has a non-trivial usage pattern.
+- `skills/ai-diff-reviewer/setup/reference.md` → update if `action.yml` inputs, defaults, or descriptions changed (this file is the local companion skill's reference manual; drift breaks the "any agent can answer setup questions" promise).
 - `AGENTS.md` (this file) → update the "Critical Rules" or "DO/DON'T" sections if you change a project standard.
 
 ### 8. SemVer for Releases (MANDATORY)
@@ -371,7 +372,7 @@ The four in-house skills (`release`, `prompt-test`, `add-provider`, plus the age
 - [ ] `python3 -m py_compile scripts/reviewer.py` passes.
 - [ ] `python3 -m unittest discover -s tests` passes (if the runtime changed).
 - [ ] `action.yml` parses (the CI job validates this; locally: `python3 -c 'import yaml; yaml.safe_load(open("action.yml"))'`).
-- [ ] If `action.yml` inputs/outputs changed: README's tables updated.
+- [ ] If `action.yml` inputs/outputs changed: README's tables updated AND `skills/ai-diff-reviewer/setup/reference.md` updated.
 - [ ] If runtime behaviour changed: `CHANGELOG.md` entry under `[Unreleased]`.
 - [ ] If a new input was added: there's an example in `examples/` showing realistic usage.
 - [ ] If the default prompt changed: a before/after on a real PR linked in the PR description.

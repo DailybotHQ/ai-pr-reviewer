@@ -428,6 +428,20 @@ The skill also ships a **`generate-extension` sub-skill** that bootstraps a repo
 
 The sub-skill inspects your stack, architecture, security surface, and existing conventions (≥ 12 tool calls minimum — real Discovery, not a guess), then writes the file directly. Two output modes: **extension** (layered on top of the default — recommended) or **full replacement** (advanced, for teams that want total control). Full details in [`skills/ai-diff-reviewer/generate-extension/SKILL.md`](skills/ai-diff-reviewer/generate-extension/SKILL.md).
 
+### Bootstrap the GitHub Action itself
+
+The skill also ships a **`setup` sub-skill** that walks you through installing the CI action on a repo that doesn't have it yet — six questions (provider, strictness, trigger mode, external-contributor policy, PR-description mode, complexity labels), sensible per-stack defaults, and a tailored `.github/workflows/pr-review.yml` written for you. Say:
+
+- *"Set up AI Diff Reviewer for this repo"*
+- *"Configure the reviewer action"*
+- *"Install the AI Diff Reviewer GitHub Action"*
+
+At the end, it also offers to bootstrap the extension file (Step 5 of the wizard hands off to `generate-extension`), so the same conversation takes you from **zero setup → installed → tailored** in one go.
+
+The sub-skill also serves as the **reference manual** for every `action.yml` input via [`skills/ai-diff-reviewer/setup/reference.md`](skills/ai-diff-reviewer/setup/reference.md). Ask any coding agent with the skill installed *"what does `strictness` do?"* or *"how do I pin the Cursor CLI version?"* and it can answer without opening the action source.
+
+Full wizard flow in [`skills/ai-diff-reviewer/setup/SKILL.md`](skills/ai-diff-reviewer/setup/SKILL.md).
+
 ### First-run bootstrap prompt
 
 You don't have to think about `generate-extension` on day one. The first time you run the review on a repo with no `.review/extension.md`, the skill offers a **yes / no / never** prompt inline:

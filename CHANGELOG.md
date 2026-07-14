@@ -57,6 +57,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   migrate.
 
 ### Added
+- **Sub-skill: [`setup`](skills/ai-diff-reviewer/setup/SKILL.md)** —
+  interactive installer for the GitHub Action itself. Walks the
+  developer through six decisions (provider, strictness, trigger mode,
+  external-contributor policy, PR-description mode, complexity
+  labels), uses light Discovery (repo visibility, existing workflows,
+  detected stack, default branch) to pre-fill sensible defaults, then
+  writes a tailored `.github/workflows/pr-review.yml` with only the
+  inputs that differ from action defaults (so the composed workflow
+  reads like a hand-written minimal file, not a config dump). Prints
+  the exact GitHub Secrets URL for the chosen provider and the git
+  commit-and-test steps at the end. Optionally hands off to
+  `generate-extension` in Step 5 so a single conversation takes the
+  developer from **zero setup → installed → tailored**. Also serves
+  as the **reference manual** for every `action.yml` input via
+  [`setup/reference.md`](skills/ai-diff-reviewer/setup/reference.md) —
+  any coding agent with the skill installed can answer *"what does
+  `strictness` do?"* or *"how do I pin the Cursor CLI version?"*
+  without opening the action source. Wired into the parent skill's
+  router table (three capabilities now) and the natural-language
+  triggers ("set up ai diff reviewer for this repo", "install the ai
+  diff reviewer github action", "how do I configure this?"). Documented
+  in the [`README.md` § "Bootstrap the GitHub Action itself"](README.md)
+  section and [`docs/PROMPTS.md`](docs/PROMPTS.md).
 - **First-run bootstrap prompt in the `ai-diff-reviewer` skill** — when
   the review flow activates on a repo with no `.review/extension.md`
   (and no `.review/.skip-bootstrap` marker), the skill asks ONE
