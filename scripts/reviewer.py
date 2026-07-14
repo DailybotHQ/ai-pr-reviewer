@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# TEMP (test/label-from-start): trivial critical-surface touch to trigger the
+# CLI self-review leg on a throwaway PR. Remove before merge / close the PR.
 """AI PR reviewer — composite-action entry point.
 
 Runs the full review lifecycle from a single Python process:
