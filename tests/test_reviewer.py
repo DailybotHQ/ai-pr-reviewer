@@ -207,6 +207,173 @@ class CountLabelEventsTests(unittest.TestCase):
             self._restore()
 
 
+class GhGetAuthenticatedLoginFallbackTests(unittest.TestCase):
+    """Regression for the v1.2 silent-403 bug that broke `collapse-previous`
+    for every consumer using the recommended `${{ secrets.GITHUB_TOKEN }}`
+    pattern. The naive `GET /user` call fails 403 on installation tokens;
+    `gh_get_authenticated_login` now has a 4-tier fallback chain.
+
+    See docs/SECURITY.md and CHANGELOG's [1.2.0] "Fixed" section.
+    """
+
+    def _install_fake_gh_request(
+        self, handler: Any
+    ) -> None:
+        self._orig_gh_request = reviewer.gh_request
+        reviewer.gh_request = handler  # type: ignore[assignment]
+
+    def _restore(self) -> None:
+        reviewer.gh_request = self._orig_gh_request  # type: ignore[assignment]
+
+    def test_tier1_user_endpoint_returns_login(self) -> None:
+        """PAT / OAuth token case — `/user` succeeds → returns its login."""
+        calls: list[str] = []
+
+        def fake(method: str, path: str, **_: Any) -> Any:
+            calls.append(path)
+            if path == "/user":
+                return {"login": "alice"}
+            raise AssertionError(f"unexpected call: {path}")
+
+        self._install_fake_gh_request(fake)
+        try:
+            login = reviewer.gh_get_authenticated_login("tok")
+            self.assertEqual(login, "alice")
+            self.assertEqual(calls, ["/user"], "no fallback should be tried")
+        finally:
+            self._restore()
+
+    def test_tier2_app_endpoint_wraps_slug_with_bot_suffix(self) -> None:
+        """GitHub App installation token — `/user` fails, `/app` returns
+        the app slug; `[bot]` suffix matches how GitHub renders the login
+        in comment.user.login payloads."""
+
+        def fake(method: str, path: str, **_: Any) -> Any:
+            if path == "/user":
+                raise RuntimeError("HTTP Error 403: Forbidden")
+            if path == "/app":
+                return {"slug": "my-cool-app"}
+            raise AssertionError(f"unexpected call: {path}")
+
+        self._install_fake_gh_request(fake)
+        try:
+            login = reviewer.gh_get_authenticated_login("tok")
+            self.assertEqual(login, "my-cool-app[bot]")
+        finally:
+            self._restore()
+
+    def test_tier3_marker_scan_finds_prior_bot_author(self) -> None:
+        """Workflow `GITHUB_TOKEN` case: both `/user` and `/app` refuse.
+        The marker-scan tier reads recent PR comments, finds one with the
+        canonical marker, and returns THAT comment's author."""
+        marker = reviewer.REVIEW_MARKER
+
+        def fake(method: str, path: str, **_: Any) -> Any:
+            if path in ("/user", "/app"):
+                raise RuntimeError("HTTP Error 403: Forbidden")
+            if path.startswith("/repos/o/r/issues/9/comments"):
+                return [
+                    {
+                        "body": "irrelevant human comment",
+                        "user": {"login": "human-user"},
+                    },
+                    {
+                        "body": f"prior review\n{marker}\nsome state",
+                        "user": {"login": "github-actions[bot]"},
+                    },
+                    {"body": "later human comment", "user": {"login": "alice"}},
+                ]
+            raise AssertionError(f"unexpected call: {path}")
+
+        self._install_fake_gh_request(fake)
+        try:
+            login = reviewer.gh_get_authenticated_login(
+                "tok", repo="o/r", pr_number=9
+            )
+            self.assertEqual(login, "github-actions[bot]")
+        finally:
+            self._restore()
+
+    def test_tier3_iterates_in_reverse_to_prefer_most_recent(self) -> None:
+        """When multiple prior markers exist (rare — the collapse mutation
+        cleans them up), the LAST one wins because it's the newest run."""
+        marker = reviewer.REVIEW_MARKER
+
+        def fake(method: str, path: str, **_: Any) -> Any:
+            if path in ("/user", "/app"):
+                raise RuntimeError("HTTP Error 403")
+            return [
+                {"body": f"old\n{marker}", "user": {"login": "old-bot[bot]"}},
+                {"body": f"new\n{marker}", "user": {"login": "new-bot[bot]"}},
+            ]
+
+        self._install_fake_gh_request(fake)
+        try:
+            login = reviewer.gh_get_authenticated_login(
+                "tok", repo="o/r", pr_number=1
+            )
+            self.assertEqual(login, "new-bot[bot]")
+        finally:
+            self._restore()
+
+    def test_tier3_skipped_when_repo_or_pr_missing(self) -> None:
+        """Callers not in the main() context (e.g. one-off helpers) don't
+        pass repo/pr_number; tier 3 is skipped and tier 4's default fires."""
+
+        def fake(method: str, path: str, **_: Any) -> Any:
+            if path in ("/user", "/app"):
+                raise RuntimeError("HTTP Error 403")
+            raise AssertionError(f"tier3 should be skipped, got: {path}")
+
+        self._install_fake_gh_request(fake)
+        try:
+            login = reviewer.gh_get_authenticated_login("tok")
+            self.assertEqual(login, reviewer.DEFAULT_WORKFLOW_BOT_LOGIN)
+        finally:
+            self._restore()
+
+    def test_tier4_falls_back_to_default_workflow_bot(self) -> None:
+        """No marker → default to `github-actions[bot]`, the login used by
+        the built-in `GITHUB_TOKEN`. Downstream steps still work: even if
+        this guess is wrong, `gh_collapse_previous_reviews` just filters
+        no nodes and logs it, staying non-fatal."""
+
+        def fake(method: str, path: str, **_: Any) -> Any:
+            if path in ("/user", "/app"):
+                raise RuntimeError("HTTP Error 403")
+            if path.startswith("/repos/"):
+                return []
+            raise AssertionError(f"unexpected call: {path}")
+
+        self._install_fake_gh_request(fake)
+        try:
+            login = reviewer.gh_get_authenticated_login(
+                "tok", repo="o/r", pr_number=1
+            )
+            self.assertEqual(login, "github-actions[bot]")
+            self.assertEqual(login, reviewer.DEFAULT_WORKFLOW_BOT_LOGIN)
+        finally:
+            self._restore()
+
+    def test_empty_login_from_tier1_falls_through(self) -> None:
+        """Defensive: some tokens return `{"login": ""}` for `/user`. Don't
+        treat that as a valid login; try the next tier instead."""
+
+        def fake(method: str, path: str, **_: Any) -> Any:
+            if path == "/user":
+                return {"login": ""}
+            if path == "/app":
+                return {"slug": "fallback-app"}
+            raise AssertionError(f"unexpected call: {path}")
+
+        self._install_fake_gh_request(fake)
+        try:
+            login = reviewer.gh_get_authenticated_login("tok")
+            self.assertEqual(login, "fallback-app[bot]")
+        finally:
+            self._restore()
+
+
 class GhPatchPrBodySignatureTests(unittest.TestCase):
     """Regression: `gh_patch_pr_body` uses positional method+path (matches
     `gh_request`'s actual signature). If someone reverts to keyword args,

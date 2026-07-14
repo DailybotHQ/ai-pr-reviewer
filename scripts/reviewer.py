@@ -404,10 +404,83 @@ def gh_graphql(query: str, variables: dict[str, Any], *, token: str) -> Any:
     return payload.get("data", {})
 
 
-def gh_get_authenticated_login(token: str) -> str:
-    """Return the login of the user the token is authenticated as."""
-    me: dict[str, Any] = gh_request("GET", "/user", token=token)
-    return str(me.get("login", ""))
+DEFAULT_WORKFLOW_BOT_LOGIN: str = "github-actions[bot]"
+
+
+def gh_get_authenticated_login(
+    token: str, *, repo: str = "", pr_number: int = 0
+) -> str:
+    """Return the login the token authenticates as, with a 4-tier fallback.
+
+    The naive `GET /user` call fails with `HTTP 403 Forbidden` when the
+    caller is the built-in workflow `GITHUB_TOKEN` (an installation
+    token, not a user token) — the well-known limitation that silently
+    broke `collapse-previous` for every consumer using the recommended
+    `github-token: ${{ secrets.GITHUB_TOKEN }}` pattern.
+
+    The fallback chain, tried in order:
+
+    1. `GET /user` — works for PATs and user OAuth tokens.
+    2. `GET /app` — works for GitHub App installation tokens; returns
+       `<slug>[bot]` (the shape GitHub uses in comment `.user.login`).
+    3. Marker-scan the PR's issue comments for our
+       `<!-- ai-pr-reviewer-marker -->` tracking comment; take that
+       comment's `.user.login`. Works for any bot that previously
+       posted here. Requires `repo` + `pr_number`.
+    4. Hardcoded `"github-actions[bot]"` — the login of the built-in
+       workflow `GITHUB_TOKEN`, which is the overwhelmingly common
+       case in the wild.
+
+    Failing all four tiers still returns tier 4's default, so callers
+    downstream (`gh_collapse_previous_reviews`) get a login they can
+    filter on. Their own error handling covers the case where the
+    token is genuinely invalid.
+    """
+    try:
+        me: dict[str, Any] = gh_request("GET", "/user", token=token)
+        login: str = str(me.get("login", "") or "")
+        if login:
+            return login
+    except Exception as e:  # noqa: BLE001 — best-effort; try next tier
+        log(f"gh_get_authenticated_login: /user tier failed: {e}")
+
+    try:
+        app: dict[str, Any] = gh_request("GET", "/app", token=token)
+        slug: str = str(app.get("slug", "") or "")
+        if slug:
+            return f"{slug}[bot]"
+    except Exception as e:  # noqa: BLE001 — best-effort; try next tier
+        log(f"gh_get_authenticated_login: /app tier failed: {e}")
+
+    if repo and pr_number:
+        try:
+            owner, name = repo.split("/", 1)
+            comments: list[dict[str, Any]] = gh_request(
+                "GET",
+                (
+                    f"/repos/{owner}/{name}/issues/{pr_number}"
+                    "/comments?per_page=100"
+                ),
+                token=token,
+            )
+            if isinstance(comments, list):
+                for comment in reversed(comments):
+                    if not isinstance(comment, dict):
+                        continue
+                    body: str = str(comment.get("body") or "")
+                    if REVIEW_MARKER not in body:
+                        continue
+                    author: str = str(
+                        (comment.get("user") or {}).get("login") or ""
+                    )
+                    if author:
+                        return author
+        except Exception as e:  # noqa: BLE001 — best-effort; fall through
+            log(
+                f"gh_get_authenticated_login: marker-scan tier failed: {e}"
+            )
+
+    return DEFAULT_WORKFLOW_BOT_LOGIN
 
 
 def gh_post_issue_comment(
@@ -2929,7 +3002,14 @@ def main() -> int:
     # ------------------------------------------------------------------
     if collapse_previous:
         try:
-            bot_login: str = gh_get_authenticated_login(gh_token)
+            # v1.2.0+: pass repo + pr_number so the fallback chain in
+            # `gh_get_authenticated_login` can marker-scan for the prior
+            # bot's login when the built-in `GITHUB_TOKEN` refuses
+            # `/user` (the fix for the silent 403 that broke this
+            # feature for every workflow-token consumer).
+            bot_login: str = gh_get_authenticated_login(
+                gh_token, repo=repo, pr_number=pr_number
+            )
             log(f"Authenticated as: {bot_login}")
             gh_collapse_previous_reviews(
                 token=gh_token,
