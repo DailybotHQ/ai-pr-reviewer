@@ -157,12 +157,21 @@ git show vX.Y.Z:skills/ai-diff-reviewer/SKILL.md | grep '^version:'
 # Expected: version: "X.Y.Z"
 
 # Move v1 to vX.Y.Z. Force is correct — v1 is a moving pointer by design.
-git tag -f v1 vX.Y.Z
+#
+# The `vX.Y.Z^{}` peel is load-bearing: without it, `git tag -f v1 vX.Y.Z`
+# creates v1 as a nested annotated tag pointing at the vX.Y.Z tag object
+# (which then points at the commit). Both are valid Git refs, but nested
+# tags make `git rev-parse v1^{commit}` require an extra hop, and
+# tag-object SHAs on GitHub's ref API don't compare equal to commit SHAs.
+# Peeling to `^{}` makes v1 a lightweight tag directly at the commit,
+# matching what a consumer running `git checkout v1` expects.
+git tag -f v1 "vX.Y.Z^{}"
 git push origin v1 --force
 
-# Verify remote agrees — both should print the same commit SHA.
-gh api repos/DailybotHQ/ai-diff-reviewer/git/refs/tags/v1 -q .object.sha
-git rev-parse vX.Y.Z^{commit}
+# Verify remote agrees — both must print the SAME commit SHA.
+git fetch origin --tags --force
+git rev-parse v1^{commit}       # commit v1 now points at (via peel)
+git rev-parse vX.Y.Z^{commit}   # commit vX.Y.Z points at
 ```
 
 #### 5. Create the GitHub Release
@@ -206,8 +215,11 @@ gh pr create --title "chore(release): dogfood vendored ai-diff-reviewer to vX.Y.
   --body "Manual Step 3.5 recovery for vX.Y.Z."
 ```
 
-Merge normally; `[skip release]` in the head commit body keeps
-auto-release from firing.
+The PR title starts with `chore(release):` — auto-release's job-level
+`if:` guard skips any head commit whose message begins with that
+prefix, which is what actually protects against a spurious `vX.Y.Z+1`
+under squash-merge (see the Step 3 warning above). The `[skip release]`
+marker on the pre-squash commit is belt-and-suspenders only.
 
 ---
 

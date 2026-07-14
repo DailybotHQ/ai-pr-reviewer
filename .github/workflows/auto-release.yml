@@ -184,7 +184,18 @@ jobs:
           # Move the major alias tag — `--force` is correct: it's a moving
           # pointer by design so `@v1` tracks the latest v1.x.y. Tag-only
           # push; not subject to branch protection.
-          git tag -f "$MAJOR_TAG" "$NEW_VERSION"
+          #
+          # The `${NEW_VERSION}^{}` peel is load-bearing: without it,
+          # `git tag -f $MAJOR_TAG $NEW_VERSION` creates a nested annotated
+          # tag pointing at the $NEW_VERSION tag object (which then points
+          # at the commit). Nested tags work but confuse tooling — a
+          # consumer running `git checkout v1` gets a detached HEAD at the
+          # tag object rather than the commit, and comparing tag-object
+          # SHAs from `gh api …/git/refs/tags/v1` to commit SHAs never
+          # matches. Peeling to `^{}` makes MAJOR_TAG a lightweight tag
+          # directly at the commit. See docs/RELEASE_RECOVERY.md § "Move
+          # the major alias tag" for the reasoning.
+          git tag -f "$MAJOR_TAG" "${NEW_VERSION}^{}"
           git push origin "$MAJOR_TAG" --force
 
       - name: Step 3.5 - 🍽️ Dogfood — refresh the vendored ai-diff-reviewer skill
