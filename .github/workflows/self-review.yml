@@ -21,13 +21,16 @@ name: Self-review
 #      **Skipped** (grey). A green leg means it actually reviewed.
 #   4. MERGE GATE (OPT-IN) — a final `gate` job with a STABLE name
 #      (`Self-review gate`) is the one check you mark as *Required* in branch
-#      protection under an opt-in review flow. It ONLY runs when `ready` is on
-#      the PR, and when it runs it FAILS (red → blocks merge) unless AT LEAST
-#      ONE provider leg ran and passed — a scope error, no eligible provider,
-#      or every leg failing all block; a single failing provider does NOT block
-#      if another passed. When `ready` isn't applied the whole gate is
-#      **Skipped** (grey) so a docs/other PR that doesn't want a review carries
-#      no red-X noise in the checks list.
+#      protection under an opt-in review flow. It ONLY runs when THIS event
+#      was a review-request event (i.e. `scope` decided a review should run,
+#      detected via `empty_reason != 'no-ready-label'`), and when it runs it
+#      FAILS (red → blocks merge) unless AT LEAST ONE provider leg ran and
+#      passed — a scope error, no eligible provider, or every leg failing all
+#      block; a single failing provider does NOT block if another passed.
+#      When the event isn't a review-request (no `ready` label, or an
+#      unrelated `labeled` event on a PR that happens to carry `ready`) the
+#      whole gate is **Skipped** (grey) so a docs/other PR that doesn't want
+#      a review carries no red-X noise in the checks list.
 #
 #      Trade-off: GitHub treats a *skipped* required check as *passing* for
 #      branch protection, so under this opt-in design a PR without `ready`
@@ -276,11 +279,22 @@ jobs:
   gate:
     name: 'Self-review gate'
     needs: [scope, self-review]
-    # `always()` so the gate reports its own conclusion regardless of whether
-    # the upstream `self-review` job succeeded, failed, or was skipped —
-    # combined with the label check, this yields "skipped" only when `ready`
-    # isn't applied (grey), and a real pass/fail whenever `ready` is on.
-    if: always() && contains(github.event.pull_request.labels.*.name, 'ready')
+    # Run the gate ONLY when this specific event was a review-request event,
+    # authoritatively decided by the scope job's should_run logic and exposed
+    # via `empty_reason`. `no-ready-label` means "this run wasn't gated on a
+    # ready-labeling — either the label isn't on the PR at all, or an
+    # unrelated label (e.g. `bug`) fired the workflow while `ready` happens to
+    # be present". In either case we skip the gate (grey) rather than fail on
+    # an empty matrix that was expected. When the run IS a review-request the
+    # gate runs and enforces pass/fail. `always()` ensures the gate still
+    # reports even when the upstream `self-review` job fails or skips.
+    #
+    # Why not `contains(github.event.pull_request.labels.*.name, 'ready')`?
+    # That's a PR-state check — true whenever the label is on the PR, even
+    # when the event that fired this run was unrelated (e.g. adding `bug` to
+    # a PR that already has `ready`). Then the gate would treat the expected
+    # empty matrix as a config bug and fail red incorrectly.
+    if: always() && needs.scope.outputs.empty_reason != 'no-ready-label'
     runs-on: ubuntu-latest
     # Override the workflow-wide grant: the gate only needs to read this run's
     # job conclusions; it touches neither the repo contents nor the PR.
@@ -304,11 +318,12 @@ jobs:
             echo "::error::Self-review scope job did not succeed (result=$SCOPE_RESULT). Blocking merge."
             exit 1
           fi
-          # Empty matrix == `ready` is applied (we only run under that
-          # condition) but no provider leg was eligible. That's a real config
-          # bug worth surfacing — pediste una review y nada puede reviewearla.
+          # Empty matrix == this run WAS a review-request event (the gate's
+          # `if:` already filtered out `no-ready-label` runs) but no provider
+          # leg was eligible. That's a real config bug worth surfacing — a
+          # review was requested but nothing can run it.
           if [ "${MATRIX:-[]}" = "[]" ]; then
-            echo "::error::Self-review did not run — 'ready' is applied but no provider leg was eligible. Configure ANTHROPIC_API_KEY for an always-on baseline, or touch a critical surface (runtime/action/prompt/workflow) so the CLI legs (cursor/codex/claude-code) run. See the scope job's notice for the exact reason."
+            echo "::error::Self-review did not run — a review was requested (via 'ready' label) but no provider leg was eligible. Configure ANTHROPIC_API_KEY for an always-on baseline, or touch a critical surface (runtime/action/prompt/workflow) so the CLI legs (cursor/codex/claude-code) run. See the scope job's notice for the exact reason."
             exit 1
           fi
           # Count the `Self-review — <provider>` legs of THIS run that concluded
