@@ -374,6 +374,201 @@ class GhGetAuthenticatedLoginFallbackTests(unittest.TestCase):
             self._restore()
 
 
+class GhCollapsePreviousReviewsTests(unittest.TestCase):
+    """Regression for the login-shape mismatch that silently broke
+    `collapse-previous` in every self-review run on this repo — even
+    after the 4-tier fallback for `gh_get_authenticated_login` landed.
+
+    REST returns `"github-actions[bot]"` but GraphQL's `.author.login`
+    on the same Bot node returns `"github-actions"` (no suffix). The
+    naive equality check filtered every bot node out, resulting in
+    "Collapsed 0/N previous bot artefact(s)" on every run. The fix
+    accepts both shapes for the comparison.
+    """
+
+    def _install_fake_gh_graphql(self, responses: list[Any]) -> list[dict]:
+        """Return a call-log list; each `gh_graphql` invocation appends
+        `{"query": ..., "variables": ...}` and pops the next response."""
+        calls: list[dict] = []
+
+        def fake(query: str, variables: dict, *, token: str) -> Any:
+            calls.append({"query": query, "variables": variables})
+            if not responses:
+                return {}
+            return responses.pop(0)
+
+        self._orig_gh_graphql = reviewer.gh_graphql
+        reviewer.gh_graphql = fake  # type: ignore[assignment]
+        return calls
+
+    def _restore(self) -> None:
+        reviewer.gh_graphql = self._orig_gh_graphql  # type: ignore[assignment]
+
+    def test_matches_graphql_bot_login_without_suffix(self) -> None:
+        """Bot comments arriving from GraphQL as `"github-actions"`
+        (no `[bot]`) must be recognized when caller passes the REST-
+        shaped `"github-actions[bot]"`. Regression for PR #9."""
+        query_payload = {
+            "repository": {
+                "pullRequest": {
+                    "comments": {
+                        "nodes": [
+                            {
+                                "id": "IC_kw_1",
+                                "isMinimized": False,
+                                "author": {"login": "github-actions"},
+                            },
+                            {
+                                "id": "IC_kw_2",
+                                "isMinimized": False,
+                                "author": {"login": "xergioalex"},
+                            },
+                        ]
+                    },
+                    "reviews": {
+                        "nodes": [
+                            {
+                                "id": "PRR_kw_1",
+                                "isMinimized": False,
+                                "author": {"login": "github-actions"},
+                                "comments": {
+                                    "nodes": [
+                                        {"id": "PRRC_kw_1", "isMinimized": False}
+                                    ]
+                                },
+                            }
+                        ]
+                    },
+                }
+            }
+        }
+        # First call: the LIST query. Then one mutation per target
+        # (comment + review + inline) → 3 mutations. Each returns {}.
+        calls = self._install_fake_gh_graphql(
+            [query_payload, {}, {}, {}]
+        )
+        try:
+            n = reviewer.gh_collapse_previous_reviews(
+                token="tok",
+                repo="o/r",
+                pr_number=9,
+                bot_login="github-actions[bot]",  # REST-shape login
+            )
+            self.assertEqual(
+                n,
+                3,
+                "must collapse the 1 issue comment + 1 review + 1 inline "
+                "comment, all authored by `github-actions` (Bot).",
+            )
+            mutation_ids = [
+                c["variables"].get("id")
+                for c in calls[1:]  # skip the LIST query
+            ]
+            self.assertEqual(sorted(mutation_ids), sorted(["IC_kw_1", "PRR_kw_1", "PRRC_kw_1"]))
+        finally:
+            self._restore()
+
+    def test_matches_bot_login_with_suffix_too(self) -> None:
+        """Sanity: when caller passes the raw `github-actions[bot]`
+        AND GraphQL also returns it that way (unlikely but not
+        impossible for future API changes), still matches."""
+        query_payload = {
+            "repository": {
+                "pullRequest": {
+                    "comments": {
+                        "nodes": [
+                            {
+                                "id": "IC_kw_1",
+                                "isMinimized": False,
+                                "author": {"login": "github-actions[bot]"},
+                            }
+                        ]
+                    },
+                    "reviews": {"nodes": []},
+                }
+            }
+        }
+        self._install_fake_gh_graphql([query_payload, {}])
+        try:
+            n = reviewer.gh_collapse_previous_reviews(
+                token="tok",
+                repo="o/r",
+                pr_number=9,
+                bot_login="github-actions[bot]",
+            )
+            self.assertEqual(n, 1)
+        finally:
+            self._restore()
+
+    def test_skips_already_minimized_nodes(self) -> None:
+        """`isMinimized: True` nodes are excluded — no wasted mutations."""
+        query_payload = {
+            "repository": {
+                "pullRequest": {
+                    "comments": {
+                        "nodes": [
+                            {
+                                "id": "IC_kw_1",
+                                "isMinimized": True,
+                                "author": {"login": "github-actions"},
+                            }
+                        ]
+                    },
+                    "reviews": {"nodes": []},
+                }
+            }
+        }
+        calls = self._install_fake_gh_graphql([query_payload])
+        try:
+            n = reviewer.gh_collapse_previous_reviews(
+                token="tok",
+                repo="o/r",
+                pr_number=9,
+                bot_login="github-actions[bot]",
+            )
+            self.assertEqual(n, 0)
+            self.assertEqual(len(calls), 1, "only the LIST query, no mutations")
+        finally:
+            self._restore()
+
+    def test_ignores_other_bots(self) -> None:
+        """Only OUR bot's comments get collapsed — a dependabot or
+        renovate bot's comments must be left alone."""
+        query_payload = {
+            "repository": {
+                "pullRequest": {
+                    "comments": {
+                        "nodes": [
+                            {
+                                "id": "IC_kw_1",
+                                "isMinimized": False,
+                                "author": {"login": "dependabot"},
+                            },
+                            {
+                                "id": "IC_kw_2",
+                                "isMinimized": False,
+                                "author": {"login": "github-actions"},
+                            },
+                        ]
+                    },
+                    "reviews": {"nodes": []},
+                }
+            }
+        }
+        calls = self._install_fake_gh_graphql([query_payload, {}])
+        try:
+            n = reviewer.gh_collapse_previous_reviews(
+                token="tok",
+                repo="o/r",
+                pr_number=9,
+                bot_login="github-actions[bot]",
+            )
+            self.assertEqual(n, 1, "only our bot's comment collapsed")
+            self.assertEqual(calls[1]["variables"]["id"], "IC_kw_2")
+        finally:
+            self._restore()
+
+
 class GhPatchPrBodySignatureTests(unittest.TestCase):
     """Regression: `gh_patch_pr_body` uses positional method+path (matches
     `gh_request`'s actual signature). If someone reverts to keyword args,

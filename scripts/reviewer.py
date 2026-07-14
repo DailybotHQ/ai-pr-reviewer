@@ -662,15 +662,29 @@ def gh_collapse_previous_reviews(
         pr.get("reviews", {}) or {}
     ).get("nodes", []) or []
 
+    # GraphQL and REST disagree on the shape of a Bot's login. REST
+    # `.user.login` returns `"github-actions[bot]"` (the shape the
+    # /user endpoint, comment payloads, and our marker-scan tier all
+    # use), but GraphQL `.author.login` on a Bot node returns
+    # `"github-actions"` — no `[bot]` suffix. Comparing directly missed
+    # every bot node and silently reported "Collapsed 0/N". Accept
+    # both shapes so the filter matches regardless of where
+    # `bot_login` came from.
+    accepted_logins: set[str] = {bot_login}
+    if bot_login.endswith("[bot]"):
+        accepted_logins.add(bot_login[: -len("[bot]")])
+
+    def _matches(author_login: str) -> bool:
+        return author_login in accepted_logins
+
     targets: list[str] = []
     for c in issue_comments:
-        if (
-            (c.get("author") or {}).get("login") == bot_login
-            and not c.get("isMinimized", False)
-        ):
+        author_login: str = str((c.get("author") or {}).get("login") or "")
+        if _matches(author_login) and not c.get("isMinimized", False):
             targets.append(c["id"])
     for r in reviews:
-        if (r.get("author") or {}).get("login") == bot_login:
+        author_login = str((r.get("author") or {}).get("login") or "")
+        if _matches(author_login):
             if not r.get("isMinimized", False):
                 targets.append(r["id"])
             inline: list[dict[str, Any]] = (
