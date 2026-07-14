@@ -5,8 +5,20 @@
 # (LSP-backed navigation, semantic search, MCP) drive the review; the
 # reviewer.py runtime unifies the output via .aiprr/findings.json.
 #
-# Auth: your Cursor API key (Settings → API keys in cursor.com). The action
-# forwards it as CURSOR_API_KEY to the CLI subprocess.
+# Auth & billing (IMPORTANT): the Cursor CLI does NOT support BYOK. Your
+# CURSOR_API_KEY must belong to a Cursor Pro / Pro+ / Ultra subscription,
+# and every review consumes credits from that subscription. There is no
+# way to route through OpenAI/Anthropic keys.
+#
+# Recommended default: `model: auto`. On the Pro plan, `auto` is UNLIMITED
+# (subject to fair-use rate limits), which is the right choice for CI to
+# avoid draining monthly credits on premium models. See docs/PROVIDERS.md
+# for the full billing story.
+#
+# Headless-CI flags: v1.2.0+ passes `--force --trust` by default (plus
+# `--approve-mcps` when mcp-config-file is set). These are Cursor's own
+# recommendations for headless CI usage — you do NOT need to add them
+# manually via agent-extra-args.
 
 name: PR review (Cursor Agent)
 on:
@@ -35,7 +47,9 @@ jobs:
           provider: cursor
           api-key: ${{ secrets.CURSOR_API_KEY }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          # Optional: pick a Cursor Composer model (default: composer-2.5).
+          # Unlimited routing on Pro plans; cheapest correct choice for CI.
+          model: auto
+          # Optional: pin a specific Cursor Composer model instead of `auto`.
           # model: composer-2.5
           # Optional: pin the CLI version.
           # cursor-version: '2025.11.01'

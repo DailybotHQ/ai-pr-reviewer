@@ -99,6 +99,1033 @@ class OverallSeverityTests(unittest.TestCase):
         )
 
 
+class CountLabelEventsTests(unittest.TestCase):
+    """`count_label_events` paginates and filters correctly."""
+
+    def _monkeypatch_gh_request(
+        self, responses: list[list[dict[str, Any]]]
+    ) -> None:
+        """Replace `gh_request` with a fake that returns queued responses.
+
+        Each call pops the next response off the queue. When the queue
+        is exhausted, returns an empty list (simulates "no more pages").
+        """
+        self._responses = responses
+        self._call_count = 0
+
+        def fake_gh_request(method: str, path: str, **kwargs: Any) -> Any:
+            self._call_count += 1
+            if not self._responses:
+                return []
+            return self._responses.pop(0)
+
+        self._orig = reviewer.gh_request
+        reviewer.gh_request = fake_gh_request  # type: ignore[assignment]
+
+    def _restore(self) -> None:
+        reviewer.gh_request = self._orig  # type: ignore[assignment]
+
+    def test_counts_matching_labeled_events(self) -> None:
+        self._monkeypatch_gh_request(
+            [
+                [
+                    {"event": "labeled", "label": {"name": "ready"}},
+                    {"event": "labeled", "label": {"name": "other"}},
+                    {"event": "closed"},
+                    {"event": "labeled", "label": {"name": "ready"}},
+                ]
+            ]
+        )
+        try:
+            n = reviewer.count_label_events(
+                token="t", repo="o/r", pr_number=1, label="ready"
+            )
+            self.assertEqual(n, 2)
+        finally:
+            self._restore()
+
+    def test_empty_label_returns_zero_without_api_call(self) -> None:
+        self._monkeypatch_gh_request([])
+        try:
+            n = reviewer.count_label_events(
+                token="t", repo="o/r", pr_number=1, label=""
+            )
+            self.assertEqual(n, 0)
+            self.assertEqual(self._call_count, 0)
+        finally:
+            self._restore()
+
+    def test_paginates_until_less_than_full_page(self) -> None:
+        # First page: 100 items → paginate. Second page: 2 items → stop.
+        page1 = [
+            {"event": "labeled", "label": {"name": "ready"}}
+        ] * 100
+        page2 = [
+            {"event": "labeled", "label": {"name": "ready"}},
+            {"event": "closed"},
+        ]
+        self._monkeypatch_gh_request([page1, page2])
+        try:
+            n = reviewer.count_label_events(
+                token="t", repo="o/r", pr_number=1, label="ready"
+            )
+            self.assertEqual(n, 101)
+            self.assertEqual(self._call_count, 2)
+        finally:
+            self._restore()
+
+    def test_logs_warning_when_pagination_cap_hit(self) -> None:
+        """Regression for PR #9 self-review comment #5: on long-lived,
+        high-chatter PRs the 20-page cap silently undercounts. The cap
+        stays (cost control) but must announce itself so operators see
+        why `label-once` is stuck."""
+        full_page = [{"event": "labeled", "label": {"name": "ready"}}] * 100
+        # 21 identical full pages → the loop hits the cap on page 21
+        # (after processing page 20) and exits with the warning.
+        self._monkeypatch_gh_request([full_page] * 21)
+
+        captured: list[str] = []
+
+        def fake_log(msg: str, *args: Any, **kwargs: Any) -> None:
+            captured.append(msg)
+
+        orig_log = reviewer.log
+        reviewer.log = fake_log  # type: ignore[assignment]
+        try:
+            n = reviewer.count_label_events(
+                token="t", repo="o/r", pr_number=1, label="ready"
+            )
+            self.assertEqual(n, 2000, "20 pages × 100 events per page")
+            warnings = [m for m in captured if m.startswith("WARNING:")]
+            self.assertEqual(
+                len(warnings), 1, f"expected one WARNING log, got {captured}"
+            )
+            self.assertIn("pagination cap", warnings[0])
+            self.assertIn("label-added-only", warnings[0])
+        finally:
+            reviewer.log = orig_log  # type: ignore[assignment]
+            self._restore()
+
+
+class GhGetAuthenticatedLoginFallbackTests(unittest.TestCase):
+    """Regression for the v1.2 silent-403 bug that broke `collapse-previous`
+    for every consumer using the recommended `${{ secrets.GITHUB_TOKEN }}`
+    pattern. The naive `GET /user` call fails 403 on installation tokens;
+    `gh_get_authenticated_login` now has a 4-tier fallback chain.
+
+    See docs/SECURITY.md and CHANGELOG's [1.2.0] "Fixed" section.
+    """
+
+    def _install_fake_gh_request(
+        self, handler: Any
+    ) -> None:
+        self._orig_gh_request = reviewer.gh_request
+        reviewer.gh_request = handler  # type: ignore[assignment]
+
+    def _restore(self) -> None:
+        reviewer.gh_request = self._orig_gh_request  # type: ignore[assignment]
+
+    def test_tier1_user_endpoint_returns_login(self) -> None:
+        """PAT / OAuth token case — `/user` succeeds → returns its login."""
+        calls: list[str] = []
+
+        def fake(method: str, path: str, **_: Any) -> Any:
+            calls.append(path)
+            if path == "/user":
+                return {"login": "alice"}
+            raise AssertionError(f"unexpected call: {path}")
+
+        self._install_fake_gh_request(fake)
+        try:
+            login = reviewer.gh_get_authenticated_login("tok")
+            self.assertEqual(login, "alice")
+            self.assertEqual(calls, ["/user"], "no fallback should be tried")
+        finally:
+            self._restore()
+
+    def test_tier2_app_endpoint_wraps_slug_with_bot_suffix(self) -> None:
+        """GitHub App installation token — `/user` fails, `/app` returns
+        the app slug; `[bot]` suffix matches how GitHub renders the login
+        in comment.user.login payloads."""
+
+        def fake(method: str, path: str, **_: Any) -> Any:
+            if path == "/user":
+                raise RuntimeError("HTTP Error 403: Forbidden")
+            if path == "/app":
+                return {"slug": "my-cool-app"}
+            raise AssertionError(f"unexpected call: {path}")
+
+        self._install_fake_gh_request(fake)
+        try:
+            login = reviewer.gh_get_authenticated_login("tok")
+            self.assertEqual(login, "my-cool-app[bot]")
+        finally:
+            self._restore()
+
+    def test_tier3_marker_scan_finds_prior_bot_author(self) -> None:
+        """Workflow `GITHUB_TOKEN` case: both `/user` and `/app` refuse.
+        The marker-scan tier reads recent PR comments, finds one with the
+        canonical marker, and returns THAT comment's author."""
+        marker = reviewer.REVIEW_MARKER
+
+        def fake(method: str, path: str, **_: Any) -> Any:
+            if path in ("/user", "/app"):
+                raise RuntimeError("HTTP Error 403: Forbidden")
+            if path.startswith("/repos/o/r/issues/9/comments"):
+                return [
+                    {
+                        "body": "irrelevant human comment",
+                        "user": {"login": "human-user"},
+                    },
+                    {
+                        "body": f"prior review\n{marker}\nsome state",
+                        "user": {"login": "github-actions[bot]"},
+                    },
+                    {"body": "later human comment", "user": {"login": "alice"}},
+                ]
+            raise AssertionError(f"unexpected call: {path}")
+
+        self._install_fake_gh_request(fake)
+        try:
+            login = reviewer.gh_get_authenticated_login(
+                "tok", repo="o/r", pr_number=9
+            )
+            self.assertEqual(login, "github-actions[bot]")
+        finally:
+            self._restore()
+
+    def test_tier3_iterates_in_reverse_to_prefer_most_recent(self) -> None:
+        """When multiple prior markers exist (rare — the collapse mutation
+        cleans them up), the LAST one wins because it's the newest run."""
+        marker = reviewer.REVIEW_MARKER
+
+        def fake(method: str, path: str, **_: Any) -> Any:
+            if path in ("/user", "/app"):
+                raise RuntimeError("HTTP Error 403")
+            return [
+                {"body": f"old\n{marker}", "user": {"login": "old-bot[bot]"}},
+                {"body": f"new\n{marker}", "user": {"login": "new-bot[bot]"}},
+            ]
+
+        self._install_fake_gh_request(fake)
+        try:
+            login = reviewer.gh_get_authenticated_login(
+                "tok", repo="o/r", pr_number=1
+            )
+            self.assertEqual(login, "new-bot[bot]")
+        finally:
+            self._restore()
+
+    def test_tier3_skipped_when_repo_or_pr_missing(self) -> None:
+        """Callers not in the main() context (e.g. one-off helpers) don't
+        pass repo/pr_number; tier 3 is skipped and tier 4's default fires."""
+
+        def fake(method: str, path: str, **_: Any) -> Any:
+            if path in ("/user", "/app"):
+                raise RuntimeError("HTTP Error 403")
+            raise AssertionError(f"tier3 should be skipped, got: {path}")
+
+        self._install_fake_gh_request(fake)
+        try:
+            login = reviewer.gh_get_authenticated_login("tok")
+            self.assertEqual(login, reviewer.DEFAULT_WORKFLOW_BOT_LOGIN)
+        finally:
+            self._restore()
+
+    def test_tier4_falls_back_to_default_workflow_bot(self) -> None:
+        """No marker → default to `github-actions[bot]`, the login used by
+        the built-in `GITHUB_TOKEN`. Downstream steps still work: even if
+        this guess is wrong, `gh_collapse_previous_reviews` just filters
+        no nodes and logs it, staying non-fatal."""
+
+        def fake(method: str, path: str, **_: Any) -> Any:
+            if path in ("/user", "/app"):
+                raise RuntimeError("HTTP Error 403")
+            if path.startswith("/repos/"):
+                return []
+            raise AssertionError(f"unexpected call: {path}")
+
+        self._install_fake_gh_request(fake)
+        try:
+            login = reviewer.gh_get_authenticated_login(
+                "tok", repo="o/r", pr_number=1
+            )
+            self.assertEqual(login, "github-actions[bot]")
+            self.assertEqual(login, reviewer.DEFAULT_WORKFLOW_BOT_LOGIN)
+        finally:
+            self._restore()
+
+    def test_empty_login_from_tier1_falls_through(self) -> None:
+        """Defensive: some tokens return `{"login": ""}` for `/user`. Don't
+        treat that as a valid login; try the next tier instead."""
+
+        def fake(method: str, path: str, **_: Any) -> Any:
+            if path == "/user":
+                return {"login": ""}
+            if path == "/app":
+                return {"slug": "fallback-app"}
+            raise AssertionError(f"unexpected call: {path}")
+
+        self._install_fake_gh_request(fake)
+        try:
+            login = reviewer.gh_get_authenticated_login("tok")
+            self.assertEqual(login, "fallback-app[bot]")
+        finally:
+            self._restore()
+
+
+class GhCollapsePreviousReviewsTests(unittest.TestCase):
+    """Regression for the login-shape mismatch that silently broke
+    `collapse-previous` in every self-review run on this repo — even
+    after the 4-tier fallback for `gh_get_authenticated_login` landed.
+
+    REST returns `"github-actions[bot]"` but GraphQL's `.author.login`
+    on the same Bot node returns `"github-actions"` (no suffix). The
+    naive equality check filtered every bot node out, resulting in
+    "Collapsed 0/N previous bot artefact(s)" on every run. The fix
+    accepts both shapes for the comparison.
+    """
+
+    def _install_fake_gh_graphql(self, responses: list[Any]) -> list[dict]:
+        """Return a call-log list; each `gh_graphql` invocation appends
+        `{"query": ..., "variables": ...}` and pops the next response."""
+        calls: list[dict] = []
+
+        def fake(query: str, variables: dict, *, token: str) -> Any:
+            calls.append({"query": query, "variables": variables})
+            if not responses:
+                return {}
+            return responses.pop(0)
+
+        self._orig_gh_graphql = reviewer.gh_graphql
+        reviewer.gh_graphql = fake  # type: ignore[assignment]
+        return calls
+
+    def _restore(self) -> None:
+        reviewer.gh_graphql = self._orig_gh_graphql  # type: ignore[assignment]
+
+    def test_matches_graphql_bot_login_without_suffix(self) -> None:
+        """Bot comments arriving from GraphQL as `"github-actions"`
+        (no `[bot]`) must be recognized when caller passes the REST-
+        shaped `"github-actions[bot]"`. Regression for PR #9."""
+        query_payload = {
+            "repository": {
+                "pullRequest": {
+                    "comments": {
+                        "nodes": [
+                            {
+                                "id": "IC_kw_1",
+                                "isMinimized": False,
+                                "author": {"login": "github-actions"},
+                            },
+                            {
+                                "id": "IC_kw_2",
+                                "isMinimized": False,
+                                "author": {"login": "xergioalex"},
+                            },
+                        ]
+                    },
+                    "reviews": {
+                        "nodes": [
+                            {
+                                "id": "PRR_kw_1",
+                                "isMinimized": False,
+                                "author": {"login": "github-actions"},
+                                "comments": {
+                                    "nodes": [
+                                        {"id": "PRRC_kw_1", "isMinimized": False}
+                                    ]
+                                },
+                            }
+                        ]
+                    },
+                }
+            }
+        }
+        # First call: the LIST query. Then one mutation per target
+        # (comment + review + inline) → 3 mutations. Each returns {}.
+        calls = self._install_fake_gh_graphql(
+            [query_payload, {}, {}, {}]
+        )
+        try:
+            n = reviewer.gh_collapse_previous_reviews(
+                token="tok",
+                repo="o/r",
+                pr_number=9,
+                bot_login="github-actions[bot]",  # REST-shape login
+            )
+            self.assertEqual(
+                n,
+                3,
+                "must collapse the 1 issue comment + 1 review + 1 inline "
+                "comment, all authored by `github-actions` (Bot).",
+            )
+            mutation_ids = [
+                c["variables"].get("id")
+                for c in calls[1:]  # skip the LIST query
+            ]
+            self.assertEqual(sorted(mutation_ids), sorted(["IC_kw_1", "PRR_kw_1", "PRRC_kw_1"]))
+        finally:
+            self._restore()
+
+    def test_matches_bot_login_with_suffix_too(self) -> None:
+        """Sanity: when caller passes the raw `github-actions[bot]`
+        AND GraphQL also returns it that way (unlikely but not
+        impossible for future API changes), still matches."""
+        query_payload = {
+            "repository": {
+                "pullRequest": {
+                    "comments": {
+                        "nodes": [
+                            {
+                                "id": "IC_kw_1",
+                                "isMinimized": False,
+                                "author": {"login": "github-actions[bot]"},
+                            }
+                        ]
+                    },
+                    "reviews": {"nodes": []},
+                }
+            }
+        }
+        self._install_fake_gh_graphql([query_payload, {}])
+        try:
+            n = reviewer.gh_collapse_previous_reviews(
+                token="tok",
+                repo="o/r",
+                pr_number=9,
+                bot_login="github-actions[bot]",
+            )
+            self.assertEqual(n, 1)
+        finally:
+            self._restore()
+
+    def test_skips_already_minimized_nodes(self) -> None:
+        """`isMinimized: True` nodes are excluded — no wasted mutations."""
+        query_payload = {
+            "repository": {
+                "pullRequest": {
+                    "comments": {
+                        "nodes": [
+                            {
+                                "id": "IC_kw_1",
+                                "isMinimized": True,
+                                "author": {"login": "github-actions"},
+                            }
+                        ]
+                    },
+                    "reviews": {"nodes": []},
+                }
+            }
+        }
+        calls = self._install_fake_gh_graphql([query_payload])
+        try:
+            n = reviewer.gh_collapse_previous_reviews(
+                token="tok",
+                repo="o/r",
+                pr_number=9,
+                bot_login="github-actions[bot]",
+            )
+            self.assertEqual(n, 0)
+            self.assertEqual(len(calls), 1, "only the LIST query, no mutations")
+        finally:
+            self._restore()
+
+    def test_ignores_other_bots(self) -> None:
+        """Only OUR bot's comments get collapsed — a dependabot or
+        renovate bot's comments must be left alone."""
+        query_payload = {
+            "repository": {
+                "pullRequest": {
+                    "comments": {
+                        "nodes": [
+                            {
+                                "id": "IC_kw_1",
+                                "isMinimized": False,
+                                "author": {"login": "dependabot"},
+                            },
+                            {
+                                "id": "IC_kw_2",
+                                "isMinimized": False,
+                                "author": {"login": "github-actions"},
+                            },
+                        ]
+                    },
+                    "reviews": {"nodes": []},
+                }
+            }
+        }
+        calls = self._install_fake_gh_graphql([query_payload, {}])
+        try:
+            n = reviewer.gh_collapse_previous_reviews(
+                token="tok",
+                repo="o/r",
+                pr_number=9,
+                bot_login="github-actions[bot]",
+            )
+            self.assertEqual(n, 1, "only our bot's comment collapsed")
+            self.assertEqual(calls[1]["variables"]["id"], "IC_kw_2")
+        finally:
+            self._restore()
+
+
+class GhPatchPrBodySignatureTests(unittest.TestCase):
+    """Regression: `gh_patch_pr_body` uses positional method+path (matches
+    `gh_request`'s actual signature). If someone reverts to keyword args,
+    this will catch it."""
+
+    def test_calls_patch_with_new_body(self) -> None:
+        captured: dict[str, Any] = {}
+
+        def fake_gh_request(method: str, path: str, **kwargs: Any) -> Any:
+            captured["method"] = method
+            captured["path"] = path
+            captured["body"] = kwargs.get("body")
+            return {}
+
+        orig = reviewer.gh_request
+        reviewer.gh_request = fake_gh_request  # type: ignore[assignment]
+        try:
+            reviewer.gh_patch_pr_body(
+                token="t", repo="o/r", pr_number=42, new_body="hello"
+            )
+        finally:
+            reviewer.gh_request = orig  # type: ignore[assignment]
+        self.assertEqual(captured["method"], "PATCH")
+        self.assertIn("/repos/o/r/pulls/42", captured["path"])
+        self.assertEqual(captured["body"], {"body": "hello"})
+
+
+class SetPrDescriptionToolSchemaTests(unittest.TestCase):
+    """Sanity checks on the exposed schema for the autocomplete surface."""
+
+    def test_tool_description_forbids_secrets(self) -> None:
+        schema = reviewer.tools_schema(
+            10, allow_set_pr_description=True
+        )
+        tool = next(
+            t for t in schema if t["name"] == "set_pr_description"
+        )
+        # The description warns the model against leaking secrets — the
+        # single most important prompt-injection mitigation for this
+        # write-back path.
+        desc: str = tool["description"].lower()
+        self.assertTrue(
+            "secret" in desc or "credential" in desc or "token" in desc,
+            "set_pr_description schema must warn against secret leakage",
+        )
+
+    def test_tool_description_mentions_marker(self) -> None:
+        schema = reviewer.tools_schema(
+            10, allow_set_pr_description=True
+        )
+        tool = next(
+            t for t in schema if t["name"] == "set_pr_description"
+        )
+        self.assertIn(
+            "ai-pr-reviewer-description-autocompleted",
+            tool["description"],
+        )
+
+
+class ResolveTriggerActionTests(unittest.TestCase):
+    """Matrix coverage across the four trigger modes."""
+
+    def test_always_runs_regardless_of_state(self) -> None:
+        d = reviewer.resolve_trigger_action(
+            trigger_mode=reviewer.TRIGGER_ALWAYS,
+            event_action="opened",
+            label_gate="",
+            current_labels=[],
+            label_toggle_generation=0,
+            last_reviewed_generation=0,
+        )
+        self.assertTrue(d.should_run)
+
+    def test_missing_label_gate_falls_back_to_always(self) -> None:
+        d = reviewer.resolve_trigger_action(
+            trigger_mode=reviewer.TRIGGER_LABEL_ONCE,
+            event_action="opened",
+            label_gate="",
+            current_labels=[],
+            label_toggle_generation=0,
+            last_reviewed_generation=0,
+        )
+        self.assertTrue(d.should_run)
+        self.assertIn("no label-gate", d.reason)
+
+    def test_label_required_blocks_when_missing(self) -> None:
+        d = reviewer.resolve_trigger_action(
+            trigger_mode=reviewer.TRIGGER_LABEL_REQUIRED,
+            event_action="opened",
+            label_gate="ready",
+            current_labels=["bug"],
+            label_toggle_generation=0,
+            last_reviewed_generation=0,
+        )
+        self.assertFalse(d.should_run)
+        self.assertIn("not present", d.reason)
+
+    def test_label_required_runs_when_present(self) -> None:
+        d = reviewer.resolve_trigger_action(
+            trigger_mode=reviewer.TRIGGER_LABEL_REQUIRED,
+            event_action="synchronize",
+            label_gate="ready",
+            current_labels=["ready", "bug"],
+            label_toggle_generation=1,
+            last_reviewed_generation=0,
+        )
+        self.assertTrue(d.should_run)
+
+    def test_label_once_runs_on_first_generation(self) -> None:
+        d = reviewer.resolve_trigger_action(
+            trigger_mode=reviewer.TRIGGER_LABEL_ONCE,
+            event_action="labeled",
+            label_gate="ready",
+            current_labels=["ready"],
+            label_toggle_generation=1,
+            last_reviewed_generation=0,
+        )
+        self.assertTrue(d.should_run)
+        self.assertIn("new label generation", d.reason)
+
+    def test_label_once_blocks_on_stale_generation(self) -> None:
+        d = reviewer.resolve_trigger_action(
+            trigger_mode=reviewer.TRIGGER_LABEL_ONCE,
+            event_action="synchronize",
+            label_gate="ready",
+            current_labels=["ready"],
+            label_toggle_generation=1,
+            last_reviewed_generation=1,
+        )
+        self.assertFalse(d.should_run)
+        self.assertIn("already reviewed", d.reason)
+
+    def test_label_once_runs_after_toggle(self) -> None:
+        d = reviewer.resolve_trigger_action(
+            trigger_mode=reviewer.TRIGGER_LABEL_ONCE,
+            event_action="labeled",
+            label_gate="ready",
+            current_labels=["ready"],
+            label_toggle_generation=2,
+            last_reviewed_generation=1,
+        )
+        self.assertTrue(d.should_run)
+
+    def test_label_once_runs_when_count_zero_but_label_present(self) -> None:
+        """Regression for PR #9 self-review comment #4: if the timeline
+        API failed (or the PR has no timeline entries yet) and the label
+        IS on the PR, we must NOT skip on `0 <= 0`. Better to run and
+        deliver a review than to skip silently."""
+        d = reviewer.resolve_trigger_action(
+            trigger_mode=reviewer.TRIGGER_LABEL_ONCE,
+            event_action="labeled",
+            label_gate="ready",
+            current_labels=["ready"],
+            label_toggle_generation=0,
+            last_reviewed_generation=0,
+        )
+        self.assertTrue(
+            d.should_run,
+            "label-once with generation=0 and gate label present must "
+            "still run — 0<=0 is not a stale-generation skip signal.",
+        )
+
+    def test_label_added_only_ignores_non_labeled_events(self) -> None:
+        d = reviewer.resolve_trigger_action(
+            trigger_mode=reviewer.TRIGGER_LABEL_ADDED_ONLY,
+            event_action="synchronize",
+            label_gate="ready",
+            current_labels=["ready"],
+            label_toggle_generation=1,
+            last_reviewed_generation=0,
+        )
+        self.assertFalse(d.should_run)
+        self.assertIn("is not 'labeled'", d.reason)
+
+    def test_label_added_only_fires_on_labeled(self) -> None:
+        d = reviewer.resolve_trigger_action(
+            trigger_mode=reviewer.TRIGGER_LABEL_ADDED_ONLY,
+            event_action="labeled",
+            label_gate="ready",
+            current_labels=["ready"],
+            label_toggle_generation=1,
+            last_reviewed_generation=0,
+        )
+        self.assertTrue(d.should_run)
+
+    def test_label_added_only_fires_when_event_label_matches_gate(self) -> None:
+        """The labeled event carries `ready` → run."""
+        d = reviewer.resolve_trigger_action(
+            trigger_mode=reviewer.TRIGGER_LABEL_ADDED_ONLY,
+            event_action="labeled",
+            event_label="ready",
+            label_gate="ready",
+            current_labels=["ready"],
+            label_toggle_generation=1,
+            last_reviewed_generation=0,
+        )
+        self.assertTrue(d.should_run)
+
+    def test_label_added_only_skips_when_event_label_is_unrelated(self) -> None:
+        """Regression for the PR #9 self-review finding: someone adds an
+        unrelated label (e.g. `bug`) while `ready` is already present. The
+        `labeled` webhook fires; we must NOT run a full review."""
+        d = reviewer.resolve_trigger_action(
+            trigger_mode=reviewer.TRIGGER_LABEL_ADDED_ONLY,
+            event_action="labeled",
+            event_label="bug",
+            label_gate="ready",
+            current_labels=["ready", "bug"],
+            label_toggle_generation=1,
+            last_reviewed_generation=0,
+        )
+        self.assertFalse(d.should_run)
+        self.assertIn("'bug'", d.reason)
+        self.assertIn("'ready'", d.reason)
+
+    def test_label_added_only_backcompat_when_event_label_unknown(self) -> None:
+        """`event_label=""` (payload not available) preserves v1.2.0
+        behaviour so runs from GitHub UI/API label additions where the
+        payload is missing still work."""
+        d = reviewer.resolve_trigger_action(
+            trigger_mode=reviewer.TRIGGER_LABEL_ADDED_ONLY,
+            event_action="labeled",
+            event_label="",
+            label_gate="ready",
+            current_labels=["ready"],
+            label_toggle_generation=1,
+            last_reviewed_generation=0,
+        )
+        self.assertTrue(d.should_run)
+
+    def test_unknown_trigger_mode_blocks(self) -> None:  # keep signature stable
+        d = reviewer.resolve_trigger_action(
+            trigger_mode="whatever",
+            event_action="opened",
+            label_gate="ready",
+            current_labels=["ready"],
+            label_toggle_generation=0,
+            last_reviewed_generation=0,
+        )
+        self.assertFalse(d.should_run)
+
+
+class AgentRunnerNoopWarningTests(unittest.TestCase):
+    """`build_agent_runner_noop_warning` — the v1.2 provider-family notice.
+
+    Regression for the PR #9 self-review finding: enabling
+    `pr-description-mode=autocomplete` or `complexity-labels-enabled=true`
+    on an agent-runner CLI provider silently no-ops. This helper produces
+    a WARNING log line so consumers see the caveat before paying for a
+    review that can't apply their PATCH/label.
+    """
+
+    def test_chat_completions_never_warns(self) -> None:
+        w = reviewer.build_agent_runner_noop_warning(
+            provider_id="anthropic",
+            is_agent_runner=False,
+            pr_desc_mode=reviewer.PR_DESC_MODE_AUTOCOMPLETE,
+            complexity_labels_enabled=True,
+        )
+        self.assertEqual(w, "")
+
+    def test_agent_runner_with_no_optin_features_is_silent(self) -> None:
+        w = reviewer.build_agent_runner_noop_warning(
+            provider_id="cursor",
+            is_agent_runner=True,
+            pr_desc_mode=reviewer.PR_DESC_MODE_OFF,
+            complexity_labels_enabled=False,
+        )
+        self.assertEqual(w, "")
+
+    def test_warn_and_block_modes_do_not_trigger(self) -> None:
+        """`warn`/`block` inspect the body themselves — they don't need
+        `set_pr_description` tool and DO work on agent-runners."""
+        for mode in (
+            reviewer.PR_DESC_MODE_WARN,
+            reviewer.PR_DESC_MODE_BLOCK,
+        ):
+            with self.subTest(mode=mode):
+                w = reviewer.build_agent_runner_noop_warning(
+                    provider_id="cursor",
+                    is_agent_runner=True,
+                    pr_desc_mode=mode,
+                    complexity_labels_enabled=False,
+                )
+                self.assertEqual(w, "", f"mode={mode!r} should not warn")
+
+    def test_autocomplete_on_agent_runner_warns(self) -> None:
+        w = reviewer.build_agent_runner_noop_warning(
+            provider_id="cursor",
+            is_agent_runner=True,
+            pr_desc_mode=reviewer.PR_DESC_MODE_AUTOCOMPLETE,
+            complexity_labels_enabled=False,
+        )
+        self.assertIn("WARNING", w)
+        self.assertIn("pr-description-mode=autocomplete", w)
+        self.assertIn("'cursor'", w)
+        self.assertIn("PR_METADATA_CHECKS.md", w)
+
+    def test_complexity_on_agent_runner_warns(self) -> None:
+        w = reviewer.build_agent_runner_noop_warning(
+            provider_id="claude-code",
+            is_agent_runner=True,
+            pr_desc_mode=reviewer.PR_DESC_MODE_OFF,
+            complexity_labels_enabled=True,
+        )
+        self.assertIn("WARNING", w)
+        self.assertIn("complexity-labels-enabled=true", w)
+        self.assertIn("'claude-code'", w)
+
+    def test_both_features_listed_together(self) -> None:
+        w = reviewer.build_agent_runner_noop_warning(
+            provider_id="codex",
+            is_agent_runner=True,
+            pr_desc_mode=reviewer.PR_DESC_MODE_AUTOCOMPLETE,
+            complexity_labels_enabled=True,
+        )
+        self.assertIn("pr-description-mode=autocomplete", w)
+        self.assertIn("complexity-labels-enabled=true", w)
+
+
+class TriggerStateRoundtripTests(unittest.TestCase):
+    """`write_trigger_state` + `read_trigger_state` roundtrip."""
+
+    def test_write_then_read_recovers_state(self) -> None:
+        body = "<!-- ai-pr-reviewer-marker -->\n\nSome body content."
+        written = reviewer.write_trigger_state(
+            body, {"label_toggle_generation": 3, "reviewed_sha": "abc"}
+        )
+        state = reviewer.read_trigger_state(written)
+        self.assertEqual(state["label_toggle_generation"], 3)
+        self.assertEqual(state["reviewed_sha"], "abc")
+
+    def test_read_returns_empty_when_no_marker(self) -> None:
+        self.assertEqual(reviewer.read_trigger_state(""), {})
+        self.assertEqual(
+            reviewer.read_trigger_state("Just some markdown, no state."),
+            {},
+        )
+
+    def test_write_replaces_prior_state(self) -> None:
+        body = "<!-- ai-pr-reviewer-marker -->\n\nBody."
+        step1 = reviewer.write_trigger_state(
+            body, {"label_toggle_generation": 1}
+        )
+        step2 = reviewer.write_trigger_state(
+            step1, {"label_toggle_generation": 2}
+        )
+        # Only the most recent state should be present.
+        self.assertEqual(step2.count("ai-pr-reviewer-state"), 1)
+        state = reviewer.read_trigger_state(step2)
+        self.assertEqual(state["label_toggle_generation"], 2)
+
+    def test_read_ignores_malformed_json(self) -> None:
+        body = (
+            "<!-- ai-pr-reviewer-marker -->\n"
+            "<!-- ai-pr-reviewer-state: {not valid json} -->\n"
+            "Body."
+        )
+        self.assertEqual(reviewer.read_trigger_state(body), {})
+
+
+class EvaluatePrDescriptionTests(unittest.TestCase):
+    """Cheap heuristic covering empty / short / adequate bodies."""
+
+    def test_empty_body_is_inadequate(self) -> None:
+        v = reviewer.evaluate_pr_description("", min_length=50)
+        self.assertFalse(v.is_adequate)
+        self.assertIn("empty", v.reason.lower())
+
+    def test_whitespace_only_body_is_inadequate(self) -> None:
+        v = reviewer.evaluate_pr_description("   \n\t\n  ", min_length=50)
+        self.assertFalse(v.is_adequate)
+
+    def test_short_body_is_inadequate(self) -> None:
+        v = reviewer.evaluate_pr_description("wip", min_length=50)
+        self.assertFalse(v.is_adequate)
+        self.assertIn("too short", v.reason.lower())
+        self.assertIn("50", v.reason)
+
+    def test_body_at_threshold_is_adequate(self) -> None:
+        body = "x" * 50
+        v = reviewer.evaluate_pr_description(body, min_length=50)
+        self.assertTrue(v.is_adequate)
+        self.assertEqual(v.reason, "")
+
+    def test_marker_is_stripped_before_length_check(self) -> None:
+        # The autocomplete marker adds ~50 chars; a body that's just the
+        # marker should NOT pass the min_length gate.
+        body = reviewer.PR_DESC_AUTOCOMPLETE_MARKER + "x"
+        v = reviewer.evaluate_pr_description(body, min_length=50)
+        self.assertFalse(v.is_adequate)
+
+    def test_none_body_treated_as_empty(self) -> None:
+        v = reviewer.evaluate_pr_description(None, min_length=50)  # type: ignore[arg-type]
+        self.assertFalse(v.is_adequate)
+
+
+class ToolSetPrDescriptionTests(unittest.TestCase):
+    """`tool_set_pr_description` records into state and enforces one-shot."""
+
+    def test_records_proposal(self) -> None:
+        state = reviewer.ReviewState()
+        result = reviewer.tool_set_pr_description(
+            {"body": "New rich PR body with context."}, state
+        )
+        self.assertEqual(
+            state.proposed_pr_description, "New rich PR body with context."
+        )
+        self.assertIn("recorded", result.lower())
+
+    def test_rejects_empty_body(self) -> None:
+        state = reviewer.ReviewState()
+        result = reviewer.tool_set_pr_description({"body": "  \n  "}, state)
+        self.assertIsNone(state.proposed_pr_description)
+        self.assertIn("Error", result)
+
+    def test_one_shot(self) -> None:
+        state = reviewer.ReviewState()
+        reviewer.tool_set_pr_description({"body": "first"}, state)
+        result = reviewer.tool_set_pr_description({"body": "second"}, state)
+        self.assertEqual(state.proposed_pr_description, "first")
+        self.assertIn("already", result.lower())
+
+
+class ToolSetPrComplexityTests(unittest.TestCase):
+    """`tool_set_pr_complexity` records + validates level enum."""
+
+    def test_records_low(self) -> None:
+        state = reviewer.ReviewState()
+        result = reviewer.tool_set_pr_complexity({"level": "low"}, state)
+        self.assertEqual(state.proposed_pr_complexity, "low")
+        self.assertIn("recorded", result.lower())
+
+    def test_case_normalized(self) -> None:
+        state = reviewer.ReviewState()
+        reviewer.tool_set_pr_complexity({"level": "HIGH"}, state)
+        self.assertEqual(state.proposed_pr_complexity, "high")
+
+    def test_rejects_unknown_level(self) -> None:
+        state = reviewer.ReviewState()
+        result = reviewer.tool_set_pr_complexity({"level": "epic"}, state)
+        self.assertIsNone(state.proposed_pr_complexity)
+        self.assertIn("Error", result)
+
+    def test_one_shot(self) -> None:
+        state = reviewer.ReviewState()
+        reviewer.tool_set_pr_complexity({"level": "low"}, state)
+        result = reviewer.tool_set_pr_complexity({"level": "high"}, state)
+        self.assertEqual(state.proposed_pr_complexity, "low")
+        self.assertIn("already", result.lower())
+
+
+class ToolsSchemaGatingTests(unittest.TestCase):
+    """Optional tools are exposed only when their flag is set."""
+
+    def test_base_five_always_present(self) -> None:
+        schema = reviewer.tools_schema(10)
+        names = [t["name"] for t in schema]
+        for expected in (
+            "read_file",
+            "grep",
+            "glob",
+            "post_inline_comment",
+            "submit_review",
+        ):
+            self.assertIn(expected, names)
+
+    def test_set_pr_description_absent_by_default(self) -> None:
+        schema = reviewer.tools_schema(10)
+        names = [t["name"] for t in schema]
+        self.assertNotIn("set_pr_description", names)
+
+    def test_set_pr_description_present_when_allowed(self) -> None:
+        schema = reviewer.tools_schema(
+            10, allow_set_pr_description=True
+        )
+        names = [t["name"] for t in schema]
+        self.assertIn("set_pr_description", names)
+
+    def test_set_pr_complexity_absent_by_default(self) -> None:
+        schema = reviewer.tools_schema(10)
+        names = [t["name"] for t in schema]
+        self.assertNotIn("set_pr_complexity", names)
+
+    def test_set_pr_complexity_present_when_allowed(self) -> None:
+        schema = reviewer.tools_schema(
+            10, allow_set_pr_complexity=True
+        )
+        names = [t["name"] for t in schema]
+        self.assertIn("set_pr_complexity", names)
+
+    def test_both_optional_tools_present_when_both_flags(self) -> None:
+        schema = reviewer.tools_schema(
+            10,
+            allow_set_pr_description=True,
+            allow_set_pr_complexity=True,
+        )
+        names = [t["name"] for t in schema]
+        self.assertIn("set_pr_description", names)
+        self.assertIn("set_pr_complexity", names)
+        self.assertEqual(len(names), 7)
+
+
+class ComposeSystemPromptTests(unittest.TestCase):
+    """`compose_system_prompt(base, extension)` covers the four cases of
+    the base+extension matrix.
+    """
+
+    def test_empty_extension_returns_base_unchanged(self) -> None:
+        base = "You are the reviewer.\n"
+        result = reviewer.compose_system_prompt(base, "")
+        self.assertEqual(result, base)
+
+    def test_extension_appended_with_separator(self) -> None:
+        base = "You are the reviewer."
+        ext = "Extra rule: never suggest `any`."
+        result = reviewer.compose_system_prompt(base, ext)
+        self.assertIn("You are the reviewer.", result)
+        self.assertIn("---", result)
+        self.assertIn("Extra rule: never suggest `any`.", result)
+        # The base appears before the separator, extension after.
+        self.assertLess(
+            result.index("You are the reviewer."), result.index("---")
+        )
+        self.assertLess(
+            result.index("---"),
+            result.index("Extra rule: never suggest `any`."),
+        )
+
+    def test_extension_strips_leading_whitespace(self) -> None:
+        base = "Base."
+        ext = "\n\n\nExtension."
+        result = reviewer.compose_system_prompt(base, ext)
+        # Should not have four consecutive newlines between separator and
+        # extension body — extension is lstripped.
+        self.assertNotIn("---\n\n\n\nExtension", result)
+        self.assertIn("---\n\nExtension.", result)
+
+    def test_base_strips_trailing_whitespace(self) -> None:
+        base = "Base.\n\n\n\n"
+        ext = "Ext."
+        result = reviewer.compose_system_prompt(base, ext)
+        self.assertIn("Base.\n\n---\n\nExt.", result)
+
+    def test_full_replacement_semantic_preserved(self) -> None:
+        # When a custom prompt-file is used as the base, the same
+        # composition rule applies with no default content leaked.
+        custom_base = "# Custom prompt\nOnly rule: be brief."
+        ext = "Additional rule: cite line numbers."
+        result = reviewer.compose_system_prompt(custom_base, ext)
+        self.assertIn("Custom prompt", result)
+        self.assertIn("Only rule: be brief.", result)
+        self.assertIn("Additional rule: cite line numbers.", result)
+        # No leakage of the bundled default (its unique phrase).
+        self.assertNotIn("post_inline_comment", result)
+
+
 class EvaluateStrictnessTests(unittest.TestCase):
     def test_lenient_never_blocks(self) -> None:
         blocked, _ = reviewer.evaluate_strictness(
@@ -141,6 +1168,39 @@ class EvaluateStrictnessTests(unittest.TestCase):
         )
         self.assertFalse(blocked)
         self.assertIn("lenient", reason)
+
+    def test_block_on_any_blocks_on_info(self) -> None:
+        blocked, reason = reviewer.evaluate_strictness(
+            reviewer.SEVERITY_INFO, reviewer.STRICTNESS_BLOCK_ANY
+        )
+        self.assertTrue(blocked)
+        self.assertIn("block-on-any", reason)
+
+    def test_block_on_any_blocks_on_warning(self) -> None:
+        self.assertTrue(
+            reviewer.evaluate_strictness(
+                reviewer.SEVERITY_WARNING, reviewer.STRICTNESS_BLOCK_ANY
+            )[0]
+        )
+
+    def test_block_on_any_blocks_on_critical(self) -> None:
+        self.assertTrue(
+            reviewer.evaluate_strictness(
+                reviewer.SEVERITY_CRITICAL, reviewer.STRICTNESS_BLOCK_ANY
+            )[0]
+        )
+
+    def test_block_on_any_passes_on_none(self) -> None:
+        blocked, reason = reviewer.evaluate_strictness(
+            reviewer.SEVERITY_NONE, reviewer.STRICTNESS_BLOCK_ANY
+        )
+        self.assertFalse(blocked)
+        self.assertIn("no findings", reason)
+
+    def test_block_on_any_in_valid_strictness(self) -> None:
+        self.assertIn(
+            reviewer.STRICTNESS_BLOCK_ANY, reviewer.VALID_STRICTNESS
+        )
 
 
 class SafeRepoPathTests(unittest.TestCase):
@@ -521,8 +1581,11 @@ class ToolsSchemaTests(unittest.TestCase):
 class FakeProvider(reviewer.Provider):
     """Provider stub that drives the loop deterministically.
 
-    Emits N tool-call turns (each a no-op read_file) then a final text turn,
-    so we can assert the conversation-pruning invariant without any network.
+    Emits N tool-call turns (each an unknown-tool stub so `execute_tool`
+    returns immediately without touching the filesystem or shelling out)
+    then a final text turn, so we can assert the conversation-pruning
+    invariant without any network AND without any I/O — critical for the
+    40-turn stress test in DriveReviewPruningTests.
     """
 
     def __init__(self, *, tool_turns: int) -> None:
@@ -544,8 +1607,11 @@ class FakeProvider(reviewer.Provider):
                     {
                         "type": "tool_use",
                         "id": f"call_{self.calls}",
-                        "name": "grep",
-                        "input": {"pattern": "x"},
+                        # Unknown tool name → execute_tool returns
+                        # "Error: unknown tool" immediately. The pruning
+                        # loop treats it as a tool_result and moves on.
+                        "name": "__pruning_test_stub__",
+                        "input": {},
                     }
                 ],
             }

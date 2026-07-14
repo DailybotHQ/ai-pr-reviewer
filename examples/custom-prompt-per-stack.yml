@@ -1,0 +1,44 @@
+# Layer a stack-specific extension on top of the bundled default prompt.
+#
+# `prompt-extension-file` APPENDS to the base prompt. The base can be the
+# bundled default (no `prompt-file:` set, this example) or your own full
+# override (`prompt-file:` set). Both inputs can coexist.
+#
+# For a bespoke prompt tailored to YOUR repo, hand
+# examples/prompts/generate-custom-prompt-meta.md to your favorite coding
+# AI and save the output to .github/prompts/pr-review.md — see
+# docs/PROMPTS.md § "Generate a custom prompt with your own AI".
+
+name: PR review (extended prompt)
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize]
+
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: DailybotHQ/ai-pr-reviewer@v1
+        with:
+          provider: anthropic
+          api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Base prompt: the bundled default (no `prompt-file:` set).
+          # Extension: layer Python-strict severity overrides on top.
+          # Swap the path for typescript-strict.md or security-focused.md
+          # depending on your stack.
+          prompt-extension-file: examples/prompts/python-strict.md
+          strictness: block-on-warning

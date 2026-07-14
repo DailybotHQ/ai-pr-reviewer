@@ -84,13 +84,19 @@ That's the minimum. Open a PR; the action posts a tracking comment, runs a revie
 | `github-token` | ✅ | — | Token with `pull-requests: write` and `contents: read`. The default `secrets.GITHUB_TOKEN` works; pass a PAT or automation-bot token if you want the review attributed to a specific account. |
 | `provider` | | `anthropic` | LLM provider. `anthropic` (chat-completions), `claude-code` / `cursor` / `codex` (agent-runner CLIs). See [docs/PROVIDERS.md](docs/PROVIDERS.md). |
 | `model` | | provider default | Model id. Anthropic → `claude-sonnet-4-6`, Cursor → `composer-2.5`, Codex → `gpt-5-codex`, Claude Code → account default. |
-| `prompt-file` | | bundled `prompts/default.md` | Path **inside the consumer checkout** to a markdown system prompt. Customising the prompt is the main lever for adapting the review to your codebase — see [docs/PROMPTS.md](docs/PROMPTS.md). |
-| `label-gate` | | `''` | If non-empty, the review only runs when the PR carries this label (e.g. `ready`). |
+| `prompt-file` | | bundled `prompts/default.md` | Path **inside the consumer checkout** to a markdown system prompt. FULLY REPLACES the base. Customising the prompt is the main lever for adapting the review to your codebase — see [docs/PROMPTS.md](docs/PROMPTS.md). |
+| `prompt-extension-file` | | _(empty)_ | Path **inside the consumer checkout** to a markdown file APPENDED to the base prompt. Use to layer overrides without copying the whole default. Combines with `prompt-file` (base + extension). Starter templates in [`examples/prompts/`](examples/prompts/). |
+| `label-gate` | | `''` | If non-empty, the review only runs when the PR carries this label (e.g. `ready`). Combined with `trigger-mode`. |
+| `trigger-mode` | | _(auto)_ | `always` / `label-required` / `label-once` / `label-added-only` — see [docs/TRIGGER_MODES.md](docs/TRIGGER_MODES.md). Empty picks `label-required` when `label-gate` is set, else `always`. |
 | `applied-label` | | `''` | If non-empty, this label is applied to the PR after a successful, non-blocked review (e.g. `pr-reviewed`). The label is auto-created if it doesn't exist. |
 | `collapse-previous` | | `true` | Mark previous bot reviews/comments as `OUTDATED` via GraphQL `minimizeComment`. |
 | `tracking-comment` | | `true` | Post a spinner comment that transitions to the final review URL. |
-| `strictness` | | `lenient` | `lenient` / `block-on-critical` / `block-on-warning` — see [docs/STRICTNESS.md](docs/STRICTNESS.md). |
+| `strictness` | | `lenient` | `lenient` / `block-on-critical` / `block-on-warning` / `block-on-any` — see [docs/STRICTNESS.md](docs/STRICTNESS.md). |
 | `max-inline-comments` | | `10` | Hard cap on inline comments per review. |
+| `pr-description-mode` | | `off` | `off` / `warn` / `block` / `autocomplete` — see [docs/PR_METADATA_CHECKS.md](docs/PR_METADATA_CHECKS.md). |
+| `pr-description-min-length` | | `50` | Char threshold below which the PR body is treated as vague. |
+| `complexity-labels-enabled` | | `false` | When `true`, the reviewer applies a `complexity:low/medium/high` label to the PR. |
+| `complexity-label-prefix` | | `complexity:` | Prefix for the complexity label (change to match your labeling conventions). |
 | `max-turns` | | `30` | Hard cap on the agentic-loop iterations (chat-completions providers only). |
 | `agent-max-turns` | | `''` | Cap on the CLI provider's internal turn count. Empty = provider default. Ignored for chat-completions providers. |
 | `agent-extra-args` | | `''` | Raw string appended to the CLI invocation. Parsed with `shlex.split` (never `shell=True`). Escape hatch for provider-specific flags. |
@@ -119,6 +125,7 @@ That's the minimum. Open a PR; the action posts a tracking comment, runs a revie
 | `lenient` (default) | Nothing. The review posts; the check is always green. |
 | `block-on-critical` | One or more inline comments tagged `critical`. |
 | `block-on-warning` | One or more inline comments tagged `critical` or `warning`. |
+| `block-on-any` | Any inline comment at all, including `info`. Zero-tolerance mode — use for security-critical or regulated stacks where every finding must be resolved before merge. |
 
 The model decides severity per inline comment via the tool's `severity` argument; the bundled default prompt explains the levels in detail. Customise the prompt to make the model more or less aggressive about each tier.
 
@@ -158,10 +165,56 @@ Pair with a branch protection rule that requires the PR-review check to pass.
   with:
     api-key: ${{ secrets.ANTHROPIC_API_KEY }}
     github-token: ${{ secrets.GITHUB_TOKEN }}
+    # Full replacement:
     prompt-file: .github/prompts/our_house_rules.md
+    # Or layer overrides on top of whichever base is loaded (default OR
+    # a custom `prompt-file`). Both inputs may be used together — see
+    # docs/PROMPTS.md for the "base vs extension vs replacement" guide:
+    # prompt-extension-file: examples/prompts/python-strict.md
 ```
 
-The prompt is the most powerful knob. See [docs/PROMPTS.md](docs/PROMPTS.md) for what good prompts look like (severity definitions, project-specific anti-patterns, "don't comment on" lists, etc.).
+The prompt is the most powerful knob. See [docs/PROMPTS.md](docs/PROMPTS.md) for the "Base vs Extension vs Replacement" decision guide, the starter extensions in [`examples/prompts/`](examples/prompts/), and the meta-prompt that lets your favorite AI generate a repo-tailored prompt for you.
+
+### Review-once-per-label workflow
+
+Run only when you signal readiness by adding a label; toggle the label off/on to re-run:
+
+```yaml
+- uses: DailybotHQ/ai-pr-reviewer@v1
+  with:
+    api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+    github-token: ${{ secrets.GITHUB_TOKEN }}
+    trigger-mode: label-once
+    label-gate: ai-review
+```
+
+Full guide: [docs/TRIGGER_MODES.md](docs/TRIGGER_MODES.md).
+
+### Auto-fill missing PR descriptions
+
+Let the reviewer write a first-draft body when the current one is empty or under 50 chars. Guarded by a marker so it never overwrites your edits.
+
+```yaml
+- uses: DailybotHQ/ai-pr-reviewer@v1
+  with:
+    api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+    github-token: ${{ secrets.GITHUB_TOKEN }}
+    pr-description-mode: autocomplete
+```
+
+Full guide: [docs/PR_METADATA_CHECKS.md](docs/PR_METADATA_CHECKS.md).
+
+### AI-driven complexity labels
+
+Apply a `complexity:low/medium/high` label based on cognitive load, files touched, and security surface — not line count:
+
+```yaml
+- uses: DailybotHQ/ai-pr-reviewer@v1
+  with:
+    api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+    github-token: ${{ secrets.GITHUB_TOKEN }}
+    complexity-labels-enabled: true
+```
 
 ### Use a non-default automation account
 

@@ -28,14 +28,26 @@ Environment (set by the composite action's `env:` block; see action.yml):
     AIPRR_GH_TOKEN           GitHub token for PR/review operations.
     AIPRR_MODEL              Model id (empty = provider default).
     AIPRR_PROMPT_FILE        Path to a markdown system prompt (empty =
-                            bundled `prompts/default.md`).
+                            bundled `prompts/default.md`). Fully replaces
+                            the base prompt.
+    AIPRR_PROMPT_EXTENSION_FILE  Path to a markdown file APPENDED to the
+                            base prompt. Layer overrides without copying
+                            the whole default.
     AIPRR_LABEL_GATE         Required label, or empty for no gate.
+    AIPRR_TRIGGER_MODE       `always` | `label-required` | `label-once` |
+                            `label-added-only`. Empty = auto (label-required
+                            when `label-gate` is set, else `always`).
     AIPRR_APPLIED_LABEL      Label to apply on success, or empty.
     AIPRR_COLLAPSE_PREVIOUS  `true`/`false`.
     AIPRR_TRACKING_COMMENT   `true`/`false`.
-    AIPRR_STRICTNESS         `lenient` | `block-on-critical` | `block-on-warning`.
+    AIPRR_STRICTNESS         `lenient` | `block-on-critical` |
+                            `block-on-warning` | `block-on-any`.
     AIPRR_MAX_INLINE_COMMENTS  Integer cap.
     AIPRR_MAX_TURNS          Integer cap.
+    AIPRR_PR_DESCRIPTION_MODE  `off` | `warn` | `block` | `autocomplete`.
+    AIPRR_PR_DESCRIPTION_MIN_LENGTH  Integer threshold for adequacy.
+    AIPRR_COMPLEXITY_LABELS_ENABLED  `true`/`false`.
+    AIPRR_COMPLEXITY_LABEL_PREFIX  Label prefix, e.g. `complexity:`.
     AIPRR_REPO               `owner/name`.
     AIPRR_PR_NUMBER          PR number.
     AIPRR_HEAD_SHA           Commit SHA the review anchors to.
@@ -56,6 +68,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -142,11 +155,54 @@ MAX_TRACKING_ERROR_CHARS: int = 1500
 STRICTNESS_LENIENT: str = "lenient"
 STRICTNESS_BLOCK_CRITICAL: str = "block-on-critical"
 STRICTNESS_BLOCK_WARNING: str = "block-on-warning"
+STRICTNESS_BLOCK_ANY: str = "block-on-any"
 VALID_STRICTNESS: tuple[str, ...] = (
     STRICTNESS_LENIENT,
     STRICTNESS_BLOCK_CRITICAL,
     STRICTNESS_BLOCK_WARNING,
+    STRICTNESS_BLOCK_ANY,
 )
+
+# PR description review modes (v1.2.0+).
+PR_DESC_MODE_OFF: str = "off"
+PR_DESC_MODE_WARN: str = "warn"
+PR_DESC_MODE_BLOCK: str = "block"
+PR_DESC_MODE_AUTOCOMPLETE: str = "autocomplete"
+PR_DESC_MODES: tuple[str, ...] = (
+    PR_DESC_MODE_OFF,
+    PR_DESC_MODE_WARN,
+    PR_DESC_MODE_BLOCK,
+    PR_DESC_MODE_AUTOCOMPLETE,
+)
+PR_DESC_MIN_LENGTH_DEFAULT: int = 50
+PR_DESC_AUTOCOMPLETE_MARKER: str = (
+    "<!-- ai-pr-reviewer-description-autocompleted -->"
+)
+
+# PR complexity labeling (v1.2.0+).
+PR_COMPLEXITY_LOW: str = "low"
+PR_COMPLEXITY_MEDIUM: str = "medium"
+PR_COMPLEXITY_HIGH: str = "high"
+PR_COMPLEXITY_LEVELS: tuple[str, ...] = (
+    PR_COMPLEXITY_LOW,
+    PR_COMPLEXITY_MEDIUM,
+    PR_COMPLEXITY_HIGH,
+)
+PR_COMPLEXITY_LABEL_PREFIX_DEFAULT: str = "complexity:"
+
+# Trigger modes (v1.2.0+).
+TRIGGER_ALWAYS: str = "always"
+TRIGGER_LABEL_REQUIRED: str = "label-required"
+TRIGGER_LABEL_ONCE: str = "label-once"
+TRIGGER_LABEL_ADDED_ONLY: str = "label-added-only"
+TRIGGER_MODES: tuple[str, ...] = (
+    TRIGGER_ALWAYS,
+    TRIGGER_LABEL_REQUIRED,
+    TRIGGER_LABEL_ONCE,
+    TRIGGER_LABEL_ADDED_ONLY,
+)
+TRIGGER_STATE_MARKER_OPEN: str = "<!-- ai-pr-reviewer-state: "
+TRIGGER_STATE_MARKER_CLOSE: str = " -->"
 
 # Severity levels — ordered low→high so `max(SEVERITY_RANK)` yields the most
 # severe finding in a review.
@@ -348,10 +404,83 @@ def gh_graphql(query: str, variables: dict[str, Any], *, token: str) -> Any:
     return payload.get("data", {})
 
 
-def gh_get_authenticated_login(token: str) -> str:
-    """Return the login of the user the token is authenticated as."""
-    me: dict[str, Any] = gh_request("GET", "/user", token=token)
-    return str(me.get("login", ""))
+DEFAULT_WORKFLOW_BOT_LOGIN: str = "github-actions[bot]"
+
+
+def gh_get_authenticated_login(
+    token: str, *, repo: str = "", pr_number: int = 0
+) -> str:
+    """Return the login the token authenticates as, with a 4-tier fallback.
+
+    The naive `GET /user` call fails with `HTTP 403 Forbidden` when the
+    caller is the built-in workflow `GITHUB_TOKEN` (an installation
+    token, not a user token) — the well-known limitation that silently
+    broke `collapse-previous` for every consumer using the recommended
+    `github-token: ${{ secrets.GITHUB_TOKEN }}` pattern.
+
+    The fallback chain, tried in order:
+
+    1. `GET /user` — works for PATs and user OAuth tokens.
+    2. `GET /app` — works for GitHub App installation tokens; returns
+       `<slug>[bot]` (the shape GitHub uses in comment `.user.login`).
+    3. Marker-scan the PR's issue comments for our
+       `<!-- ai-pr-reviewer-marker -->` tracking comment; take that
+       comment's `.user.login`. Works for any bot that previously
+       posted here. Requires `repo` + `pr_number`.
+    4. Hardcoded `"github-actions[bot]"` — the login of the built-in
+       workflow `GITHUB_TOKEN`, which is the overwhelmingly common
+       case in the wild.
+
+    Failing all four tiers still returns tier 4's default, so callers
+    downstream (`gh_collapse_previous_reviews`) get a login they can
+    filter on. Their own error handling covers the case where the
+    token is genuinely invalid.
+    """
+    try:
+        me: dict[str, Any] = gh_request("GET", "/user", token=token)
+        login: str = str(me.get("login", "") or "")
+        if login:
+            return login
+    except Exception as e:  # noqa: BLE001 — best-effort; try next tier
+        log(f"gh_get_authenticated_login: /user tier failed: {e}")
+
+    try:
+        app: dict[str, Any] = gh_request("GET", "/app", token=token)
+        slug: str = str(app.get("slug", "") or "")
+        if slug:
+            return f"{slug}[bot]"
+    except Exception as e:  # noqa: BLE001 — best-effort; try next tier
+        log(f"gh_get_authenticated_login: /app tier failed: {e}")
+
+    if repo and pr_number:
+        try:
+            owner, name = repo.split("/", 1)
+            comments: list[dict[str, Any]] = gh_request(
+                "GET",
+                (
+                    f"/repos/{owner}/{name}/issues/{pr_number}"
+                    "/comments?per_page=100"
+                ),
+                token=token,
+            )
+            if isinstance(comments, list):
+                for comment in reversed(comments):
+                    if not isinstance(comment, dict):
+                        continue
+                    body: str = str(comment.get("body") or "")
+                    if REVIEW_MARKER not in body:
+                        continue
+                    author: str = str(
+                        (comment.get("user") or {}).get("login") or ""
+                    )
+                    if author:
+                        return author
+        except Exception as e:  # noqa: BLE001 — best-effort; fall through
+            log(
+                f"gh_get_authenticated_login: marker-scan tier failed: {e}"
+            )
+
+    return DEFAULT_WORKFLOW_BOT_LOGIN
 
 
 def gh_post_issue_comment(
@@ -437,6 +566,48 @@ def gh_pr_has_label(
     return any((lbl.get("name") or "") == label for lbl in labels)
 
 
+def gh_remove_labels_by_prefix(
+    *,
+    token: str,
+    repo: str,
+    pr_number: int,
+    prefix: str,
+    except_label: str = "",
+) -> int:
+    """Remove all PR labels starting with `prefix`, except `except_label`.
+
+    Returns the number of labels removed. Best-effort — callers wrap in
+    try/except so label bookkeeping failures do not crash the review.
+    """
+    if not prefix:
+        return 0
+    owner, name = repo.split("/", 1)
+    pr: dict[str, Any] = gh_request(
+        "GET", f"/repos/{owner}/{name}/pulls/{pr_number}", token=token
+    )
+    labels: list[dict[str, Any]] = pr.get("labels", []) or []
+    removed: int = 0
+    for lbl in labels:
+        lbl_name: str = (lbl.get("name") or "").strip()
+        if not lbl_name.startswith(prefix):
+            continue
+        if except_label and lbl_name == except_label:
+            continue
+        try:
+            gh_request(
+                "DELETE",
+                (
+                    f"/repos/{owner}/{name}/issues/{pr_number}/labels/"
+                    f"{urllib.parse.quote(lbl_name)}"
+                ),
+                token=token,
+            )
+            removed += 1
+        except Exception as e:  # noqa: BLE001 — best-effort GH API call
+            log(f"Could not remove label {lbl_name!r}: {e}")
+    return removed
+
+
 def gh_collapse_previous_reviews(
     *, token: str, repo: str, pr_number: int, bot_login: str
 ) -> int:
@@ -491,15 +662,29 @@ def gh_collapse_previous_reviews(
         pr.get("reviews", {}) or {}
     ).get("nodes", []) or []
 
+    # GraphQL and REST disagree on the shape of a Bot's login. REST
+    # `.user.login` returns `"github-actions[bot]"` (the shape the
+    # /user endpoint, comment payloads, and our marker-scan tier all
+    # use), but GraphQL `.author.login` on a Bot node returns
+    # `"github-actions"` — no `[bot]` suffix. Comparing directly missed
+    # every bot node and silently reported "Collapsed 0/N". Accept
+    # both shapes so the filter matches regardless of where
+    # `bot_login` came from.
+    accepted_logins: set[str] = {bot_login}
+    if bot_login.endswith("[bot]"):
+        accepted_logins.add(bot_login[: -len("[bot]")])
+
+    def _matches(author_login: str) -> bool:
+        return author_login in accepted_logins
+
     targets: list[str] = []
     for c in issue_comments:
-        if (
-            (c.get("author") or {}).get("login") == bot_login
-            and not c.get("isMinimized", False)
-        ):
+        author_login: str = str((c.get("author") or {}).get("login") or "")
+        if _matches(author_login) and not c.get("isMinimized", False):
             targets.append(c["id"])
     for r in reviews:
-        if (r.get("author") or {}).get("login") == bot_login:
+        author_login = str((r.get("author") or {}).get("login") or "")
+        if _matches(author_login):
             if not r.get("isMinimized", False):
                 targets.append(r["id"])
             inline: list[dict[str, Any]] = (
@@ -814,6 +999,7 @@ def _invoke_cli_agent(
     findings_path: Path,
     env: dict[str, str],
     cli_name: str,
+    stdin_input: str | None = None,
 ) -> ReviewResult:
     """Run a CLI agent subprocess and parse its findings.json output.
 
@@ -822,6 +1008,10 @@ def _invoke_cli_agent(
       - Hard timeout via CLI_INVOCATION_TIMEOUT.
       - Structured error on non-zero exit with truncated stderr.
       - Delegation to parse_findings_file() for output validation.
+
+    `stdin_input`, when provided, is piped to the subprocess' stdin. Providers
+    that hit the OS ARG_MAX limit (Linux E2BIG on argv > ~128 KB) pass their
+    large prompt this way instead of via a positional CLI argument.
     """
     log(f"Invoking {cli_name}: {' '.join(shlex.quote(a) for a in argv[:2])} …")
     try:
@@ -833,6 +1023,7 @@ def _invoke_cli_agent(
             check=False,
             capture_output=True,
             text=True,
+            input=stdin_input,
         )
     except subprocess.TimeoutExpired as e:
         raise RuntimeError(
@@ -943,12 +1134,24 @@ class ClaudeCodeProvider(AgentRunnerProvider):
 class CursorProvider(AgentRunnerProvider):
     """Cursor Agent CLI (headless, local runtime) as an agent-runner provider.
 
-    Auth: `CURSOR_API_KEY` env var (from the consumer's `api-key` input).
+    Auth: `CURSOR_API_KEY` env var (from the consumer's `api-key` input). The
+    key must belong to a Cursor Pro/Pro+/Ultra subscription — usage credits
+    are debited from that subscription (there is no BYOK). Consumers on the
+    Pro plan can select `model: auto` to route through Cursor's dispatch
+    layer and avoid burning monthly credits on premium models.
+
     CLI: `cursor-agent` — installed via `curl -fsSL https://cursor.com/install
     | bash` by the composite step.
 
-    Local runtime only for v1.1.0 (no `/v1/agents` cloud REST path). The CLI
-    operates against `workspace` directly.
+    Headless defaults (v1.2.0+): the invocation always passes `--force` and
+    `--trust`, which are what Cursor's own headless CLI docs recommend for
+    CI (they prevent interactive approval prompts that would otherwise stall
+    the run). When `mcp_config_file` is set, `--approve-mcps` is added so
+    the MCP approval prompt is also non-interactive. Consumers can still
+    override any of this via `agent-extra-args`.
+
+    Local runtime only for v1.1.0+ (no `/v1/agents` cloud REST path). The
+    CLI operates against `workspace` directly.
     """
 
     CLI_NAME: str = "Cursor Agent"
@@ -1003,15 +1206,28 @@ class CursorProvider(AgentRunnerProvider):
             self.mcp_config_file, self.MCP_DEST
         )
         try:
+            # Cursor CLI reads the prompt from stdin when `-p` is passed
+            # without a positional argument. This avoids the E2BIG kernel
+            # limit (~128 KB on Linux) which the argv path hits on large
+            # PRs where the diff alone can exceed 200 KB.
             argv: list[str] = [
                 self.CLI_BIN,
                 "-p",
-                user_prompt,
                 "--output-format",
                 "text",
+                # Headless-CI defaults per Cursor's own documentation:
+                # `--force` skips interactive tool approvals, `--trust` marks
+                # the workspace as trusted for the run. Without these the
+                # CLI can stall on approval prompts.
+                "--force",
+                "--trust",
             ]
             if self.model:
                 argv += ["--model", self.model]
+            if self.mcp_config_file:
+                # Only relevant when an MCP config was injected; suppresses
+                # the interactive "approve this MCP server" prompt.
+                argv.append("--approve-mcps")
             if self.extra_args:
                 argv += shlex.split(self.extra_args)
 
@@ -1024,6 +1240,7 @@ class CursorProvider(AgentRunnerProvider):
                 findings_path=findings_path,
                 env=env,
                 cli_name=self.CLI_NAME,
+                stdin_input=user_prompt,
             )
         finally:
             _restore_mcp_config(mcp_dest, mcp_backup)
@@ -1319,9 +1536,20 @@ def render_user_prompt(ctx: PRContext) -> str:
 # ---------------------------------------------------------------------------
 
 
-def tools_schema(max_inline_comments: int) -> list[dict[str, Any]]:
-    """JSONSchema for every tool the model can call."""
-    return [
+def tools_schema(
+    max_inline_comments: int,
+    *,
+    allow_set_pr_description: bool = False,
+    allow_set_pr_complexity: bool = False,
+) -> list[dict[str, Any]]:
+    """JSONSchema for every tool the model can call.
+
+    `set_pr_description` is exposed only when `allow_set_pr_description`
+    is True (i.e. `pr-description-mode: autocomplete`). Similarly for
+    `set_pr_complexity` and the complexity-labeling feature. The base
+    five tools are always present.
+    """
+    base: list[dict[str, Any]] = [
         {
             "name": "read_file",
             "description": (
@@ -1474,6 +1702,69 @@ def tools_schema(max_inline_comments: int) -> list[dict[str, Any]]:
             },
         },
     ]
+    if allow_set_pr_description:
+        base.append(
+            {
+                "name": "set_pr_description",
+                "description": (
+                    "Set the PR body to a new markdown value. Call this "
+                    "AT MOST ONCE, only when the current PR body is missing "
+                    "or too vague. Do NOT call it if the current body "
+                    f"already carries the `{PR_DESC_AUTOCOMPLETE_MARKER}` "
+                    "marker (that means a previous run already wrote it). "
+                    "Do NOT include environment variables, tokens, or "
+                    "secrets in the body."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "body": {
+                            "type": "string",
+                            "description": (
+                                "New markdown for the PR body. Should NOT "
+                                "include the autocomplete marker — the "
+                                "action appends it automatically."
+                            ),
+                        }
+                    },
+                    "required": ["body"],
+                },
+            }
+        )
+    if allow_set_pr_complexity:
+        base.append(
+            {
+                "name": "set_pr_complexity",
+                "description": (
+                    "Assess and record the PR's overall complexity. Call "
+                    "this AT MOST ONCE, near the end of the review. The "
+                    "value drives a `complexity:*` label on the PR. Assess "
+                    "based on total change (files touched, cognitive load, "
+                    "cross-cutting concerns, security surface, test "
+                    "coverage delta) — NOT line count."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "level": {
+                            "type": "string",
+                            "enum": list(PR_COMPLEXITY_LEVELS),
+                            "description": (
+                                "`low` = self-contained, easy to review "
+                                "(e.g. typo fix, doc, isolated helper). "
+                                "`medium` = one subsystem, moderate "
+                                "cognitive load. `high` = multiple "
+                                "subsystems, security-adjacent code, "
+                                "novel abstraction, or requires "
+                                "cross-team review."
+                            ),
+                        }
+                    },
+                    "required": ["level"],
+                },
+            }
+        )
+    return base
 
 
 # ---------------------------------------------------------------------------
@@ -1489,6 +1780,13 @@ class ReviewState:
     severities: list[str] = field(default_factory=list)
     final_summary: str | None = None
     max_inline_comments: int = DEFAULT_MAX_INLINE_COMMENTS
+    # Populated by `set_pr_description` tool (only in `autocomplete` mode).
+    # None = model did not propose a description. `""` is treated identically
+    # to None so an accidental empty-string tool call is a no-op.
+    proposed_pr_description: str | None = None
+    # Populated by `set_pr_complexity` tool (only when complexity labeling
+    # is enabled). Values: `low`, `medium`, `high`. None = not proposed.
+    proposed_pr_complexity: str | None = None
 
 
 def safe_repo_path(rel: str) -> Path:
@@ -1628,6 +1926,56 @@ def tool_submit_review(args: dict[str, Any], state: ReviewState) -> str:
     )
 
 
+def tool_set_pr_description(
+    args: dict[str, Any], state: ReviewState
+) -> str:
+    """Record a proposed PR body. The actual PATCH happens in `main()`
+    after the loop terminates, so the whole lifecycle stays atomic and
+    the marker check can inspect the final resolved body.
+    """
+    body: str = args.get("body", "")
+    if not isinstance(body, str) or not body.strip():
+        return (
+            "Error: `body` must be a non-empty string. Skipped — the "
+            "current PR body will be left unchanged."
+        )
+    if state.proposed_pr_description is not None:
+        return (
+            "Error: set_pr_description was already called this session. "
+            "The first proposal is retained; do not call it again."
+        )
+    state.proposed_pr_description = body
+    return (
+        "PR description proposal recorded. The action will PATCH the PR "
+        "body after this run if the current body is missing/vague and "
+        "does not already carry the autocomplete marker."
+    )
+
+
+def tool_set_pr_complexity(
+    args: dict[str, Any], state: ReviewState
+) -> str:
+    """Record an AI-assessed complexity level. The actual label
+    application happens in `main()` after the loop terminates.
+    """
+    level: str = str(args.get("level", "")).strip().lower()
+    if level not in PR_COMPLEXITY_LEVELS:
+        return (
+            f"Error: `level` must be one of {list(PR_COMPLEXITY_LEVELS)}. "
+            f"Got: {level!r}. Skipped."
+        )
+    if state.proposed_pr_complexity is not None:
+        return (
+            "Error: set_pr_complexity was already called this session. "
+            "The first assessment is retained; do not call it again."
+        )
+    state.proposed_pr_complexity = level
+    return (
+        f"PR complexity `{level}` recorded. The action will apply the "
+        "corresponding label after this run."
+    )
+
+
 def execute_tool(name: str, args: dict[str, Any], state: ReviewState) -> str:
     """Dispatch a tool call to its handler and return a tool_result string."""
     try:
@@ -1641,9 +1989,419 @@ def execute_tool(name: str, args: dict[str, Any], state: ReviewState) -> str:
             return tool_post_inline_comment(args, state)
         if name == "submit_review":
             return tool_submit_review(args, state)
+        if name == "set_pr_description":
+            return tool_set_pr_description(args, state)
+        if name == "set_pr_complexity":
+            return tool_set_pr_complexity(args, state)
         return f"Error: unknown tool `{name}`"
     except Exception as e:  # noqa: BLE001 — surface to model rather than crash
         return f"Tool `{name}` raised {type(e).__name__}: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Trigger modes (v1.2.0+): decide whether to run based on webhook event
+# + label state + prior-run marker generation.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TriggerDecision:
+    """Result of `resolve_trigger_action()`."""
+
+    should_run: bool
+    reason: str  # log line + optional tracking-comment note
+
+
+COUNT_LABEL_EVENTS_MAX_PAGES: int = 20
+
+
+def count_label_events(
+    *, token: str, repo: str, pr_number: int, label: str
+) -> int:
+    """Return the number of times `label` was applied to the PR.
+
+    Uses `/issues/{n}/timeline`, filtered on `labeled` events with the
+    matching label name. Best-effort: any error returns the count
+    accumulated so far (possibly 0) — callers use the "was the label
+    present at all?" signal to decide whether that 0 is meaningful.
+
+    Pagination is capped at `COUNT_LABEL_EVENTS_MAX_PAGES` (~2000
+    timeline events) to bound cost on long-lived, high-chatter PRs.
+    When the cap is hit a `WARNING:` is logged; `label-once` may
+    undercount the generation on such PRs, in which case toggling the
+    label twice or switching to `label-added-only` are the documented
+    workarounds (see docs/TRIGGER_MODES.md § "Edge cases").
+    """
+    if not label:
+        return 0
+    owner, name = repo.split("/", 1)
+    count: int = 0
+    page: int = 1
+    while True:
+        try:
+            events: list[dict[str, Any]] = gh_request(
+                "GET",
+                (
+                    f"/repos/{owner}/{name}/issues/{pr_number}/timeline"
+                    f"?per_page=100&page={page}"
+                ),
+                token=token,
+            )
+        except Exception as e:  # noqa: BLE001 — best-effort GH API call
+            log(f"count_label_events: could not read timeline page {page}: {e}")
+            return count
+        if not isinstance(events, list) or not events:
+            break
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            if ev.get("event") != "labeled":
+                continue
+            lbl_field: dict[str, Any] = ev.get("label") or {}
+            if (lbl_field.get("name") or "") == label:
+                count += 1
+        if len(events) < 100:
+            break
+        page += 1
+        if page > COUNT_LABEL_EVENTS_MAX_PAGES:
+            log(
+                f"WARNING: count_label_events hit the "
+                f"{COUNT_LABEL_EVENTS_MAX_PAGES}-page pagination cap for "
+                f"label {label!r} on PR #{pr_number}. `label-once` "
+                f"generation may be undercounted; if a re-review does not "
+                f"fire, toggle {label!r} off/on twice or switch to "
+                f"`trigger-mode: label-added-only`."
+            )
+            break
+    return count
+
+
+def read_trigger_state(tracking_comment_body: str) -> dict[str, Any]:
+    """Parse the ai-pr-reviewer-state HTML comment, or `{}` if absent."""
+    if not tracking_comment_body:
+        return {}
+    body: str = tracking_comment_body
+    open_at: int = body.find(TRIGGER_STATE_MARKER_OPEN)
+    if open_at < 0:
+        return {}
+    close_at: int = body.find(
+        TRIGGER_STATE_MARKER_CLOSE, open_at + len(TRIGGER_STATE_MARKER_OPEN)
+    )
+    if close_at < 0:
+        return {}
+    raw: str = body[
+        open_at + len(TRIGGER_STATE_MARKER_OPEN) : close_at
+    ].strip()
+    try:
+        parsed: Any = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return parsed
+
+
+def write_trigger_state(body: str, state: dict[str, Any]) -> str:
+    """Emit `body` with the ai-pr-reviewer-state marker inserted/updated.
+
+    The state block sits on a line by itself just after the runtime's
+    canonical `<!-- ai-pr-reviewer-marker -->` marker (or at the top if
+    that marker is absent). Round-trips cleanly through `read_trigger_state`.
+    """
+    payload: str = (
+        TRIGGER_STATE_MARKER_OPEN + json.dumps(state, sort_keys=True)
+        + TRIGGER_STATE_MARKER_CLOSE
+    )
+    # Strip any pre-existing state block to keep the body idempotent.
+    prior_open: int = body.find(TRIGGER_STATE_MARKER_OPEN)
+    if prior_open >= 0:
+        prior_close: int = body.find(
+            TRIGGER_STATE_MARKER_CLOSE,
+            prior_open + len(TRIGGER_STATE_MARKER_OPEN),
+        )
+        if prior_close >= 0:
+            body = (
+                body[:prior_open]
+                + body[prior_close + len(TRIGGER_STATE_MARKER_CLOSE) :]
+            )
+            body = body.lstrip("\n")
+    canonical_marker: str = "<!-- ai-pr-reviewer-marker -->"
+    marker_at: int = body.find(canonical_marker)
+    if marker_at < 0:
+        return payload + "\n" + body
+    insert_at: int = marker_at + len(canonical_marker)
+    return body[:insert_at] + "\n" + payload + body[insert_at:]
+
+
+def _read_github_event_payload() -> dict[str, Any]:
+    """Return the current GitHub event payload as a dict, or `{}`.
+
+    Reads `GITHUB_EVENT_PATH` — a JSON file provided by the runner for
+    every workflow event. Best-effort: parsing errors return `{}` so
+    the trigger resolver treats the event as generic.
+    """
+    path: str = os.environ.get("GITHUB_EVENT_PATH", "")
+    if not path:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            payload: Any = json.load(fh)
+    except (OSError, json.JSONDecodeError) as e:
+        log(f"Could not read GITHUB_EVENT_PATH ({path!r}): {e}")
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return payload
+
+
+def _read_github_event_action() -> str:
+    """Return the `action` field of the current GitHub event, or `""`."""
+    payload = _read_github_event_payload()
+    return str(payload.get("action", "") or "")
+
+
+def _read_github_event_label() -> str:
+    """Return the `label.name` field of the current event, or `""`.
+
+    Only meaningful for `labeled` / `unlabeled` webhook events, where
+    GitHub attaches the specific label that triggered the event to the
+    payload. Any other event returns `""`. Used by
+    `label-added-only` to reject webhooks fired by unrelated labels.
+    """
+    payload = _read_github_event_payload()
+    label = payload.get("label")
+    if not isinstance(label, dict):
+        return ""
+    return str(label.get("name", "") or "")
+
+
+def _read_existing_tracking_state(
+    *, token: str, repo: str, pr_number: int
+) -> dict[str, Any]:
+    """Fetch prior ai-pr-reviewer tracking-comment state, or `{}`.
+
+    Looks for an issue comment carrying the canonical
+    `<!-- ai-pr-reviewer-marker -->` marker. Returns the parsed state
+    JSON from the same body, or `{}` when no prior comment exists.
+    """
+    owner, name = repo.split("/", 1)
+    try:
+        comments: list[dict[str, Any]] = gh_request(
+            "GET",
+            f"/repos/{owner}/{name}/issues/{pr_number}/comments?per_page=100",
+            token=token,
+        )
+    except Exception as e:  # noqa: BLE001 — best-effort GH API call
+        log(f"Could not list issue comments for trigger state: {e}")
+        return {}
+    if not isinstance(comments, list):
+        return {}
+    marker: str = "<!-- ai-pr-reviewer-marker -->"
+    # Iterate in reverse — the most recent tracking comment wins.
+    for comment in reversed(comments):
+        if not isinstance(comment, dict):
+            continue
+        body: str = str(comment.get("body") or "")
+        if marker not in body:
+            continue
+        return read_trigger_state(body)
+    return {}
+
+
+def resolve_trigger_action(
+    *,
+    trigger_mode: str,
+    event_action: str,
+    label_gate: str,
+    current_labels: list[str],
+    label_toggle_generation: int,
+    last_reviewed_generation: int,
+    event_label: str = "",
+) -> TriggerDecision:
+    """Decide whether to run the review for the current event.
+
+    `event_label` is the specific label attached to `labeled`/`unlabeled`
+    webhook payloads (from `event.label.name`). It's used by
+    `label-added-only` to distinguish "this label was just added" from
+    "some unrelated label was just added while `label_gate` was already
+    present."
+
+    See docs/TRIGGER_MODES.md for the full semantics per mode.
+    """
+    if trigger_mode == TRIGGER_ALWAYS:
+        return TriggerDecision(True, "trigger-mode=always")
+
+    if not label_gate:
+        return TriggerDecision(
+            True,
+            f"trigger-mode={trigger_mode} requires label-gate; "
+            "no label-gate set → treating as always.",
+        )
+
+    label_present: bool = label_gate in current_labels
+
+    if trigger_mode == TRIGGER_LABEL_REQUIRED:
+        if not label_present:
+            return TriggerDecision(
+                False, f"label {label_gate!r} not present"
+            )
+        return TriggerDecision(True, f"label {label_gate!r} present")
+
+    if trigger_mode == TRIGGER_LABEL_ONCE:
+        if not label_present:
+            return TriggerDecision(
+                False, f"label {label_gate!r} not present"
+            )
+        # Only skip on a stale generation if we actually counted at least
+        # one `labeled` event. Otherwise `count_label_events()` returned 0
+        # (transient API error, permissions issue, or empty timeline) —
+        # skipping would silently mask "the label is present but we can't
+        # tell how many times it's been applied." Better to run than to
+        # deliver nothing. Regression for PR #9 self-review comment #4.
+        if (
+            label_toggle_generation > 0
+            and label_toggle_generation <= last_reviewed_generation
+        ):
+            return TriggerDecision(
+                False,
+                (
+                    f"already reviewed label generation "
+                    f"{last_reviewed_generation} — toggle "
+                    f"{label_gate!r} off/on to re-run"
+                ),
+            )
+        return TriggerDecision(
+            True,
+            (
+                f"new label generation ({label_toggle_generation} "
+                f"vs. last reviewed {last_reviewed_generation})"
+            ),
+        )
+
+    if trigger_mode == TRIGGER_LABEL_ADDED_ONLY:
+        if event_action != "labeled":
+            return TriggerDecision(
+                False,
+                (
+                    f"event action {event_action!r} is not 'labeled' — "
+                    "workflow must subscribe with `types: [labeled]`"
+                ),
+            )
+        if not label_present:
+            return TriggerDecision(
+                False, f"label {label_gate!r} not present"
+            )
+        # `labeled` fires for ANY label — reject when it's not our gate.
+        # Without this, adding an unrelated label (e.g. `bug`) triggers
+        # a full review as long as `label_gate` was already present.
+        if event_label and event_label != label_gate:
+            return TriggerDecision(
+                False,
+                (
+                    f"labeled event was for {event_label!r}, "
+                    f"not {label_gate!r}"
+                ),
+            )
+        return TriggerDecision(True, "labeled event fired")
+
+    return TriggerDecision(
+        False, f"unknown trigger-mode {trigger_mode!r} — no action taken"
+    )
+
+
+# ---------------------------------------------------------------------------
+# PR metadata checks (v1.2.0+): description review + complexity labeling.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DescriptionVerdict:
+    """Result of `evaluate_pr_description()`."""
+
+    is_adequate: bool
+    reason: str  # empty when adequate, otherwise a short human-readable reason
+
+
+def build_agent_runner_noop_warning(
+    *,
+    provider_id: str,
+    is_agent_runner: bool,
+    pr_desc_mode: str,
+    complexity_labels_enabled: bool,
+) -> str:
+    """Return the WARNING log line for v1.2 features that silently no-op
+    on agent-runner providers, or `""` if none apply.
+
+    Extracted from `main()` for unit-testability. `set_pr_description` and
+    `set_pr_complexity` are exposed via `tools_schema()` only on the
+    chat-completions path, so `pr-description-mode=autocomplete` and
+    `complexity-labels-enabled=true` never populate their `state.proposed_*`
+    fields on agent-runner providers → the post-loop PATCH/label blocks
+    silently no-op. See docs/PR_METADATA_CHECKS.md § "Provider support
+    matrix".
+    """
+    if not is_agent_runner:
+        return ""
+    skips: list[str] = []
+    if pr_desc_mode == PR_DESC_MODE_AUTOCOMPLETE:
+        skips.append("pr-description-mode=autocomplete")
+    if complexity_labels_enabled:
+        skips.append("complexity-labels-enabled=true")
+    if not skips:
+        return ""
+    return (
+        "WARNING: "
+        + ", ".join(skips)
+        + f" requested but provider={provider_id!r} is an "
+        "agent-runner CLI. These features are chat-completions-only "
+        "in v1.2 and will silently no-op. See "
+        "docs/PR_METADATA_CHECKS.md § 'Provider support matrix'."
+    )
+
+
+def evaluate_pr_description(
+    body: str, *, min_length: int
+) -> DescriptionVerdict:
+    """Cheap heuristic — 'missing' if body is empty/whitespace after strip,
+    'vague' if under `min_length` after stripping the autocomplete marker.
+
+    The heuristic is intentionally simple; a smart LLM check would burn
+    tokens on trivia. The maintainer decides the minimum length; the
+    action just enforces it.
+    """
+    stripped: str = (
+        (body or "").replace(PR_DESC_AUTOCOMPLETE_MARKER, "").strip()
+    )
+    if not stripped:
+        return DescriptionVerdict(
+            is_adequate=False, reason="PR description is empty."
+        )
+    if len(stripped) < min_length:
+        return DescriptionVerdict(
+            is_adequate=False,
+            reason=(
+                f"PR description is too short ({len(stripped)} chars); "
+                f"minimum is {min_length}."
+            ),
+        )
+    return DescriptionVerdict(is_adequate=True, reason="")
+
+
+def gh_patch_pr_body(
+    *, token: str, repo: str, pr_number: int, new_body: str
+) -> None:
+    """PATCH the PR body via the GitHub REST API.
+
+    Raises on non-2xx. Callers are expected to wrap this in try/except
+    so PR-description autocomplete failures do not crash the review.
+    """
+    owner, name = repo.split("/", 1)
+    gh_request(
+        "PATCH",
+        f"/repos/{owner}/{name}/pulls/{pr_number}",
+        token=token,
+        body={"body": new_body},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1872,6 +2630,20 @@ def findings_to_gh_inline_comments(
     return out
 
 
+def compose_system_prompt(base: str, extension: str) -> str:
+    """Compose the effective system prompt from a base + optional extension.
+
+    - `extension` empty → returns `base` unchanged.
+    - `extension` non-empty → returns `base.rstrip() + "\\n\\n---\\n\\n" +
+      extension.lstrip()`. The `---` separator gives the model an
+      unambiguous boundary between the base prompt and the consumer's
+      overrides so overrides can safely contradict the base.
+    """
+    if not extension:
+        return base
+    return base.rstrip() + "\n\n---\n\n" + extension.lstrip()
+
+
 def evaluate_strictness(
     severity: str, strictness: str
 ) -> tuple[bool, str]:
@@ -1897,6 +2669,14 @@ def evaluate_strictness(
                 f"found `{severity}` severity — block-on-warning fired"
             )
         return False, f"highest severity `{severity}` ≤ warning threshold"
+    if strictness == STRICTNESS_BLOCK_ANY:
+        # Zero-tolerance: blocks on any finding, including `info`. The gate
+        # fires whenever a comment was posted (i.e. severity is not `none`).
+        if severity != SEVERITY_NONE:
+            return True, (
+                f"found `{severity}` severity — block-on-any fired"
+            )
+        return False, "no findings — block-on-any passes"
     return False, "unhandled strictness branch"
 
 
@@ -2083,6 +2863,9 @@ def main() -> int:
         return 1
 
     prompt_file: str = os.environ.get("AIPRR_PROMPT_FILE", "").strip()
+    prompt_extension_file: str = os.environ.get(
+        "AIPRR_PROMPT_EXTENSION_FILE", ""
+    ).strip()
     label_gate: str = os.environ.get("AIPRR_LABEL_GATE", "").strip()
     applied_label: str = os.environ.get("AIPRR_APPLIED_LABEL", "").strip()
     collapse_previous: bool = parse_bool(
@@ -2104,38 +2887,143 @@ def main() -> int:
         or DEFAULT_MAX_TURNS
     )
 
+    # PR description review (v1.2.0+)
+    pr_desc_mode: str = (
+        os.environ.get(
+            "AIPRR_PR_DESCRIPTION_MODE", PR_DESC_MODE_OFF
+        ).strip()
+        or PR_DESC_MODE_OFF
+    )
+    if pr_desc_mode not in PR_DESC_MODES:
+        log(
+            f"Unknown pr-description-mode {pr_desc_mode!r} — falling back "
+            f"to {PR_DESC_MODE_OFF}"
+        )
+        pr_desc_mode = PR_DESC_MODE_OFF
+    pr_desc_min_length: int = int(
+        os.environ.get(
+            "AIPRR_PR_DESCRIPTION_MIN_LENGTH",
+            str(PR_DESC_MIN_LENGTH_DEFAULT),
+        )
+        or PR_DESC_MIN_LENGTH_DEFAULT
+    )
+
+    # PR complexity labeling (v1.2.0+)
+    complexity_labels_enabled: bool = parse_bool(
+        os.environ.get("AIPRR_COMPLEXITY_LABELS_ENABLED", "false"),
+        default=False,
+    )
+    complexity_label_prefix: str = (
+        os.environ.get(
+            "AIPRR_COMPLEXITY_LABEL_PREFIX",
+            PR_COMPLEXITY_LABEL_PREFIX_DEFAULT,
+        ).strip()
+        or PR_COMPLEXITY_LABEL_PREFIX_DEFAULT
+    )
+
+    # Trigger-mode resolution (v1.2.0+). Empty default falls back to
+    # `always` (or `label-required` when `label-gate` is set) for full
+    # back-compat with v1.1 workflows.
+    trigger_mode_raw: str = (
+        os.environ.get("AIPRR_TRIGGER_MODE", "").strip()
+    )
+    if trigger_mode_raw:
+        trigger_mode: str = trigger_mode_raw
+        if trigger_mode not in TRIGGER_MODES:
+            log(
+                f"Unknown trigger-mode {trigger_mode!r} — falling back to "
+                f"{TRIGGER_ALWAYS}"
+            )
+            trigger_mode = TRIGGER_ALWAYS
+    else:
+        trigger_mode = (
+            TRIGGER_LABEL_REQUIRED if label_gate else TRIGGER_ALWAYS
+        )
+
+    event_action: str = _read_github_event_action()
+    event_label: str = _read_github_event_label()
+
     log(
         f"Reviewing {repo}#{pr_number} @ {head_sha[:7]} with "
-        f"{provider_id}/{model} (strictness={strictness})"
+        f"{provider_id}/{model} (strictness={strictness}, "
+        f"trigger-mode={trigger_mode})"
     )
 
     # ------------------------------------------------------------------
-    # Label gate — exit early if missing the required label
+    # Trigger evaluation (v1.2.0+) — subsumes the v1.x `label-gate` block
     # ------------------------------------------------------------------
-    if label_gate:
+    label_toggle_generation: int = 0
+    last_reviewed_generation: int = 0
+    if trigger_mode in (TRIGGER_LABEL_REQUIRED, TRIGGER_LABEL_ONCE):
         try:
-            present: bool = gh_pr_has_label(
+            label_toggle_generation = count_label_events(
                 token=gh_token,
                 repo=repo,
                 pr_number=pr_number,
                 label=label_gate,
             )
-        except Exception as e:  # noqa: BLE001
-            log(f"Could not read PR labels for gate check: {e}")
-            present = False
-        if not present:
-            log(
-                f"Label gate: PR does not carry {label_gate!r} — skipping review."
+        except Exception as e:  # noqa: BLE001 — best-effort GH API call
+            log(f"Could not count label events (assuming 0): {e}")
+
+    if trigger_mode == TRIGGER_LABEL_ONCE:
+        prior_state: dict[str, Any] = _read_existing_tracking_state(
+            token=gh_token, repo=repo, pr_number=pr_number
+        )
+        try:
+            last_reviewed_generation = int(
+                prior_state.get("label_toggle_generation", 0) or 0
             )
-            write_all_outputs(skipped=True)
-            return 0
+        except (TypeError, ValueError):
+            last_reviewed_generation = 0
+
+    try:
+        current_labels_raw: list[dict[str, Any]] = (
+            gh_request(
+                "GET",
+                f"/repos/{repo.split('/')[0]}/{repo.split('/')[1]}"
+                f"/pulls/{pr_number}",
+                token=gh_token,
+            )
+            .get("labels", [])
+            or []
+        )
+        current_labels: list[str] = [
+            (lbl.get("name") or "") for lbl in current_labels_raw
+        ]
+    except Exception as e:  # noqa: BLE001 — best-effort GH API call
+        log(f"Could not read PR labels for trigger check: {e}")
+        current_labels = []
+
+    trigger_decision: TriggerDecision = resolve_trigger_action(
+        trigger_mode=trigger_mode,
+        event_action=event_action,
+        event_label=event_label,
+        label_gate=label_gate,
+        current_labels=current_labels,
+        label_toggle_generation=label_toggle_generation,
+        last_reviewed_generation=last_reviewed_generation,
+    )
+    log(
+        f"Trigger decision: should_run={trigger_decision.should_run} "
+        f"({trigger_decision.reason})"
+    )
+    if not trigger_decision.should_run:
+        write_all_outputs(skipped=True)
+        return 0
 
     # ------------------------------------------------------------------
     # Collapse previous bot reviews/comments as outdated
     # ------------------------------------------------------------------
     if collapse_previous:
         try:
-            bot_login: str = gh_get_authenticated_login(gh_token)
+            # v1.2.0+: pass repo + pr_number so the fallback chain in
+            # `gh_get_authenticated_login` can marker-scan for the prior
+            # bot's login when the built-in `GITHUB_TOKEN` refuses
+            # `/user` (the fix for the silent 403 that broke this
+            # feature for every workflow-token consumer).
+            bot_login: str = gh_get_authenticated_login(
+                gh_token, repo=repo, pr_number=pr_number
+            )
             log(f"Authenticated as: {bot_login}")
             gh_collapse_previous_reviews(
                 token=gh_token,
@@ -2168,14 +3056,21 @@ def main() -> int:
     # ------------------------------------------------------------------
     # Resolve and read system prompt
     # ------------------------------------------------------------------
+    # Composition matrix:
+    #   1) neither set              → bundled default
+    #   2) prompt_file only         → prompt_file replaces default
+    #   3) prompt_extension only    → default + "\n\n---\n\n" + extension
+    #   4) both set                 → prompt_file + "\n\n---\n\n" + extension
+    # The `---` separator gives the model an unambiguous boundary between
+    # the base prompt and the consumer's overrides.
     resolved_prompt_path: Path
     if prompt_file:
         resolved_prompt_path = Path(prompt_file)
     else:
         resolved_prompt_path = Path(action_path) / "prompts" / "default.md"
     try:
-        system_prompt: str = resolved_prompt_path.read_text(encoding="utf-8")
-        log(f"Prompt loaded from {resolved_prompt_path}")
+        base_prompt: str = resolved_prompt_path.read_text(encoding="utf-8")
+        log(f"Base prompt loaded from {resolved_prompt_path}")
     except OSError as e:
         log(f"Failed to read prompt file {resolved_prompt_path!r}: {e}")
         gh_update_issue_comment(
@@ -2190,6 +3085,30 @@ def main() -> int:
         write_all_outputs(skipped=False)
         return 1
 
+    extension_text: str = ""
+    if prompt_extension_file:
+        extension_path: Path = Path(prompt_extension_file)
+        try:
+            extension_text = extension_path.read_text(encoding="utf-8")
+            log(f"Prompt extension appended from {extension_path}")
+        except OSError as e:
+            log(
+                f"Failed to read prompt extension file "
+                f"{extension_path!r}: {e}"
+            )
+            gh_update_issue_comment(
+                token=gh_token,
+                repo=repo,
+                comment_id=tracking_id,
+                body=render_tracking_body_failed(
+                    head_sha=head_sha,
+                    error=f"Could not read prompt extension file: {e}",
+                ),
+            )
+            write_all_outputs(skipped=False)
+            return 1
+    system_prompt: str = compose_system_prompt(base_prompt, extension_text)
+
     # ------------------------------------------------------------------
     # Fetch PR + run agentic loop, all wrapped so failures hit the spinner
     # ------------------------------------------------------------------
@@ -2203,9 +3122,40 @@ def main() -> int:
             f"{len(pr_ctx.changed_files)} files"
         )
 
+        # PR description verdict (only computed when the mode is not `off`,
+        # to keep the log clean when the feature is disabled).
+        description_verdict: DescriptionVerdict = DescriptionVerdict(
+            is_adequate=True, reason=""
+        )
+        if pr_desc_mode != PR_DESC_MODE_OFF:
+            description_verdict = evaluate_pr_description(
+                pr_ctx.body, min_length=pr_desc_min_length
+            )
+            log(
+                f"PR description: mode={pr_desc_mode}, "
+                f"adequate={description_verdict.is_adequate}"
+            )
+
         provider: Provider | AgentRunnerProvider = build_provider(
             provider_id, api_key=api_key, model=model
         )
+
+        # v1.2.0 dispatch caveat: the `set_pr_description` and
+        # `set_pr_complexity` tools are only exposed on the chat-completions
+        # path (they piggyback on the built-in tool-use loop). On agent-
+        # runner providers, `state.proposed_*` stays empty and the post-loop
+        # PATCH/label blocks silently no-op. Warn the consumer so they
+        # don't silently pay for a review that can't do what they asked.
+        # Roadmap: extend findings.json schema to carry these signals from
+        # the CLI back to the runtime (see docs/PR_METADATA_CHECKS.md).
+        agent_runner_warning: str = build_agent_runner_noop_warning(
+            provider_id=provider_id,
+            is_agent_runner=isinstance(provider, AgentRunnerProvider),
+            pr_desc_mode=pr_desc_mode,
+            complexity_labels_enabled=complexity_labels_enabled,
+        )
+        if agent_runner_warning:
+            log(agent_runner_warning)
 
         if isinstance(provider, AgentRunnerProvider):
             # Agent-runner path: vendor CLI owns the tool-use loop. Verify the
@@ -2240,7 +3190,17 @@ def main() -> int:
             messages: list[dict[str, Any]] = [
                 {"role": "user", "content": render_user_prompt(pr_ctx)}
             ]
-            tools: list[dict[str, Any]] = tools_schema(max_inline_comments)
+            # Expose set_pr_description only in autocomplete mode; expose
+            # set_pr_complexity only when complexity labeling is enabled.
+            tools: list[dict[str, Any]] = tools_schema(
+                max_inline_comments,
+                allow_set_pr_description=(
+                    pr_desc_mode == PR_DESC_MODE_AUTOCOMPLETE
+                    and not description_verdict.is_adequate
+                    and PR_DESC_AUTOCOMPLETE_MARKER not in (pr_ctx.body or "")
+                ),
+                allow_set_pr_complexity=complexity_labels_enabled,
+            )
 
             drive_review(
                 provider=provider,
@@ -2276,6 +3236,25 @@ def main() -> int:
         )
         log("No submit_review captured — posting fallback summary")
 
+    # Append the PR description verdict to the summary when warn/block mode
+    # flagged the description. In autocomplete mode we don't warn — the
+    # feature *fixed* the description.
+    if (
+        pr_desc_mode in (PR_DESC_MODE_WARN, PR_DESC_MODE_BLOCK)
+        and not description_verdict.is_adequate
+    ):
+        result.summary = (
+            result.summary.rstrip()
+            + "\n\n---\n\n"
+            + "> **PR description check**: "
+            + description_verdict.reason
+            + (
+                "  (mode: `block` — the check will fail on this)"
+                if pr_desc_mode == PR_DESC_MODE_BLOCK
+                else "  (mode: `warn` — advisory only)"
+            )
+        )
+
     log(
         f"Submitting review: {len(result.findings)} inline comment(s), "
         f"{len(result.summary)} chars of summary"
@@ -2307,29 +3286,108 @@ def main() -> int:
     log(f"Review posted: {review_url}")
 
     # ------------------------------------------------------------------
+    # PR description autocomplete (v1.2.0+) — best-effort PATCH.
+    # ------------------------------------------------------------------
+    if (
+        pr_desc_mode == PR_DESC_MODE_AUTOCOMPLETE
+        and not description_verdict.is_adequate
+        and PR_DESC_AUTOCOMPLETE_MARKER not in (pr_ctx.body or "")
+        and state.proposed_pr_description
+    ):
+        new_body: str = (
+            state.proposed_pr_description.rstrip()
+            + "\n\n"
+            + PR_DESC_AUTOCOMPLETE_MARKER
+        )
+        try:
+            gh_patch_pr_body(
+                token=gh_token,
+                repo=repo,
+                pr_number=pr_number,
+                new_body=new_body,
+            )
+            log("PR description autocompleted by the reviewer.")
+        except Exception as e:  # noqa: BLE001 — best-effort GH API call
+            log(f"Could not PATCH PR body (non-fatal): {e}")
+
+    # ------------------------------------------------------------------
+    # PR complexity labeling (v1.2.0+) — best-effort label update.
+    # ------------------------------------------------------------------
+    if complexity_labels_enabled and state.proposed_pr_complexity:
+        new_label: str = (
+            f"{complexity_label_prefix}{state.proposed_pr_complexity}"
+        )
+        try:
+            # Remove any prior `complexity:*` label so the labels reflect
+            # the current review's assessment, not a stale one.
+            gh_remove_labels_by_prefix(
+                token=gh_token,
+                repo=repo,
+                pr_number=pr_number,
+                prefix=complexity_label_prefix,
+                except_label=new_label,
+            )
+            gh_apply_label(
+                token=gh_token,
+                repo=repo,
+                pr_number=pr_number,
+                label=new_label,
+            )
+            log(f"Applied complexity label {new_label!r}")
+        except Exception as e:  # noqa: BLE001 — best-effort GH API call
+            log(f"Could not apply complexity label (non-fatal): {e}")
+
+    # ------------------------------------------------------------------
     # Strictness gate
     # ------------------------------------------------------------------
     severity: str = result.overall_severity
     blocked, block_reason = evaluate_strictness(severity, strictness)
+
+    # PR description gate — orthogonal to the strictness gate. When
+    # `pr-description-mode: block`, an inadequate description forces
+    # `blocked=True` regardless of inline-comment severity.
+    if (
+        pr_desc_mode == PR_DESC_MODE_BLOCK
+        and not description_verdict.is_adequate
+    ):
+        blocked = True
+        block_reason = (
+            f"pr-description-mode=block: {description_verdict.reason}"
+        )
+        log(f"PR description gate: blocking — {description_verdict.reason}")
+    elif (
+        pr_desc_mode in (PR_DESC_MODE_WARN, PR_DESC_MODE_BLOCK)
+        and not description_verdict.is_adequate
+    ):
+        log(f"PR description gate: warning — {description_verdict.reason}")
+
     log(
         f"Severity: {severity}; strictness: {strictness}; blocked: {blocked} "
         f"({block_reason})"
     )
 
     attached_inline: int = len(result.findings) - dropped_inline
+    tracking_body: str = render_tracking_body_done(
+        head_sha=head_sha,
+        review_url=review_url,
+        inline_attached=attached_inline,
+        inline_dropped=dropped_inline,
+        severity=severity,
+        blocked=blocked,
+        block_reason=block_reason,
+    )
+    # For `label-once` mode, embed the label-toggle generation so the
+    # next run can detect "already reviewed this label application".
+    if trigger_mode == TRIGGER_LABEL_ONCE and not blocked:
+        tracking_body = write_trigger_state(
+            tracking_body,
+            {"label_toggle_generation": label_toggle_generation},
+        )
     gh_update_issue_comment(
         token=gh_token,
         repo=repo,
         comment_id=tracking_id,
-        body=render_tracking_body_done(
-            head_sha=head_sha,
-            review_url=review_url,
-            inline_attached=attached_inline,
-            inline_dropped=dropped_inline,
-            severity=severity,
-            blocked=blocked,
-            block_reason=block_reason,
-        ),
+        body=tracking_body,
     )
 
     # ------------------------------------------------------------------

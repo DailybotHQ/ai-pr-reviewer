@@ -157,6 +157,38 @@ Every PR contains author-controlled text: the title, body, file paths, and code 
 
 - We don't claim the model is impossible to trick into posting a bad comment. If a malicious PR succeeds in getting the model to post wrong feedback, the maintainer reads it, ignores it, and the worst-case outcome is "one wasted review".
 
+## PR metadata PATCH surface (v1.2.0+)
+
+Two features introduced in v1.2.0 write back to the PR: `pr-description-mode: autocomplete` PATCHes the PR body, and `complexity-labels-enabled: true` adds/removes `complexity:*` labels. Both are opt-in and share the same trust envelope as the existing "post review" and "apply label" paths.
+
+### New API surface
+
+| Endpoint | Called by | Guard |
+|---|---|---|
+| `PATCH /repos/{owner}/{repo}/pulls/{n}` | `gh_patch_pr_body()` — invoked at most once per run when `pr-description-mode: autocomplete` AND the current body is missing/vague AND the marker is not present AND the model called `set_pr_description`. | Marker check + one-shot gate in `tool_set_pr_description()`. |
+| `POST /repos/{owner}/{repo}/issues/{n}/labels` | `gh_apply_label()` — already used by `applied-label`; extended for `complexity:*`. | No behavioural change; runs at most once per run per label. |
+| `DELETE /repos/{owner}/{repo}/issues/{n}/labels/<name>` | `gh_remove_labels_by_prefix()` — new for complexity relabelling. | Only removes labels starting with the configured `complexity-label-prefix` (default `complexity:`); other labels are untouched. |
+
+None of these are a scope escalation — the `pull-requests: write` permission is the same one required to post reviews and apply labels since v1.0. No new secret access.
+
+### Idempotency
+
+- **Description autocomplete** stamps `<!-- ai-pr-reviewer-description-autocompleted -->` at the end of the body it writes. Subsequent runs read the current body via `GET /pulls/{n}`; if the marker is present, no PATCH is issued regardless of what the model does. Manual maintainer edits that leave the marker in place still block re-writes; edits that remove the marker allow re-writes (which is the intended affordance for "reset the AI-generated body").
+- **Complexity labels** are re-applied on every run. Each run removes any prior label matching the configured prefix and applies exactly one new one, so the label always reflects the *current* review's assessment. Consumers who want a "stamp once, don't overwrite" behaviour should disable the feature after the first run.
+
+### Prompt-injection defense
+
+The `set_pr_description` tool description instructs the model explicitly not to include environment variables, tokens, or secrets in the body. The existing `redact_for_log` shield still applies to logs. That said: **treat the AI-written body as untrusted content** — a malicious PR that hijacks the model could produce a body that misrepresents what the PR does. Human review of the PR body remains the maintainer's responsibility.
+
+### Rate limiting
+
+- At most one PATCH per action run (guarded by the marker check + one-shot gate).
+- At most one DELETE per pre-existing `<prefix>*` label + one POST for the new label per run. In steady state that's 1 DELETE + 1 POST per run once the feature is enabled.
+
+### Failure modes
+
+All of the above endpoints are called inside broad `try/except Exception` blocks that log and continue on error — a 4xx from GitHub (e.g. token missing scope) does NOT crash the review. The consumer sees a warning in the workflow log; the inline review still posts normally.
+
 ## Hardening recommendations for consumers
 
 If you want to reduce the action's blast radius further:
