@@ -51,7 +51,16 @@ jobs:
         id: version
         run: |
           set -euo pipefail
-          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          # Use the highest SemVer RELEASE tag (vX.Y.Z), NOT
+          # `git describe --tags --abbrev=0`. `describe` walks by ancestry and
+          # returns the most recent reachable tag — which, once the moving `v1`
+          # major-alias tag is force-moved onto the latest release commit, is
+          # `v1` itself. That parses as MAJOR=1, MINOR="" (→0) and a minor bump
+          # produces the already-existing `v1.1.0` (fatal: tag already exists).
+          # Filtering to exact `vMAJOR.MINOR.PATCH` and version-sorting ignores
+          # the `v1`/`v2` aliases and any pre-release/suffix tags.
+          LATEST_TAG=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || echo "")
           if [ -z "$LATEST_TAG" ]; then
             echo "No existing tag found. The first release (v1.0.0) must be cut"
             echo "manually so it can be published to the Marketplace from the"

@@ -1,26 +1,31 @@
 name: Self-review
 
 # Dogfood: review PRs to this action's own `main` with the action itself.
-# Cost control has three gates, cheapest first:
-#   1. LABEL GATE — the whole dogfood only runs when the PR carries a `ready`
-#      label (case-insensitive: `ready`/`Ready`/`READY`). No label → nothing
-#      runs. This puts the maintainer in explicit control of when tokens burn.
-#   2. RUN-ONCE — via `trigger-mode: label-once` on the action, it reviews
-#      only ONCE per label application; to re-run, remove the `ready` label
-#      and add it back.
-#   3. SCOPE — when it does run, the Anthropic baseline always reviews, but the
-#      three CLI-provider legs only review when the diff touches
-#      runtime/action/prompt/workflow surfaces where provider parity can
-#      realistically regress (keeps a `ready` toggle on a docs PR cheap).
 #
-# Accepted tradeoff of the scope gate: when a CLI leg is SKIPPED on a
-# follow-up push (e.g. a docs-only push after a critical one), it doesn't run
-# `collapse-previous`, so that provider's prior review + `self-reviewed:*`
-# label stay live against the older SHA until the next critical push
-# re-runs and collapses them (collapse is provider-scoped). This is a
-# dogfood-only workflow — reviewers of this repo understand the setup — so we
-# accept the transient staleness rather than build a collapse-only cleanup
-# path. Consumers are unaffected: they typically run one always-on provider.
+# Design goals:
+#   1. LABEL-GATED, RUN-ONCE — the dogfood runs only when the `ready` label is
+#      applied (case-insensitive: `ready`/`Ready`/`READY`), exactly once per
+#      application. It fires on the `labeled` event (and on `opened` if the PR
+#      already carries `ready`), NOT on every push — so to re-review you remove
+#      and re-add the `ready` label. This keeps the maintainer in explicit
+#      control of when tokens burn.
+#   2. SCOPE — the Anthropic baseline reviews whenever the gate opens; the three
+#      CLI-provider legs review only when the diff touches
+#      runtime/action/prompt/workflow surfaces where provider parity can
+#      realistically regress (keeps a `ready` toggle on a docs-only PR cheap).
+#   3. HONEST STATUS — the single `scope` job builds the matrix of provider legs
+#      that will ACTUALLY review this event. A leg that shouldn't run (no
+#      `ready` label, an unset provider secret, or a non-critical diff) is
+#      simply absent from the matrix, so it never shows a misleading green
+#      Success; when nothing is eligible the whole review job reports as
+#      **Skipped** (grey). A green leg means it actually reviewed.
+#
+# Why a `scope` job + dynamic matrix instead of a per-leg `if:`? GitHub Actions
+# does not expose the `matrix` context to a job-level `if:`, so a static matrix
+# can only be skipped at the STEP level — which leaves the job green. Building
+# the matrix from a decision job is the supported way to make ineligible legs
+# skip cleanly. Consumers who want the same pattern: see docs/TRIGGER_MODES.md
+# § "Recipe: run once when labelled `ready`, and show Skipped (not green)".
 #
 # The local checkout under `./` is what gets used (instead of a
 # `uses: DailybotHQ/ai-pr-reviewer@v1` pin), so the in-flight changes are what
@@ -29,9 +34,10 @@ name: Self-review
 on:
   pull_request:
     branches: [main]
-    # `labeled` is needed so re-adding the `ready` label re-triggers the
-    # dogfood (see `trigger-mode: label-once` on the action step below).
-    types: [opened, synchronize, labeled]
+    # `labeled` (re-)adding `ready` re-triggers; `opened` catches a PR created
+    # with `ready` already on it. Deliberately NOT `synchronize` — pushes do
+    # not re-review (run-once semantics; toggle the label to re-run).
+    types: [opened, labeled]
 
 concurrency:
   group: self-review-${{ github.event.pull_request.number }}
@@ -42,173 +48,145 @@ permissions:
   pull-requests: write
 
 jobs:
-  self-review:
-    name: 'Self-review — ${{ matrix.provider }}'
+  # ---------------------------------------------------------------------------
+  # Single cheap decision job. Emits the matrix of provider legs that should
+  # ACTUALLY review this event (as JSON). Everything the review legs gate on
+  # lives here, so an ineligible leg is never created — no green no-ops.
+  # ---------------------------------------------------------------------------
+  scope:
+    name: 'Decide self-review scope'
     runs-on: ubuntu-latest
-    # Higher timeout because agent-runner providers can take longer than the
-    # chat-completions Anthropic path when they are enabled by the scope gate.
-    timeout-minutes: 25
-    strategy:
-      # Continue reviewing across providers even if one fails. The scope gate
-      # below decides which legs actually invoke the LLM.
-      fail-fast: false
-      matrix:
-        include:
-          # Every leg pins an EXPLICIT, cost-efficient model — never an
-          # implicit default, and never `auto` for the metered providers
-          # (Anthropic/Claude Code/Codex); Cursor uses `auto` deliberately
-          # because it's flat-rate/unlimited on Pro. So the dogfood cost is
-          # deterministic and visible here. The always-on baseline uses the
-          # cheapest capable Anthropic model (Haiku 4.5) since it's a smoke
-          # review that runs on every push; the CLI legs (which run only on
-          # critical changes) also use each vendor's cheapest smoke model.
-          - provider: anthropic
-            api-key-secret: ANTHROPIC_API_KEY
-            applied-label: 'self-reviewed:anthropic'
-            run-policy: always
-            model: 'claude-haiku-4-5'
-          - provider: claude-code
-            # Dogfood the SUBSCRIPTION auth path: this secret holds a
-            # `claude setup-token` OAuth token (`sk-ant-oat…`), which the
-            # action auto-detects and forwards as CLAUDE_CODE_OAUTH_TOKEN so
-            # the review bills against a Claude Pro/Max plan instead of API
-            # tokens. If the secret is unset, this leg simply skips. Swap
-            # back to ANTHROPIC_API_KEY to exercise the metered-key path.
-            api-key-secret: CLAUDE_CODE_OAUTH_TOKEN
-            applied-label: 'self-reviewed:claude-code'
-            run-policy: critical
-            model: 'claude-haiku-4-5'
-          - provider: cursor
-            api-key-secret: CURSOR_API_KEY
-            applied-label: 'self-reviewed:cursor'
-            run-policy: critical
-            # `auto` is unlimited/flat on Cursor Pro — cheapest marginal cost.
-            model: 'auto'
-          - provider: codex
-            api-key-secret: OPENAI_API_KEY
-            applied-label: 'self-reviewed:codex'
-            run-policy: critical
-            model: 'gpt-5.4-mini'
+    outputs:
+      # A JSON array of matrix `include` entries — `[]` when nothing runs.
+      matrix: ${{ steps.decide.outputs.matrix }}
     steps:
-      - name: Skip when provider secret is unset
-        id: gate
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Decide which provider legs run
+        id: decide
         shell: bash
         env:
-          API_KEY: ${{ secrets[matrix.api-key-secret] }}
-          PROVIDER: ${{ matrix.provider }}
-          SECRET_NAME: ${{ matrix.api-key-secret }}
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_LABEL: ${{ github.event.label.name }}
+          LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          # Whether each provider's secret is configured. `!= ''` yields the
+          # string "true"/"false" — the secret VALUE never enters the shell.
+          HAS_ANTHROPIC: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+          HAS_CLAUDE_CODE: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+          HAS_CURSOR: ${{ secrets.CURSOR_API_KEY != '' }}
+          HAS_OPENAI: ${{ secrets.OPENAI_API_KEY != '' }}
         run: |
-          if [[ -z "${API_KEY}" ]]; then
-            echo "::notice::${SECRET_NAME} is not configured for this repo; skipping the ${PROVIDER} leg."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          lc() { tr '[:upper:]' '[:lower:]'; }
+
+          # 1. RUN-ONCE LABEL GATE (case-insensitive).
+          #    - `labeled` event: run only when the label just added is `ready`
+          #      (ignore unrelated labels like `bug`/`dependencies`).
+          #    - `opened` event: run if the PR already carries `ready`.
+          ready_present=false
+          if printf '%s' "$LABELS_JSON" | lc | grep -qE '"ready"'; then
+            ready_present=true
+          fi
+          should_run=false
+          case "$EVENT_ACTION" in
+            labeled)
+              [ "$(printf '%s' "$EVENT_LABEL" | lc)" = "ready" ] && should_run=true ;;
+            opened)
+              [ "$ready_present" = "true" ] && should_run=true ;;
+          esac
+          if [ "$should_run" != "true" ]; then
+            echo "::notice::Self-review skipped — apply the 'ready' label to run the dogfood (remove + re-add to re-run)."
+            echo 'matrix=[]' >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
+          # 2. CRITICAL-SURFACE detection — which CLI legs are worth running.
+          #    Test files are listed explicitly (not globbed) so a docs-only
+          #    test-doc change doesn't trigger all legs; add new provider/runtime
+          #    test files here. Safe degradation if forgotten: only the Anthropic
+          #    baseline reviews that PR.
+          critical=false
+          while IFS= read -r path; do
+            case "$path" in
+              action.yml|scripts/reviewer.py|prompts/*|.github/workflows/self-review.yml|.github/workflows/code_check.yml|.github/scripts/validate_action.py|tests/test_reviewer.py|tests/test_agent_runner_providers.py|tests/test_findings_parser.py|tests/test_end_to_end_roundtrip.py)
+                critical=true ;;
+            esac
+          done < <(git diff --name-only "origin/${BASE_REF}...HEAD")
+
+          # 3. Build the matrix. A leg is included only if its secret is set AND
+          #    its policy allows it (Anthropic = always-on baseline; the CLI legs
+          #    only on critical changes). Omitted legs show as absent/Skipped,
+          #    never a green no-op. Each entry pins an explicit cost-efficient
+          #    model — never `auto` for metered providers; Cursor uses `auto`
+          #    deliberately (flat-rate on Pro).
+          matrix='[]'
+          add() {
+            matrix=$(printf '%s' "$matrix" | jq -c \
+              --arg p "$1" --arg s "$2" --arg l "$3" --arg m "$4" \
+              '. += [{provider:$p, secret:$s, label:$l, model:$m}]')
+          }
+          [ "$HAS_ANTHROPIC" = "true" ] && add anthropic ANTHROPIC_API_KEY "self-reviewed:anthropic" claude-haiku-4-5
+          if [ "$critical" = "true" ]; then
+            # Claude Code dogfoods the SUBSCRIPTION auth path: CLAUDE_CODE_OAUTH_TOKEN
+            # holds a `claude setup-token` OAuth token (`sk-ant-oat…`) which the
+            # action auto-detects and bills against a Claude Pro/Max plan.
+            [ "$HAS_CLAUDE_CODE" = "true" ] && add claude-code CLAUDE_CODE_OAUTH_TOKEN "self-reviewed:claude-code" claude-haiku-4-5
+            [ "$HAS_CURSOR" = "true" ]      && add cursor CURSOR_API_KEY "self-reviewed:cursor" auto
+            [ "$HAS_OPENAI" = "true" ]      && add codex OPENAI_API_KEY "self-reviewed:codex" gpt-5.4-mini
+          fi
+          echo "::notice::Self-review matrix: $matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # One matrix leg per ELIGIBLE provider (built by `scope`). The job-level
+  # `if:` (which may reference `needs`, unlike `matrix`) skips the whole job as
+  # **Skipped** — not green — when no provider is eligible. When a leg does run,
+  # it always reviews; there is no internal "run and quietly skip" path left.
+  # ---------------------------------------------------------------------------
+  self-review:
+    name: 'Self-review — ${{ matrix.provider }}'
+    needs: scope
+    if: needs.scope.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    # Higher timeout because agent-runner providers can take longer than the
+    # chat-completions Anthropic path.
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.scope.outputs.matrix) }}
+    steps:
       - uses: actions/checkout@v7
-        if: steps.gate.outputs.skip != 'true'
         with:
           fetch-depth: 0
           # Don't persist GITHUB_TOKEN into .git/config: the CLI legs run with
-          # broad local access (Claude Code with `bypassPermissions`, and now
-          # a subscription OAuth token in its env), so a persisted token on
-          # disk is exactly the residual exfiltration surface documented in
+          # broad local access (Claude Code with `bypassPermissions`, and a
+          # subscription OAuth token in its env), so a persisted token on disk
+          # is exactly the residual exfiltration surface documented in
           # docs/SECURITY.md § "Agent-runner providers". The reviewer talks to
           # the GitHub API in-process; the CLI never needs git credentials.
           persist-credentials: false
 
-      - name: Decide self-review scope
-        id: scope
-        if: steps.gate.outputs.skip != 'true'
-        shell: bash
-        env:
-          PROVIDER: ${{ matrix.provider }}
-          RUN_POLICY: ${{ matrix.run-policy }}
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
-          # JSON array of the PR's current label names.
-          LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
-        run: |
-          set -euo pipefail
-
-          # LABEL GATE (case-insensitive): the dogfood only runs when a
-          # `ready` label is present. This is the cheapest gate — no LLM
-          # call, no checkout diff needed to decide it. The action itself
-          # also enforces `label-gate: ready` + `trigger-mode: label-once`
-          # (see the run step) so re-review needs a label off/on toggle; this
-          # workflow-level check just avoids spinning up jobs with no label.
-          if ! printf '%s' "${LABELS_JSON}" \
-            | tr '[:upper:]' '[:lower:]' \
-            | grep -qiE '"ready"'; then
-            echo "run=false" >> "${GITHUB_OUTPUT}"
-            echo "::notice::${PROVIDER} self-review skipped; add the 'ready' label to run."
-            exit 0
-          fi
-
-          changed_file_list="${RUNNER_TEMP}/self-review-changed-files.txt"
-          git diff --name-only "origin/${BASE_REF}...HEAD" > "${changed_file_list}"
-
-          # Critical surfaces where provider parity can regress. NOTE: the
-          # `tests/*` entries are listed explicitly rather than globbed so a
-          # docs-only test-doc change doesn't trigger all four legs — when you
-          # add a new provider/runtime test file, add it here too. (Worst case
-          # if forgotten: only the always-on Anthropic baseline reviews that
-          # PR, which is a safe degradation, not a failure.)
-          critical=false
-          while IFS= read -r path; do
-            case "${path}" in
-              action.yml|scripts/reviewer.py|prompts/*|.github/workflows/self-review.yml|.github/workflows/code_check.yml|.github/scripts/validate_action.py|tests/test_reviewer.py|tests/test_agent_runner_providers.py|tests/test_findings_parser.py|tests/test_end_to_end_roundtrip.py)
-                critical=true
-                ;;
-            esac
-          done < "${changed_file_list}"
-
-          if [[ "${RUN_POLICY}" == "always" ]]; then
-            echo "run=true" >> "${GITHUB_OUTPUT}"
-            echo "::notice::${PROVIDER} self-review enabled as the baseline leg."
-          elif [[ "${critical}" == "true" ]]; then
-            echo "run=true" >> "${GITHUB_OUTPUT}"
-            echo "::notice::${PROVIDER} self-review enabled because critical action/runtime files changed."
-          else
-            echo "run=false" >> "${GITHUB_OUTPUT}"
-            echo "::notice::${PROVIDER} self-review skipped; this diff does not touch critical action/runtime files."
-          fi
-
       - name: Run AI PR Reviewer (local checkout, provider=${{ matrix.provider }})
-        if: steps.gate.outputs.skip != 'true' && steps.scope.outputs.run == 'true'
-        # `./` resolves to this repo's checkout — i.e. we use the version
-        # of the action that this PR is proposing, not the published one.
-        # This is the canonical "test in CI" setup for action repos.
+        # `./` resolves to this repo's checkout — i.e. we use the version of the
+        # action this PR proposes, not the published one. Canonical CI setup.
         uses: ./
         with:
           provider: ${{ matrix.provider }}
-          api-key: ${{ secrets[matrix.api-key-secret] }}
+          api-key: ${{ secrets[matrix.secret] }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          # Run only while a `ready` label is present (case-insensitive), and
-          # only ONCE per label application — remove + re-add `ready` to
-          # re-review. The workflow-level scope step above short-circuits when
-          # the label is absent; these two inputs are what make the action
-          # itself enforce the gate + the run-once semantics.
+          # Defense-in-depth: the `scope` job already gated on the `ready`
+          # label, but pass it through so the action's own gate agrees.
           label-gate: ready
-          trigger-mode: label-once
-          # Explicit cost-efficient model per leg (see the matrix above) —
-          # never `auto`/implicit for the metered providers, so the dogfood
-          # spend is deterministic. Anthropic + Claude Code → Haiku 4.5
-          # (cheapest capable Claude), Codex → gpt-5.4-mini (cheapest current
-          # OpenAI code model), Cursor → auto (flat-rate on Pro).
           model: ${{ matrix.model }}
           strictness: lenient
-          applied-label: ${{ matrix.applied-label }}
-          # Cost guard: the direct Anthropic path owns a turn loop and the
-          # default ceiling is intentionally generous for consumers. This
-          # repo's always-on dogfood leg is a smoke review, so keep it tighter.
+          applied-label: ${{ matrix.label }}
+          # Smoke review — keep the chat-completions turn ceiling tight.
           max-turns: 12
-          # `collapse-previous` is left at its default `true`. Even though all
-          # four legs share one GITHUB_TOKEN (one bot author), collapsing is
-          # now scoped per-provider (each review/tracking comment carries a
-          # provider marker), so each leg only collapses its OWN prior-push
-          # artefacts — the four providers coexist on the PR and each keeps a
-          # single live review. See docs/PROVIDERS.md § "Running more than one
-          # provider on the same PR".
-          # The action's own prompt is the bundled default — no override
-          # needed; that's the prompt we ship to users, so dogfooding it
-          # is the right thing.
+          # `collapse-previous` stays at its default `true`; collapsing is
+          # provider-scoped (per-provider marker), so the legs coexist and each
+          # keeps a single live review. See docs/PROVIDERS.md § "Running more
+          # than one provider on the same PR".
