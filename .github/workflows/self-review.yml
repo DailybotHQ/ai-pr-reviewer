@@ -19,13 +19,23 @@ name: Self-review
 #      simply absent from the matrix, so it never shows a misleading green
 #      Success; when nothing is eligible the whole review job reports as
 #      **Skipped** (grey). A green leg means it actually reviewed.
+#   4. MERGE GATE — a final `gate` job with a STABLE name (`Self-review gate`)
+#      is the one check you mark as *Required* in branch protection. It FAILS
+#      (red → blocks merge) when the review did not actually run and pass — no
+#      `ready` label, a failed leg, or a scope error. This is necessary because
+#      GitHub's branch protection treats a **Skipped** required check as
+#      *passing* (mergeable) — only *failure* or *pending* blocks a merge. So
+#      the per-leg "Skipped" status (goal 3) stays honest for humans reading the
+#      checks list, while the gate turns "didn't review" into a hard block.
+#      Mark ONLY `Self-review gate` required — never the dynamic `Self-review —
+#      <provider>` leg names (they vary and disappear when skipped).
 #
 # Why a `scope` job + dynamic matrix instead of a per-leg `if:`? GitHub Actions
 # does not expose the `matrix` context to a job-level `if:`, so a static matrix
 # can only be skipped at the STEP level — which leaves the job green. Building
 # the matrix from a decision job is the supported way to make ineligible legs
 # skip cleanly. Consumers who want the same pattern: see docs/TRIGGER_MODES.md
-# § "Recipe: run once when labelled `ready`, and show Skipped (not green)".
+# § "Recipe: run once when labelled `ready`, block merge until it passes".
 #
 # The local checkout under `./` is what gets used (instead of a
 # `uses: DailybotHQ/ai-pr-reviewer@v1` pin), so the in-flight changes are what
@@ -190,3 +200,48 @@ jobs:
           # provider-scoped (per-provider marker), so the legs coexist and each
           # keeps a single live review. See docs/PROVIDERS.md § "Running more
           # than one provider on the same PR".
+
+  # ---------------------------------------------------------------------------
+  # Stable-named MERGE GATE — mark THIS job (`Self-review gate`) as the required
+  # status check in branch protection. Runs with `if: always()` so it reports on
+  # every event, and FAILS (red → blocks merge) unless the self-review actually
+  # ran and passed. GitHub treats a *skipped* required check as passing, so the
+  # `self-review` job's Skipped state alone would NOT block a merge — this job is
+  # what turns "no review happened" into a hard block. Its name never varies
+  # (unlike the dynamic `Self-review — <provider>` legs), so it's a reliable
+  # required-check target. See docs/TRIGGER_MODES.md § "Recipe: run once when
+  # labelled `ready`, block merge until it passes".
+  gate:
+    name: 'Self-review gate'
+    needs: [scope, self-review]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce that the self-review ran and passed
+        shell: bash
+        env:
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          REVIEW_RESULT: ${{ needs.self-review.result }}
+          MATRIX: ${{ needs.scope.outputs.matrix }}
+        run: |
+          set -euo pipefail
+          # The scope job itself must have succeeded — a crash there means we
+          # can't trust the matrix, so block rather than wave the PR through.
+          if [ "$SCOPE_RESULT" != "success" ]; then
+            echo "::error::Self-review scope job did not succeed (result=$SCOPE_RESULT). Blocking merge."
+            exit 1
+          fi
+          # Empty matrix == the review did not run. The only path to that (given
+          # the secrets are configured) is a missing `ready` label. Block and
+          # tell the maintainer exactly how to unblock.
+          if [ "${MATRIX:-[]}" = "[]" ]; then
+            echo "::error::Self-review did not run — apply the 'ready' label (remove + re-add to re-run) so the required review executes, then merge once it passes."
+            exit 1
+          fi
+          # The review ran; require every eligible leg to have passed. With
+          # fail-fast:false a single failing provider yields result=failure.
+          if [ "$REVIEW_RESULT" != "success" ]; then
+            echo "::error::Self-review ran but did not pass (result=$REVIEW_RESULT). Fix the findings / rerun before merging."
+            exit 1
+          fi
+          echo "Self-review ran and passed — merge gate satisfied."
