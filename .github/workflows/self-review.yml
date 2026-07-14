@@ -100,6 +100,13 @@ jobs:
         if: steps.gate.outputs.skip != 'true'
         with:
           fetch-depth: 0
+          # Don't persist GITHUB_TOKEN into .git/config: the CLI legs run with
+          # broad local access (Claude Code with `bypassPermissions`, and now
+          # a subscription OAuth token in its env), so a persisted token on
+          # disk is exactly the residual exfiltration surface documented in
+          # docs/SECURITY.md § "Agent-runner providers". The reviewer talks to
+          # the GitHub API in-process; the CLI never needs git credentials.
+          persist-credentials: false
 
       - name: Decide self-review scope
         id: scope
@@ -115,6 +122,12 @@ jobs:
           changed_file_list="${RUNNER_TEMP}/self-review-changed-files.txt"
           git diff --name-only "origin/${BASE_REF}...HEAD" > "${changed_file_list}"
 
+          # Critical surfaces where provider parity can regress. NOTE: the
+          # `tests/*` entries are listed explicitly rather than globbed so a
+          # docs-only test-doc change doesn't trigger all four legs — when you
+          # add a new provider/runtime test file, add it here too. (Worst case
+          # if forgotten: only the always-on Anthropic baseline reviews that
+          # PR, which is a safe degradation, not a failure.)
           critical=false
           while IFS= read -r path; do
             case "${path}" in

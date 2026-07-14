@@ -1850,12 +1850,33 @@ class CliProxyEnvForwardingTests(unittest.TestCase):
             os.environ.update(prev)
 
 
-class CursorDefaultModelTests(unittest.TestCase):
-    """Cursor's default model should be `auto` (unlimited on Pro), matching
-    the recommendation in docs/PROVIDERS.md (I2)."""
+class DefaultModelTests(unittest.TestCase):
+    """Lock the intended per-provider default models. These are the
+    load-bearing cost/quality guardrail — `test_default_models_covers_all_
+    shipping_providers` only checks the keys are truthy, so `"auto"` or a
+    smoke-tier model would pass there. Assert the exact values so a future
+    edit can't silently revert `claude-code` → `auto` or `codex` → a
+    deprecated/smoke model without a red suite."""
+
+    def test_anthropic_default_is_sonnet(self) -> None:
+        self.assertEqual(
+            reviewer.DEFAULT_MODELS["anthropic"], "claude-sonnet-4-6"
+        )
+
+    def test_claude_code_default_is_sonnet_not_auto(self) -> None:
+        self.assertEqual(
+            reviewer.DEFAULT_MODELS["claude-code"], "claude-sonnet-4-6"
+        )
+        self.assertNotEqual(reviewer.DEFAULT_MODELS["claude-code"], "auto")
 
     def test_cursor_default_is_auto(self) -> None:
         self.assertEqual(reviewer.DEFAULT_MODELS["cursor"], "auto")
+
+    def test_codex_default_is_quality_tier_not_deprecated(self) -> None:
+        self.assertEqual(reviewer.DEFAULT_MODELS["codex"], "gpt-5.6-luna")
+        # Never the deprecated model, never the smoke/mini tier.
+        self.assertNotEqual(reviewer.DEFAULT_MODELS["codex"], "gpt-5-codex")
+        self.assertNotEqual(reviewer.DEFAULT_MODELS["codex"], "gpt-5.4-mini")
 
 
 class ProviderMarkerTrackingBodyTests(unittest.TestCase):

@@ -256,11 +256,11 @@ Every run logs the resolved model + argv (with the API key redacted). Combine th
 
 | | Cursor | Claude Code | Codex | Anthropic (direct) |
 |---|---|---|---|---|
-| Auth | Subscription API key | Anthropic API key OR `CLAUDE_CODE_USE_BEDROCK` | OpenAI API key | Anthropic API key |
-| Billing | Cursor subscription credits | Anthropic-metered tokens | OpenAI-metered tokens | Anthropic-metered tokens |
+| Auth | Subscription API key | Anthropic API key **or** `sk-ant-oat…` subscription token (`claude setup-token`) | OpenAI API key | Anthropic API key |
+| Billing | Cursor subscription credits | Anthropic-metered tokens **or** Claude Pro/Max subscription | OpenAI-metered tokens | Anthropic-metered tokens |
 | BYOK | ❌ Not supported | ✅ Bring your own Anthropic key | ✅ Bring your own OpenAI key | ✅ Bring your own Anthropic key |
-| Unlimited plan | ✅ `model: auto` on Pro | ❌ Metered | ❌ Metered | ❌ Metered |
-| Best for | Teams already on Cursor Pro | Teams already on Anthropic | Teams already on OpenAI | Pure API workloads |
+| Subscription plan | ✅ `model: auto` on Pro | ✅ via `sk-ant-oat…` token (see "Billing Claude Code against a subscription") | ❌ Metered (no clean CI path) | ❌ Metered |
+| Best for | Teams already on Cursor Pro | Teams already on Anthropic (API or Pro/Max plan) | Teams already on OpenAI | Pure API workloads |
 
 ---
 

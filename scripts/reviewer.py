@@ -108,8 +108,10 @@ GITHUB_GRAPHQL_URL: str = "https://api.github.com/graphql"
 DEFAULT_MODELS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-6",
     # Agent-runner (CLI) providers. A `model:` input from the consumer
-    # overrides these. We ALWAYS pin an explicit model — never `auto`, which
-    # defers to the account default and can silently be Opus (≈$5/$25).
+    # overrides these. For the METERED providers (Claude Code, Codex) we
+    # always pin an explicit model — never `auto`, which defers to the account
+    # default and can silently be Opus (≈$5/$25). Cursor deliberately keeps
+    # `auto` because it is unlimited/flat-rate on Pro.
     # Claude Code: `claude-sonnet-4-6` is the quality/price sweet spot for
     # code review — it reliably finds the subtle bugs (logic, concurrency,
     # security) that make a review worth running, at ~1/5th of Opus cost.
