@@ -8,12 +8,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Vendored `dailybot` agent skill (v3.10.3) + `skills-lock.json` lockfile at
+  repo root.** Both vendored skills — [`.agents/skills/dailybot/`](.agents/skills/dailybot/)
+  and the already-vendored [`.agents/skills/deepworkplan/`](.agents/skills/deepworkplan/) —
+  are now installed and pinned via the [`skills.sh`](https://skills.sh) CLI
+  (`npx skills add DailybotHQ/agent-skill --skill dailybot -y` and
+  `npx skills add DailybotHQ/deepworkplan-skill --skill deepworkplan -y`).
+  The lockfile records source repo + content hash per skill so any contributor
+  can restore identical vendored copies with `npx skills experimental_install`,
+  and can bump to the latest upstream release with
+  `npx skills update deepworkplan dailybot`. Dailybot integration
+  (progress reporting, check-ins, kudos, chat, forms, email, and per-repo API
+  keys via `.dailybot/env.json` — CLI 3.7.0+) is now discoverable directly from
+  `.agents/skills/dailybot/SKILL.md` without requiring a global install on the
+  contributor's machine. This aligns with the existing DWP dogfood-copy pattern
+  and matches the Dailybot addon in DWP's `.agents/skills/deepworkplan/addons/dailybot/`
+  which expects the Dailybot agent skill ≥ 3.10.3 and CLI ≥ 3.7.0. Consumer
+  impact: none — the vendored skills only ship inside this repo's `.agents/`
+  tree and are invisible to users of the `DailybotHQ/ai-pr-reviewer` action.
+  Docs updated: [`AGENTS.md`](AGENTS.md) (Project Structure + Skills & Agents
+  sections), [`.agents/docs/skills_agents_catalog.md`](.agents/docs/skills_agents_catalog.md)
+  (new `dailybot` row + a "Vendored skills and the lockfile" subsection with
+  the common `npx skills` workflows).
 - **README recipe: "Require a passing review before merge (branch protection)"** —
   documents the merge-gate pattern (a stable-named job that *fails* rather than
   *skips* so a required check actually blocks the merge), cross-linked to
   [`docs/TRIGGER_MODES.md`](docs/TRIGGER_MODES.md).
 
 ### Changed
+- **Self-review dogfood now runs on EVERY `ready`-labeled PR** — no more
+  critical-surface filter. Previously the three CLI provider legs
+  (`claude-code`, `cursor`, `codex`) only ran when the diff touched a small
+  hardcoded list of "critical" paths (`action.yml`, `scripts/reviewer.py`,
+  `prompts/*`, the workflows, the main test files), and the Anthropic
+  baseline was the only always-on reviewer. That optimized for cost but
+  created a coverage hole: docs-only, `.agents/**` (vendored skills) and
+  other AI-tooling PRs got zero review unless `ANTHROPIC_API_KEY` was
+  configured — and when it wasn't, the merge gate failed red on legitimate
+  PRs (e.g. the Dailybot-skill-vendoring PR that lit up this fix). Since
+  vendored skills, workflow tweaks, prompt edits, and docs are exactly the
+  surface where prompt injection or malicious content can hide, every
+  configured provider now reviews every ready-labeled PR regardless of the
+  diff shape. A leg is only absent from the matrix when its secret isn't
+  configured on the repo. The scope job's `empty_reason` output renamed
+  `no-eligible-provider` → `no-provider-secret` to match. The gate's error
+  message now instructs "set at least one of ANTHROPIC_API_KEY,
+  CLAUDE_CODE_OAUTH_TOKEN, CURSOR_API_KEY, or OPENAI_API_KEY" rather than
+  the older "configure ANTHROPIC_API_KEY or touch a critical surface". The
+  scope job also no longer checks out the repo (nothing left to diff), so
+  the decision runs faster. See
+  [`.github/workflows/self-review.yml`](.github/workflows/self-review.yml)
+  header comment (Design goals #2 and #3).
 - **Self-review gate is now opt-in per PR** (this repo's dogfood only, no
   runtime/action.yml change). The `Self-review gate` job in
   [`.github/workflows/self-review.yml`](.github/workflows/self-review.yml) now
