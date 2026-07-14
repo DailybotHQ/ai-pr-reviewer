@@ -58,7 +58,7 @@ It is **not** a replacement for human code review. It's an additional reviewer t
 - **Single-file implementation** — `scripts/reviewer.py` is ~2400 LOC, fully type-hinted, runnable directly without the action wrapper for local debugging.
 - **Compile-checked in CI** on every PR, plus a 109-test stdlib `unittest` suite covering the pure logic (parsers, dispatch, subprocess boundary, roundtrip serialization, env allowlist).
 - **CLI installers smoke-tested** — a matrix job exercises each agent-runner CLI installer on a fresh runner before it reaches consumers.
-- **Dogfooded** — the action reviews its own PRs via `.github/workflows/self-review.yml`, running a 4-leg matrix across all shipping providers with distinct `self-reviewed:*` labels so each provider's review is separately identifiable in the PR conversation.
+- **Dogfooded** — the action reviews its own PRs via `.github/workflows/self-review.yml`. The direct Anthropic baseline runs on every PR/push, and the CLI-provider legs run when provider-sensitive runtime/action/prompt/workflow files change. Active legs use distinct `self-reviewed:*` labels so each provider's review is separately identifiable in the PR conversation.
 
 ## Roadmap (not a commitment)
 

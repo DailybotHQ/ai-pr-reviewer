@@ -1,13 +1,14 @@
 name: Self-review
 
-# Dogfood: review every PR to this action's own `main` with the action
-# itself, across all four shipping providers in parallel. The local checkout
-# under `./` is what gets used (instead of a `uses: DailybotHQ/ai-pr-reviewer@v1`
-# pin) so the in-flight changes are what reviews the in-flight changes.
+# Dogfood: review every PR to this action's own `main` with the action itself.
+# To keep token spend controlled, the direct Anthropic leg runs on every
+# PR/push as the baseline reviewer. The three CLI-provider legs run only when
+# the diff touches runtime/action/prompt/workflow surfaces where provider
+# parity can realistically regress.
 #
-# One matrix leg per provider — each leg posts its own review with a
-# provider-scoped `applied-label` so we can tell the reviews apart in the
-# PR conversation tab.
+# The local checkout under `./` is what gets used (instead of a
+# `uses: DailybotHQ/ai-pr-reviewer@v1` pin), so the in-flight changes are what
+# review the in-flight changes.
 
 on:
   pull_request:
@@ -26,27 +27,31 @@ jobs:
   self-review:
     name: 'Self-review — ${{ matrix.provider }}'
     runs-on: ubuntu-latest
-    # Higher timeout because agent-runner providers can take longer than
-    # the chat-completions Anthropic path.
+    # Higher timeout because agent-runner providers can take longer than the
+    # chat-completions Anthropic path when they are enabled by the scope gate.
     timeout-minutes: 25
     strategy:
-      # Continue reviewing across providers even if one fails — the goal
-      # is comparative dogfooding, not gating merge on all four.
+      # Continue reviewing across providers even if one fails. The scope gate
+      # below decides which legs actually invoke the LLM.
       fail-fast: false
       matrix:
         include:
           - provider: anthropic
             api-key-secret: ANTHROPIC_API_KEY
             applied-label: 'self-reviewed:anthropic'
+            run-policy: always
           - provider: claude-code
             api-key-secret: ANTHROPIC_API_KEY
             applied-label: 'self-reviewed:claude-code'
+            run-policy: critical
           - provider: cursor
             api-key-secret: CURSOR_API_KEY
             applied-label: 'self-reviewed:cursor'
+            run-policy: critical
           - provider: codex
             api-key-secret: OPENAI_API_KEY
             applied-label: 'self-reviewed:codex'
+            run-policy: critical
     steps:
       - name: Skip when provider secret is unset
         id: gate
@@ -68,8 +73,42 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Run AI PR Reviewer (local checkout, provider=${{ matrix.provider }})
+      - name: Decide self-review scope
+        id: scope
         if: steps.gate.outputs.skip != 'true'
+        shell: bash
+        env:
+          PROVIDER: ${{ matrix.provider }}
+          RUN_POLICY: ${{ matrix.run-policy }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+
+          changed_file_list="${RUNNER_TEMP}/self-review-changed-files.txt"
+          git diff --name-only "origin/${BASE_REF}...HEAD" > "${changed_file_list}"
+
+          critical=false
+          while IFS= read -r path; do
+            case "${path}" in
+              action.yml|scripts/reviewer.py|prompts/*|.github/workflows/self-review.yml|.github/workflows/code_check.yml|.github/scripts/validate_action.py|tests/test_reviewer.py|tests/test_agent_runner_providers.py|tests/test_findings_parser.py|tests/test_end_to_end_roundtrip.py)
+                critical=true
+                ;;
+            esac
+          done < "${changed_file_list}"
+
+          if [[ "${RUN_POLICY}" == "always" ]]; then
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+            echo "::notice::${PROVIDER} self-review enabled as the baseline leg."
+          elif [[ "${critical}" == "true" ]]; then
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+            echo "::notice::${PROVIDER} self-review enabled because critical action/runtime files changed."
+          else
+            echo "run=false" >> "${GITHUB_OUTPUT}"
+            echo "::notice::${PROVIDER} self-review skipped; this diff does not touch critical action/runtime files."
+          fi
+
+      - name: Run AI PR Reviewer (local checkout, provider=${{ matrix.provider }})
+        if: steps.gate.outputs.skip != 'true' && steps.scope.outputs.run == 'true'
         # `./` resolves to this repo's checkout — i.e. we use the version
         # of the action that this PR is proposing, not the published one.
         # This is the canonical "test in CI" setup for action repos.
@@ -80,6 +119,10 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           strictness: lenient
           applied-label: ${{ matrix.applied-label }}
+          # Cost guard: the direct Anthropic path owns a turn loop and the
+          # default ceiling is intentionally generous for consumers. This
+          # repo's always-on dogfood leg is a smoke review, so keep it tighter.
+          max-turns: 12
           # `collapse-previous` is left at its default `true`. Even though all
           # four legs share one GITHUB_TOKEN (one bot author), collapsing is
           # now scoped per-provider (each review/tracking comment carries a

@@ -99,7 +99,7 @@ That's the minimum. Open a PR; the action posts a tracking comment, runs a revie
 | `complexity-labels-enabled` | | `false` | When `true`, the reviewer applies a `complexity:low/medium/high` label to the PR. |
 | `complexity-label-prefix` | | `complexity:` | Prefix for the complexity label (change to match your labeling conventions). |
 | `max-turns` | | `30` | Hard cap on the agentic-loop iterations (chat-completions providers only). |
-| `agent-max-turns` | | `''` | Cap on the CLI provider's internal turn count. Empty = provider default. Ignored for chat-completions providers. |
+| `agent-max-turns` | | `''` | Reserved budget hint for CLI providers. Currently logs a warning instead of enforcing a cap because the shipping CLIs do not expose one stable cross-provider turn-count flag. Ignored for chat-completions providers. |
 | `agent-extra-args` | | `''` | Raw string appended to the CLI invocation. Parsed with `shlex.split` (never `shell=True`). Escape hatch for provider-specific flags. |
 | `mcp-config-file` | | `''` | Path inside the consumer checkout to an MCP servers JSON config. If set, the file is copied to the CLI's expected location before invocation. |
 | `claude-code-version` | | `''` | Pin the Claude Code CLI version (npm semver). Empty = latest. |

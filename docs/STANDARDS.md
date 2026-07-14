@@ -101,7 +101,7 @@ See [TESTING_GUIDE.md](TESTING_GUIDE.md). The summary:
 - `actionlint` is the workflow gate.
 - The stdlib `unittest` suite in `tests/` is the unit gate (109 tests, no third-party deps).
 - `cli-install-smoke` is the CLI-installer gate (matrix over the three agent-runner providers).
-- `self-review.yml` is the integration gate (dogfooding across the 4-leg provider matrix).
+- `self-review.yml` is the integration gate (always-on Anthropic baseline plus scoped CLI-provider dogfooding for provider-sensitive changes).
 
 ## Security
 
