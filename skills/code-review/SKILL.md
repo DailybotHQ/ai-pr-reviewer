@@ -47,10 +47,21 @@ Bump to the latest with `npx skills update code-review`.
 
 ---
 
+## What it does
+
+Two coordinated capabilities, routed by intent:
+
+| Capability | Sub-skill | When it fires |
+|---|---|---|
+| **Run a local review** | (this file — default flow) | Developer wants CI-parity review of the current branch's diff before pushing |
+| **Generate the extension file** | [`generate-extension`](generate-extension/SKILL.md) | Developer wants to customize the reviewer to this repo — "generate a `.review/extension.md` for this project" |
+
+Both share the same shipped [`prompt.md`](prompt.md) as the base — one
+runs it, the other tailors what layers on top.
+
 ## Activation
 
-The skill fires when the developer asks (or the harness routes) for a
-local code review. Natural-language triggers:
+**Default flow (run a review) — triggers:**
 
 - "Review my current branch"
 - "Run a code review on my changes"
@@ -58,8 +69,21 @@ local code review. Natural-language triggers:
 - "Code review the diff against `main`"
 - "What would CI say about my current commits?"
 
-Some harnesses (Claude Code, Cursor) also expose it as a slash command
-(e.g. `/code-review`); check the harness's skill-invocation docs.
+**Generate-extension flow — triggers:**
+
+- "Generate a `.review/extension.md` for this repo"
+- "Customize the code review for our project"
+- "Help me write repo-specific review rules"
+- "Set up the AI reviewer for this codebase"
+- "Tailor the reviewer to our stack"
+
+If the trigger is ambiguous (e.g. developer says "help me with the
+review" on a repo that has no `.review/extension.md` yet), ask ONE
+clarifying question before routing.
+
+Some harnesses (Claude Code, Cursor) also expose these as slash
+commands (`/code-review`, `/code-review-generate-extension`); check
+the harness's skill-invocation docs.
 
 ---
 

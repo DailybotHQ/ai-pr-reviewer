@@ -225,6 +225,30 @@ Reference the same file from your CI workflow so both surfaces produce the same 
 
 Full workflow details, trust boundary, activation triggers, and step-by-step methodology: [`skills/code-review/SKILL.md`](../skills/code-review/SKILL.md).
 
+### Generate a repo-tailored extension automatically
+
+The skill ships a **`generate-extension` sub-skill** that inspects THIS repo (stack, architecture, security surface, existing conventions, historical pain) and writes a tailored `.review/extension.md` for you — no copy-paste, no manual authoring.
+
+Natural-language triggers:
+
+- *"Generate a `.review/extension.md` for this repo"*
+- *"Customize the code review for our project"*
+- *"Help me write repo-specific review rules"*
+- *"Set up the AI reviewer for this codebase"*
+
+The sub-skill runs a mandatory Discovery phase (≥ 12 tool calls covering package manifests, top-level source layout, security-adjacent patterns via `grep`, existing quality standards, and — if `gh` is available — recent bugs) before writing anything. This is the difference between a generic extension that could belong to any repo and one that names specific files, modules, and RFCs.
+
+**Two output modes:**
+
+| Mode | File written | Structure | When |
+|---|---|---|---|
+| **Extension** (default) | `.review/extension.md` | ~50-150 lines of overrides layered on top of the shipped default prompt | Almost always — cheap iteration, keeps benefiting from upstream default improvements |
+| **Full replacement** (advanced) | `.github/prompts/pr-review.md` | 200-500 lines standalone prompt replacing the default entirely | Rare — teams that want total control, or codebases so idiosyncratic that the default is more noise than signal |
+
+The sub-skill asks a single clarifying question ("extension or full replacement?") before generating, defaulting to extension. Full details, quality-gate checklist, and Discovery methodology: [`skills/code-review/generate-extension/SKILL.md`](../skills/code-review/generate-extension/SKILL.md); condensed sample outputs in [`skills/code-review/generate-extension/examples.md`](../skills/code-review/generate-extension/examples.md).
+
+**Zero-install alternative:** if you don't want to vendor the skill (e.g. using a web chatbot without file-system access), the same discovery-and-generation flow is still available as a copy-paste meta-prompt at [`examples/prompts/generate-custom-prompt-meta.md`](../examples/prompts/generate-custom-prompt-meta.md).
+
 ---
 
 ## Sharing prompts

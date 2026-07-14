@@ -420,9 +420,17 @@ Once installed, natural-language triggers activate the review:
 
 The skill uses your local agent's own tools (Read / Grep / Glob) to gather context, then produces the review in **the same output format** the CI bot would post — verdict, findings table, per-finding body, notes, recommendation. Because the skill's `prompt.md` is a byte-identical copy of the action's shipped `prompts/default.md` (kept in sync by [`auto-release.yml`](.github/workflows/auto-release.yml)), pinning the same version on both surfaces guarantees local ↔ CI parity.
 
+The skill also ships a **`generate-extension` sub-skill** that bootstraps a repo-tailored `.review/extension.md` for you. Instead of copy-pasting the [meta-prompt](examples/prompts/generate-custom-prompt-meta.md) into a chat window, just say:
+
+- *"Generate a `.review/extension.md` for this repo"*
+- *"Customize the code review for our project"*
+- *"Set up the AI reviewer for this codebase"*
+
+The sub-skill inspects your stack, architecture, security surface, and existing conventions (≥ 12 tool calls minimum — real Discovery, not a guess), then writes the file directly. Two output modes: **extension** (layered on top of the default — recommended) or **full replacement** (advanced, for teams that want total control). Full details in [`skills/code-review/generate-extension/SKILL.md`](skills/code-review/generate-extension/SKILL.md).
+
 ### Sharing repo-specific rules between CI and local
 
-Put your custom overrides in **`.review/extension.md`** at your repo root — the skill auto-detects it, and your CI workflow can reference the same file via the action's `prompt-extension-file:` input:
+Put your custom overrides in **`.review/extension.md`** at your repo root — the `code-review` skill auto-detects it, and your CI workflow can reference the same file via the action's `prompt-extension-file:` input:
 
 ```yaml
 - uses: DailybotHQ/ai-pr-reviewer@v1

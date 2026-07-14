@@ -10,6 +10,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 **Headline:** ship a local companion **`code-review` skill** alongside the action so every developer's coding agent (Cursor, Claude Code, Codex, Gemini, Copilot, Cline, Windsurf) can run the SAME review methodology locally — same prompt, same severity model, same output format — before pushing. The skill and the action share `prompts/default.md` as a single source of truth, kept in sync by a new CI invariant + an `auto-release.yml` step. Also establishes the `.review/extension.md` convention so a project's custom rules apply to both surfaces from a single file.
 
 ### Added
+- **Sub-skill: [`generate-extension`](skills/code-review/generate-extension/SKILL.md)** —
+  bootstraps a repo-tailored `.review/extension.md` (or, in advanced
+  mode, a full-replacement `.github/prompts/pr-review.md`) by inspecting
+  the codebase for stack, architecture, security surface, existing
+  conventions, and historical pain points. Mandatory Discovery phase
+  (≥ 12 tool calls before writing anything) keeps the output tied to
+  concrete file/module references, not generic "avoid magic numbers"
+  advice. Wraps the existing meta-prompt at
+  [`examples/prompts/generate-custom-prompt-meta.md`](examples/prompts/generate-custom-prompt-meta.md)
+  as a proper skill so consumers don't have to copy-paste it into a
+  chat window. Two output modes chosen by a single clarifying question
+  (extension by default, full-replacement as advanced). Meta-prompt
+  file kept for zero-install use cases (web chatbots without file-system
+  access) with a header redirecting to the skill. Follows the
+  `DailybotHQ/agent-skill` router-plus-sub-skills pattern used by
+  `dailybot-report`, `dailybot-kudos`, etc.
 - **Local companion skill: [`code-review`](skills/code-review/SKILL.md)** —
   the same review methodology that runs on your PR in CI, now available
   locally in every coding-agent harness. Install into any consumer repo

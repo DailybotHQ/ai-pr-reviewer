@@ -1,6 +1,35 @@
 <!--
 Meta-prompt for AI PR Reviewer — generate a repo-tailored `prompt-file`.
 
+────────────────────────────────────────────────────────────────────────
+👉 PREFER THE SKILL. This meta-prompt is now packaged as a sub-skill
+────────────────────────────────────────────────────────────────────────
+
+Install the code-review skill in your repo — it wraps this whole
+discovery-and-generation flow AND is smart enough to:
+
+  * ask whether you want an EXTENSION file (default, layered) or a
+    FULL-REPLACEMENT prompt-file (advanced),
+  * auto-detect your stack and inspect the repo,
+  * write the output directly to `.review/extension.md` or
+    `.github/prompts/pr-review.md` (no copy-paste),
+  * explain the workflow-file wiring for both modes.
+
+    npx skills add DailybotHQ/ai-pr-reviewer --skill code-review
+
+Then just tell your coding agent:
+
+    > "Generate a .review/extension.md for this repo"
+    > "Customize the code review for our project"
+
+Full docs: skills/code-review/generate-extension/SKILL.md
+────────────────────────────────────────────────────────────────────────
+
+STILL USEFUL FOR:  zero-install (you don't want to vendor a skill),
+web chatbots without file-system access (ChatGPT/Gemini web UI), or
+one-off customization where installing a skill is more friction than
+the copy-paste.
+
 Usage: copy this entire file into your favorite coding AI (Claude Code,
 Cursor Agent, Codex, ChatGPT, Gemini) with your repository checked out
 locally or opened as workspace context. The AI will inspect your codebase
