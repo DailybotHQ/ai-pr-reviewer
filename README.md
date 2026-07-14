@@ -1,17 +1,33 @@
 # AI Diff Reviewer
 
-> An LLM-driven pull-request reviewer as a GitHub Action — inline comments, severity-based gating, no infrastructure.
+> One review methodology, two surfaces — an **LLM-driven code reviewer** that ships as a **GitHub Action** for CI **and** a **coding-agent skill** for your local machine.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![GitHub Marketplace](https://img.shields.io/github/v/release/DailybotHQ/ai-diff-reviewer?label=Marketplace&logo=github&color=success)](https://github.com/marketplace/actions/ai-diff-reviewer)
 [![Powered by Dailybot](https://img.shields.io/badge/Powered%20by-Dailybot-6C5CE7.svg)](https://www.dailybot.com?utm_source=dailybotopensource&utm_medium=ai-pr-reviewer)
 
-A composite GitHub Action that runs a real code review on every pull request: posts inline comments, marks previous reviews as outdated, gates the GitHub check based on configurable strictness, and applies a "reviewed" label. Stdlib-only Python — no Docker image to pull, no Node modules, no infrastructure beyond your provider's API key.
+Reviews `git diff origin/<base>...HEAD` on every pull request (or on your feature branch, before you push), posts findings with severity tags (`critical` / `warning` / `info`), gates the check based on configurable strictness, collapses prior reviews, and auto-labels the PR when it passes. Stdlib-only Python — no Docker image, no Node modules, no infrastructure beyond your provider's API key.
 
-Originally built to replace [`anthropics/claude-code-action@v1`](https://github.com/anthropics/claude-code-action) when its `restoreConfigFromBase` step started crashing on repos that ship `.claude` as a symlink. The action solves that problem and a few more — same review quality, more configuration knobs, friendlier failure modes.
+The same [`prompts/default.md`](prompts/default.md) drives both surfaces. Pinning the same version on the Action and the skill guarantees **local ↔ CI parity** — what the skill flags locally is what CI will flag on the PR.
+
+---
+
+## Two ways to run the same review
+
+| Surface | Where it runs | Install |
+|---|---|---|
+| **GitHub Action** — auto-review every PR | On `ubuntu-latest` in your CI | Add `uses: DailybotHQ/ai-diff-reviewer@v1` to a workflow → [§ jump](#in-ci--as-a-github-action) |
+| **Coding-agent skill** — review before you push | In your coding agent (Cursor, Claude Code, Codex, Gemini, Copilot, Cline, Windsurf) | `npx skills add DailybotHQ/ai-diff-reviewer --skill ai-diff-reviewer` → [§ jump](#locally--as-a-coding-agent-skill) |
+
+**Use them together** — install the skill for pre-push checks, install the Action for the merge gate, share **one `.review/extension.md`** for your repo-specific rules, and the two stay in perfect sync (see [§ Bringing them together](#bringing-them-together--reviewextensionmd)).
+
+**Just discovered the skill?** The skill even ships a wizard that installs the Action for you — say *"Set up AI Diff Reviewer for this repo"* and it walks you through six questions to generate a tailored workflow file. No YAML editing required for the first install.
 
 ---
 
 ## Contents
+
+### As a GitHub Action (CI)
 
 - [Quick start](#quick-start)
 - [What you get out of the box](#what-you-get-out-of-the-box)
@@ -22,13 +38,31 @@ Originally built to replace [`anthropics/claude-code-action@v1`](https://github.
 - [Controlling cost & access](#controlling-cost--access)
 - [Recipes](#recipes)
 - [Required permissions](#required-permissions)
+
+### As a coding-agent skill (local)
+
+- [Quick start (skill)](#quick-start-skill)
+- [The four sub-skills](#the-four-sub-skills)
+- [First-run bootstrap prompt](#first-run-bootstrap-prompt)
+- [Sub-skill: run a local review](#sub-skill-run-a-local-review-default-flow)
+- [Sub-skill: `setup` — install the Action via wizard](#sub-skill-setup--install-the-action-via-wizard)
+- [Sub-skill: `generate-extension` — tailor the reviewer](#sub-skill-generate-extension--tailor-the-reviewer-to-your-repo)
+- [Sub-skill: `open-pr` — author the PR from the diff](#sub-skill-open-pr--author-the-pr-from-the-same-diff)
+
+### Shared foundations
+
+- [Bringing them together — `.review/extension.md`](#bringing-them-together--reviewextensionmd)
 - [How it works](#how-it-works)
 - [Provider roadmap](#provider-roadmap)
+- [Documentation](#documentation)
 - [FAQ](#faq)
-- [Contributing](#contributing)
-- [License](#license)
+- [Contributing](#contributing) · [License](#license)
 
 ---
+
+# In CI — as a GitHub Action
+
+The primary surface: an auto-triggered code review on every pull request, with inline comments and severity-based merge gating. Zero infrastructure — the action is a stdlib-only Python composite step that runs on `ubuntu-latest` without an install phase.
 
 ## Quick start
 
@@ -64,7 +98,7 @@ jobs:
 
 That's the minimum. Open a PR; the action posts a tracking comment, runs a review, and updates the comment with the result.
 
----
+**Prefer a guided install?** The [companion skill's `setup` sub-skill](#sub-skill-setup--install-the-action-via-wizard) generates this file for you — six questions (provider, strictness, trigger mode, external-contributor policy, PR-description mode, complexity labels) → tailored workflow.
 
 ## What you get out of the box
 
@@ -75,8 +109,6 @@ That's the minimum. Open a PR; the action posts a tracking comment, runs a revie
 - **Optional label gate**: only run when a PR carries a label (e.g. `ready`).
 - **Optional "reviewed" label**: applied automatically after a successful, non-blocked review.
 - **Self-healing on GitHub 422**: if the model anchors a comment outside the diff, the action retries summary-only instead of losing every other comment.
-
----
 
 ## Providers
 
@@ -128,8 +160,6 @@ Like Cursor, `claude-code` can bill against a **Claude Pro/Max subscription**. R
 
 > **Security:** a subscription token grants broader account access than a scoped API key. On public repos, use the CLI providers only on trusted (non-fork) PRs and set `persist-credentials: false` on `actions/checkout`. Full details: [docs/PROVIDERS.md](docs/PROVIDERS.md) and [docs/SECURITY.md](docs/SECURITY.md).
 
----
-
 ## Inputs
 
 | Input | Required | Default | Description |
@@ -160,6 +190,8 @@ Like Cursor, `claude-code` can bill against a **Claude Pro/Max subscription**. R
 | `cursor-version` | | `''` | Pin the Cursor Agent CLI version. Empty = latest stable. |
 | `codex-version` | | `''` | Pin the OpenAI Codex CLI version (npm semver). Empty = latest. |
 
+**Prefer to look up an input from your coding agent?** The [companion skill's `setup` sub-skill](#sub-skill-setup--install-the-action-via-wizard) doubles as a reference manual — ask any agent with the skill installed *"what does `strictness` do?"* or *"how do I pin the Cursor CLI version?"* and it answers from [`skills/ai-diff-reviewer/setup/reference.md`](skills/ai-diff-reviewer/setup/reference.md) without opening the action source.
+
 ## Outputs
 
 | Output | Type | Description |
@@ -183,8 +215,6 @@ Consume them in a later step by giving the action step an `id`:
         run: echo "Critical findings — see ${{ steps.review.outputs.review-url }}"
 ```
 
----
-
 ## Strictness levels
 
 | Mode | What fails the check |
@@ -197,8 +227,6 @@ Consume them in a later step by giving the action step an `id`:
 The model decides severity per inline comment via the tool's `severity` argument; the bundled default prompt explains the levels in detail. Customise the prompt to make the model more or less aggressive about each tier.
 
 Full guide: [docs/STRICTNESS.md](docs/STRICTNESS.md).
-
----
 
 ## Controlling cost & access
 
@@ -230,8 +258,6 @@ Every review spends tokens, so the action layers three controls, evaluated **che
 These compose. For a public open-source repo the safe combination is author-association (default) **+** a label gate — see the [recipe below](#public-open-source-repo-safest-defaults).
 
 Threat model & full detail: [docs/SECURITY.md § "Author-association gate"](docs/SECURITY.md), [docs/TRIGGER_MODES.md](docs/TRIGGER_MODES.md).
-
----
 
 ## Recipes
 
@@ -365,8 +391,6 @@ Result: an outsider opening PRs cannot trigger the review at all (gate fails, ze
 
 More recipes: [`examples/`](examples/).
 
----
-
 ## Required permissions
 
 The action needs:
@@ -383,54 +407,90 @@ The job-level `timeout-minutes: 15` is recommended — the agentic loop has its 
 
 ---
 
-## How it works
+# Locally — as a coding-agent skill
 
-1. **Access & trigger gates** (cheapest first, no API calls) — `author-association` runs first (skip if the PR author isn't in the whitelist), then the `label-gate` / `trigger-mode` check (skip if the required label is missing or this label application was already reviewed).
-2. **Collapse previous** — marks prior bot reviews/comments as `OUTDATED` via GraphQL.
-3. **Tracking comment** — posts a `Working…` comment with a stable marker.
-4. **Fetch PR** — pulls metadata, file list, and `git diff origin/<base>...HEAD`.
-5. **Agentic loop** — runs the model with five tools: `read_file`, `grep`, `glob`, `post_inline_comment`, `submit_review`. Inline comments are queued in memory and posted atomically with the final review. Conversation history is pruned in pairs to bound token cost.
-6. **Submit** — `POST /pulls/{n}/reviews` with the summary and queued inline comments. On HTTP 422 (one bad anchor line in any comment ⇒ entire request rejected), the action retries summary-only and reports the dropped count in the tracking comment.
-7. **Apply label** — applies `applied-label` if set and the strictness gate didn't block.
-8. **Strictness gate** — exits 2 if blocked, 0 otherwise.
+The second surface: the **exact same review methodology** the CI Action runs, executed by your local coding agent (Cursor, Claude Code, Codex, Gemini, Copilot, Cline, Windsurf) on the branch you're working on right now — no push required. Useful for pre-flight checks, iterating on prompt-extension rules, or getting a second opinion on a WIP branch without opening a draft PR.
 
-For the full design, see [docs/PROVIDERS.md](docs/PROVIDERS.md), [docs/PROMPTS.md](docs/PROMPTS.md), [docs/STRICTNESS.md](docs/STRICTNESS.md).
+The skill's [`prompt.md`](skills/ai-diff-reviewer/prompt.md) is a byte-identical copy of the Action's shipped [`prompts/default.md`](prompts/default.md), kept in sync by [`auto-release.yml`](.github/workflows/auto-release.yml) on every release cut. Pin the same version on both surfaces → **local review says X ⇒ CI will say X too**.
 
----
-
-## Local review parity (companion skill)
-
-Run the **same review methodology** the CI action would run — locally, in your coding agent (Cursor, Claude Code, Codex, Gemini, Copilot, Cline, Windsurf) — before you push. Useful for pre-flight checks, iterating on prompt-extension rules, or getting a second opinion on a WIP branch without opening a draft PR.
-
-The companion skill ships alongside the action in this repo (`skills/ai-diff-reviewer/`) and installs into any consumer repo with one command:
+## Quick start (skill)
 
 ```bash
+# Latest v1.x
 npx skills add DailybotHQ/ai-diff-reviewer --skill ai-diff-reviewer
+
 # Or pin to a specific action version for reproducibility:
 npx skills add DailybotHQ/ai-diff-reviewer@v1 --skill ai-diff-reviewer
 ```
 
-`npx skills` vendors the skill into `.agents/skills/ai-diff-reviewer/` and records the source + content hash in `skills-lock.json` so teammates can restore identical bytes with `npx skills experimental_install`.
+`npx skills` vendors the skill into `.agents/skills/ai-diff-reviewer/` in your repo and records source + content hash in `skills-lock.json` so teammates restore identical bytes with `npx skills experimental_install`. Bump with `npx skills update ai-diff-reviewer`.
 
-Once installed, natural-language triggers activate the review:
+Once installed, natural-language triggers activate each of the four capabilities — no memorized commands to look up:
 
-- *"Review my current branch"*
-- *"Do a pre-flight review before I push"*
-- *"What would CI say about my current commits?"*
+```text
+"Review my current branch"                         → local review
+"Set up AI Diff Reviewer for this repo"            → install the CI Action
+"Generate a .review/extension.md for this repo"    → tailor the reviewer to your stack
+"Open the PR for this branch"                      → author the PR from the diff
+```
 
-The skill uses your local agent's own tools (Read / Grep / Glob) to gather context, then produces the review in **the same output format** the CI bot would post — verdict, findings table, per-finding body, notes, recommendation. Because the skill's `prompt.md` is a byte-identical copy of the action's shipped `prompts/default.md` (kept in sync by [`auto-release.yml`](.github/workflows/auto-release.yml)), pinning the same version on both surfaces guarantees local ↔ CI parity.
+Some harnesses (Claude Code, Cursor) also expose these as slash commands: `/ai-diff-reviewer`, `/ai-diff-reviewer-setup`, `/ai-diff-reviewer-generate-extension`, `/ai-diff-reviewer-open-pr`.
 
-The skill also ships a **`generate-extension` sub-skill** that bootstraps a repo-tailored `.review/extension.md` for you. Instead of copy-pasting the [meta-prompt](examples/prompts/generate-custom-prompt-meta.md) into a chat window, just say:
+## The four sub-skills
 
-- *"Generate a `.review/extension.md` for this repo"*
-- *"Customize the code review for our project"*
-- *"Set up the AI reviewer for this codebase"*
+The skill is a **router** — it inspects your intent from natural language and routes to one of four capabilities, all sharing the same shipped prompt as the review base:
 
-The sub-skill inspects your stack, architecture, security surface, and existing conventions (≥ 12 tool calls minimum — real Discovery, not a guess), then writes the file directly. Two output modes: **extension** (layered on top of the default — recommended) or **full replacement** (advanced, for teams that want total control). Full details in [`skills/ai-diff-reviewer/generate-extension/SKILL.md`](skills/ai-diff-reviewer/generate-extension/SKILL.md).
+| Sub-skill | Purpose | Fires when you say… |
+|---|---|---|
+| **[Local review](skills/ai-diff-reviewer/SKILL.md)** *(default flow)* | Run the CI review methodology locally on your current branch's diff | *"Review my current branch"* · *"Do a pre-flight review before I push"* |
+| **[`setup`](skills/ai-diff-reviewer/setup/SKILL.md)** | Install & configure the CI GitHub Action via a 6-question wizard. Also the reference manual for every `action.yml` input | *"Set up AI Diff Reviewer for this repo"* · *"What does `strictness` do?"* |
+| **[`generate-extension`](skills/ai-diff-reviewer/generate-extension/SKILL.md)** | Bootstrap a repo-tailored `.review/extension.md` after inspecting your stack (≥ 12 Discovery tool calls) | *"Generate a `.review/extension.md` for this repo"* · *"Customize the review for our project"* |
+| **[`open-pr`](skills/ai-diff-reviewer/open-pr/SKILL.md)** | Author a well-documented pull request (title + body) from the current diff — Conventional Commits inference, PR-template merge, `gh pr create` / `edit` | *"Open the PR"* · *"Draft the PR title and description"* · *"Rewrite the PR body properly"* |
 
-### Bootstrap the GitHub Action itself
+Together they form a **lifecycle**: `setup` installs the Action once per repo → `generate-extension` tailors the review once per repo → the default review flow catches issues before pushing on every branch → `open-pr` authors the PR that ships the change.
 
-The skill also ships a **`setup` sub-skill** that walks you through installing the CI action on a repo that doesn't have it yet — six questions (provider, strictness, trigger mode, external-contributor policy, PR-description mode, complexity labels), sensible per-stack defaults, and a tailored `.github/workflows/pr-review.yml` written for you. Say:
+## First-run bootstrap prompt
+
+You don't have to think about `generate-extension` on day one. The first time you run the review on a repo with no `.review/extension.md`, the skill offers a **yes / no / never** prompt inline:
+
+- **yes** → routes to `generate-extension`, then re-runs the review with the fresh extension layered on.
+- **no** → runs the review this once with the base prompt only. Offer fires again next time.
+- **never** → creates `.review/.skip-bootstrap` (a 0-byte tracked marker) so the offer never fires again in this repo. Commit it and your whole team inherits the same UX. Delete the file to re-enable the offer.
+
+The base prompt alone (bundled with the action at [`prompts/default.md`](prompts/default.md)) catches ~90% of general-purpose issues — SQL injection, unhandled promises, missing input validation, obvious perf regressions. The extension is what turns "generic senior reviewer" into "senior reviewer who knows YOUR repo."
+
+## Sub-skill: run a local review (default flow)
+
+The skill uses your local agent's own tools (Read / Grep / Glob) to gather context, then produces the review in **the same output format** the CI bot would post — verdict, findings table, per-finding body, notes, recommendation:
+
+```markdown
+## Verdict
+<one sentence — "Looks good", "Blocking security fix needed", etc.>
+
+## Findings
+| # | Severity     | File               | Summary                                   |
+|---|--------------|--------------------|-------------------------------------------|
+| 1 | 🚨 critical  | `src/auth.ts:55`   | SQL injection in raw-string login query   |
+| 2 | ⚠️ warning   | `src/cache.ts:120` | Unbounded cache key cardinality           |
+| 3 | ℹ️ info      | `tests/utils.ts:12`| Helper could be reused from existing fixture |
+
+### 1. `src/auth.ts:55` — 🚨 critical
+<full finding body + optional ```suggestion block```>
+
+### 2. `src/cache.ts:120` — ⚠️ warning
+<...>
+
+## Notes (no inline anchor)
+- <cross-cutting concerns, architecture, test-strategy comments>
+
+**Recommendation:** approve / request-changes / comment-only
+```
+
+Reproducing this exact shape (verdict → findings table → per-finding body → notes → recommendation) is what lets you trust "the local review says X, so CI will say X too." Full flow: [`skills/ai-diff-reviewer/SKILL.md`](skills/ai-diff-reviewer/SKILL.md).
+
+## Sub-skill: `setup` — install the Action via wizard
+
+Walks you through installing the CI action on a repo that doesn't have it yet — six questions (provider, strictness, trigger mode, external-contributor policy, PR-description mode, complexity labels), sensible per-stack defaults, and a tailored `.github/workflows/pr-review.yml` written for you. Say:
 
 - *"Set up AI Diff Reviewer for this repo"*
 - *"Configure the reviewer action"*
@@ -440,11 +500,28 @@ At the end, it also offers to bootstrap the extension file (Step 5 of the wizard
 
 The sub-skill also serves as the **reference manual** for every `action.yml` input via [`skills/ai-diff-reviewer/setup/reference.md`](skills/ai-diff-reviewer/setup/reference.md). Ask any coding agent with the skill installed *"what does `strictness` do?"* or *"how do I pin the Cursor CLI version?"* and it can answer without opening the action source.
 
-Full wizard flow in [`skills/ai-diff-reviewer/setup/SKILL.md`](skills/ai-diff-reviewer/setup/SKILL.md).
+Full wizard flow: [`skills/ai-diff-reviewer/setup/SKILL.md`](skills/ai-diff-reviewer/setup/SKILL.md).
 
-### Open the pull request from the same diff
+## Sub-skill: `generate-extension` — tailor the reviewer to your repo
 
-The skill also ships an **`open-pr` sub-skill** that authors the PR title and body from the current branch's diff — the natural next step after the local review says "looks good." Say:
+Instead of copy-pasting the [meta-prompt](examples/prompts/generate-custom-prompt-meta.md) into a chat window, just say:
+
+- *"Generate a `.review/extension.md` for this repo"*
+- *"Customize the code review for our project"*
+- *"Set up the AI reviewer for this codebase"*
+
+The sub-skill inspects your stack, architecture, security surface, and existing conventions (≥ 12 tool calls minimum — real Discovery, not a guess), then writes the file directly.
+
+Two output modes:
+
+- **`extension` (default, recommended)** — layers repo-specific overrides ON TOP of the battle-tested default prompt. Cheap iteration; the default keeps improving upstream.
+- **`full replacement` (advanced)** — for teams that want total control, or whose codebase is so idiosyncratic (proprietary DSL, unusual paradigm) that the default is more noise than signal. Requires ongoing maintenance; you lose upstream improvements to the default.
+
+Full authoring guide: [`skills/ai-diff-reviewer/generate-extension/SKILL.md`](skills/ai-diff-reviewer/generate-extension/SKILL.md).
+
+## Sub-skill: `open-pr` — author the PR from the same diff
+
+Turns the current branch's diff into a well-documented pull request — natural next step after the local review says "looks good." Say:
 
 - *"Open the PR"* / *"Create a pull request for this branch"*
 - *"Draft the PR title and description"*
@@ -459,21 +536,17 @@ It reads the diff, empirically detects your repo's title convention from the las
 - **Migrations** — when `migrations/`, `alembic/versions/`, `prisma/migrations/`, etc. are touched
 - **Dependencies** — when `package.json`, `poetry.lock`, `go.sum`, etc. are touched
 
-Your existing `.github/pull_request_template.md` is **merged, never overwritten** — repo-specific `## Checklist` / `## Rollout plan` sections are preserved intact; only the diff-derived sections override the template's placeholders. Preview → single `yes`/`edit`/`cancel` → `gh pr create` (new PR) or `gh pr edit` (refresh existing — with a body diff shown). Never pushes commits, never auto-merges, never fabricates issue refs. Full details in [`skills/ai-diff-reviewer/open-pr/SKILL.md`](skills/ai-diff-reviewer/open-pr/SKILL.md).
+Your existing `.github/pull_request_template.md` is **merged, never overwritten** — repo-specific `## Checklist` / `## Rollout plan` sections are preserved intact; only the diff-derived sections override the template's placeholders. Preview → single `yes` / `edit` / `cancel` → `gh pr create` (new PR) or `gh pr edit` (refresh existing — with a body diff shown). Never pushes commits, never auto-merges, never fabricates issue refs.
 
-### First-run bootstrap prompt
+Full skill: [`skills/ai-diff-reviewer/open-pr/SKILL.md`](skills/ai-diff-reviewer/open-pr/SKILL.md).
 
-You don't have to think about `generate-extension` on day one. The first time you run the review on a repo with no `.review/extension.md`, the skill offers a **yes / no / never** prompt inline:
+---
 
-- **yes** → routes to `generate-extension`, then re-runs the review with the fresh extension layered on.
-- **no** → runs the review this once with the base prompt only. Offer fires again next time.
-- **never** → creates `.review/.skip-bootstrap` (a 0-byte tracked marker) so the offer never fires again in this repo. Commit it and your whole team inherits the same UX. Delete the file to re-enable the offer.
+## Bringing them together — `.review/extension.md`
 
-The base prompt alone (bundled with the action at [`prompts/default.md`](prompts/default.md)) catches ~90% of general-purpose issues — SQL injection, unhandled promises, missing input validation, obvious perf regressions. The extension is what turns "generic senior reviewer" into "senior reviewer who knows YOUR repo."
+The two surfaces converge on a single **repo-specific extension file** — a plain-Markdown override layer that sits on top of the shipped default prompt. Both the CI Action and the local skill read it from the same path, so your team's custom review rules (severity overrides, "don't comment on" scopes, house conventions) apply identically in both places.
 
-### Sharing repo-specific rules between CI and local
-
-Put your custom overrides in **`.review/extension.md`** at your repo root — the `ai-diff-reviewer` skill auto-detects it, and your CI workflow can reference the same file via the action's `prompt-extension-file:` input:
+**Put your custom overrides in `.review/extension.md`** at your repo root — the local skill auto-detects it, and your CI workflow references the same file via the `prompt-extension-file:` input:
 
 ```yaml
 - uses: DailybotHQ/ai-diff-reviewer@v1
@@ -485,7 +558,43 @@ Put your custom overrides in **`.review/extension.md`** at your repo root — th
 
 **One file, two surfaces, zero drift.**
 
-Full details, extension authoring guide, and worked examples: [`skills/ai-diff-reviewer/SKILL.md`](skills/ai-diff-reviewer/SKILL.md) and [`docs/PROMPTS.md` § "Local coding-agent parity"](docs/PROMPTS.md).
+Example `.review/extension.md`:
+
+```markdown
+## Severity overrides for our codebase
+
+- Any `SELECT * FROM users` in a request path is **critical** (PII exposure).
+- Missing `AbortController` on a `fetch()` in `apps/frontend/` is **warning**
+  (React 18 pattern we standardized on in RFC-014).
+
+## Don't comment on
+
+- Formatting in `apps/legacy/*` — that module is scheduled for a rewrite.
+- Missing tests in `experiments/` — that folder is intentionally exploratory.
+```
+
+The [`generate-extension` sub-skill](#sub-skill-generate-extension--tailor-the-reviewer-to-your-repo) can bootstrap this file for you — it reads your stack, architecture, security surface, and existing conventions, then writes concrete, code-anchored overrides. If you'd rather write it by hand, the full authoring guide (structure, tips, worked examples) is in [docs/PROMPTS.md § "Sharing repo-specific rules between CI and local"](docs/PROMPTS.md).
+
+**Fallback path** for teams that prefer keeping the file next to `.github/workflows/`: the skill also recognizes `.github/ai-diff-reviewer/extension.md` (and the legacy `.github/ai-pr-reviewer/extension.md` for pre-v1.5 repos). The recommended convention is `.review/extension.md` at the repo root — runtime-agnostic and future-proof.
+
+---
+
+## How it works
+
+The Action's runtime (the local skill mirrors these steps in your coding agent):
+
+1. **Access & trigger gates** (cheapest first, no API calls) — `author-association` runs first (skip if the PR author isn't in the whitelist), then the `label-gate` / `trigger-mode` check (skip if the required label is missing or this label application was already reviewed).
+2. **Collapse previous** — marks prior bot reviews/comments as `OUTDATED` via GraphQL.
+3. **Tracking comment** — posts a `Working…` comment with a stable marker.
+4. **Fetch PR** — pulls metadata, file list, and `git diff origin/<base>...HEAD`.
+5. **Agentic loop** — runs the model with five tools: `read_file`, `grep`, `glob`, `post_inline_comment`, `submit_review`. Inline comments are queued in memory and posted atomically with the final review. Conversation history is pruned in pairs to bound token cost.
+6. **Submit** — `POST /pulls/{n}/reviews` with the summary and queued inline comments. On HTTP 422 (one bad anchor line in any comment ⇒ entire request rejected), the action retries summary-only and reports the dropped count in the tracking comment.
+7. **Apply label** — applies `applied-label` if set and the strictness gate didn't block.
+8. **Strictness gate** — exits 2 if blocked, 0 otherwise.
+
+The local skill diverges only at the boundary: instead of posting inline comments to GitHub (step 6), it collects them in-memory and prints the review as a Markdown table in your agent's terminal. Same tools, same prompt, same output shape.
+
+For the full design, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/PROVIDERS.md](docs/PROVIDERS.md), [docs/PROMPTS.md](docs/PROMPTS.md), [docs/STRICTNESS.md](docs/STRICTNESS.md).
 
 ---
 
@@ -510,6 +619,30 @@ Adding a new provider means implementing one class and registering it in `build_
 
 ---
 
+## Documentation
+
+The deep-dive docs live under [`docs/`](docs/) and are cross-linked from every relevant section above. Quick index for browsing:
+
+| Topic | Doc |
+|---|---|
+| Product spec (what & why) | [docs/PRODUCT_SPEC.md](docs/PRODUCT_SPEC.md) |
+| Architecture (single-file runtime + provider abstraction) | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
+| Providers (chat-completions vs agent-runner, model choice) | [docs/PROVIDERS.md](docs/PROVIDERS.md) |
+| Prompts (base / extension / full replacement, worked examples) | [docs/PROMPTS.md](docs/PROMPTS.md) |
+| Strictness (`lenient` / `block-on-*` semantics) | [docs/STRICTNESS.md](docs/STRICTNESS.md) |
+| Trigger modes & branch-protection recipes | [docs/TRIGGER_MODES.md](docs/TRIGGER_MODES.md) |
+| PR-metadata checks (autocomplete, warn, block) | [docs/PR_METADATA_CHECKS.md](docs/PR_METADATA_CHECKS.md) |
+| Security model (author-association, egress surfaces, provider trust) | [docs/SECURITY.md](docs/SECURITY.md) |
+| Performance (turn budgets, prompt caching, token cost) | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) |
+| Testing guide | [docs/TESTING_GUIDE.md](docs/TESTING_GUIDE.md) |
+| PR-review workflow (reading past comments, marker-anchored) | [docs/PR_REVIEW_WORKFLOW.md](docs/PR_REVIEW_WORKFLOW.md) |
+| Release recovery playbook | [docs/RELEASE_RECOVERY.md](docs/RELEASE_RECOVERY.md) |
+| Full docs index | [docs/README.md](docs/README.md) |
+
+**For AI agents working on this repo:** the canonical entry point is [`AGENTS.md`](AGENTS.md) — the single source of truth for every coding assistant (Claude Code, Cursor, Codex, Gemini, Copilot, OpenClaw). Rule numbers referenced from `.review/extension.md` anchor there.
+
+---
+
 ## FAQ
 
 **Why a custom action and not just `anthropics/claude-code-action`?**
@@ -518,20 +651,26 @@ That action's `restoreConfigFromBase` step crashes with `ENOENT` on repos that s
 **Why composite, not Docker?**
 The reviewer is stdlib-only Python. A Docker action would add ~30s of pull time and a second supply chain (the image registry) for zero benefit.
 
+**Do I have to install both the Action and the skill?**
+No — they're independent. Many teams start with just the Action (auto-review on every PR is the highest-leverage install) and add the skill later for pre-push checks. Others start with just the skill (their coding agent knows how to review). If you install both, they naturally reinforce each other via `.review/extension.md`.
+
 **Will the model leak my code to the provider?**
-The action sends the PR diff and any files the model `read_file`s to the configured provider. Treat it like any other LLM integration — review your provider's data-retention policy and use a self-hosted runner if you have specific constraints.
+The action sends the PR diff and any files the model `read_file`s to the configured provider. Treat it like any other LLM integration — review your provider's data-retention policy and use a self-hosted runner if you have specific constraints. The skill runs your local agent, so it inherits your agent's data-handling posture (Cursor Pro, Claude Pro/API, etc.).
 
 **Does it work on private repos?**
 Yes. The default `secrets.GITHUB_TOKEN` has the right scope; just make sure the repo's settings allow Actions to read content and write PR comments.
 
 **Can I dogfood the reviewer on its own PRs?**
-Yes — see `.github/workflows/self-review.yml` in this repo for the pattern.
+Yes — see [`.github/workflows/self-review.yml`](.github/workflows/self-review.yml) in this repo for the pattern. This repo also vendors its own skill copy at [`.agents/skills/ai-diff-reviewer/`](.agents/skills/ai-diff-reviewer/) refreshed automatically on every release — dogfooding the install flow every time we publish.
+
+**How do version pins between the Action and the skill line up?**
+They're intended to be identical. `uses: DailybotHQ/ai-diff-reviewer@v1.4.2` in CI + `npx skills add DailybotHQ/ai-diff-reviewer@v1.4.2 --skill ai-diff-reviewer` locally = byte-identical prompt on both surfaces. Pinning to the moving `@v1` alias on both sides also works — new patches and minor features flow to both simultaneously.
 
 ---
 
 ## Contributing
 
-Bug reports, feature requests, provider implementations, and prompt improvements are all welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
+Bug reports, feature requests, provider implementations, sub-skills, and prompt improvements are all welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md) (the single source of truth for repo standards, canonical file paths, and the mandatory-rules checklist).
 
 ## License
 
