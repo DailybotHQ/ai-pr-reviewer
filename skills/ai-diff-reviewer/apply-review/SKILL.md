@@ -163,13 +163,16 @@ REPO="$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || ech
 
 # PR for the current branch (if any)
 PR_JSON="$(gh pr view --json number,url,state,headRefOid,labels,isDraft 2>/dev/null || true)"
-PR_NUMBER="$(printf '%s' "$PR_JSON" | jq -r '.number // empty')"
+PR_NUMBER="$(gh pr view --json number --jq '.number // empty' 2>/dev/null || true)"
 ```
 
 `PR_NUMBER` is consumed by every subsequent `gh` / `gh api graphql`
-invocation (Steps 2b, 3, 7). If `PR_JSON` is empty (no open PR on this
-branch) `PR_NUMBER` is empty too — that's the signal the mode table
-below uses to route to `refuse-soft`.
+invocation (Steps 2b, 3, 7). Extracted via `gh pr view --json …
+--jq …` (not standalone `jq`) so the sub-skill's dependency set
+stays `git` + `gh` — the two bins already declared in
+`metadata.requires.anyBins`, matching sibling sub-skills. If the
+`gh pr view` call fails (no open PR on this branch), `PR_NUMBER` is
+empty and the mode table below routes to `refuse-soft`.
 
 Decide the mode from the state:
 
@@ -221,8 +224,8 @@ override the heuristic.
 
 ```bash
 gh api graphql -F owner="${REPO%%/*}" -F repo="${REPO##*/}" \
-  -F number="$PR_NUMBER" -F bot="$BOT_LOGIN" -f query='
-query($owner: String!, $repo: String!, $number: Int!, $bot: String!) {
+  -F number="$PR_NUMBER" -f query='
+query($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
       comments(first: 100) {
@@ -250,6 +253,7 @@ query($owner: String!, $repo: String!, $number: Int!, $bot: String!) {
               path
               line
               startLine
+              diffHunk
               isMinimized
             }
           }
@@ -268,6 +272,19 @@ field is the range end for multi-line comments and the anchor for
 single-line ones. `originalLine` is the outdated-position field
 (diff-relative for reviews that no longer point at the current file
 state) and is **not** the multi-line-range start — do not use it here.
+
+The `diffHunk` field carries the raw diff hunk the comment was
+anchored on (the `-`, `+`, and context lines around the anchor).
+Step 6b's pre-image verification reads the non-`+` lines from
+`diffHunk` to compare against the working-tree state — that's how the
+apply flow avoids overwriting lines the developer has already edited.
+Without `diffHunk`, the pre-image contract is not enforceable.
+
+`BOT_LOGIN` is **not** a GraphQL variable — it's applied client-side
+in Step 2c's filter. GitHub's GraphQL API rejects unused declared
+variables (`variableNotUsed`), so declaring `$bot: String!` while only
+using it in a follow-up `jq` filter fails the query outright. Keep
+the login filter in Step 2c and the GraphQL selection set variable-free.
 
 ### 2c. Filter to live bot artefacts
 
@@ -321,12 +338,12 @@ per-finding severity lives in the **review summary body's findings
 table**:
 
 ```markdown
-## Findings
+### 2. Findings table
 
-| # | Severity   | File               | Summary        |
-|---|------------|--------------------|----------------|
-| 1 | 🚨 critical | src/auth.ts:55   | SQL injection… |
-| 2 | ⚠️ warning  | src/cache.ts:120 | Unbounded key… |
+| # | Severity   | File                | Summary        |
+|---|------------|---------------------|----------------|
+| 1 | 🚨 critical | `src/auth.ts:55`   | SQL injection… |
+| 2 | ⚠️ warning  | `src/cache.ts:120` | Unbounded key… |
 ```
 
 For each inline comment produced by the leg, join to the summary
@@ -343,8 +360,13 @@ table by matching on `path:line`:
    reliable strategy.
 2. Parse each row into `{severity, path, line, summary}`. The severity
    cell is `<emoji> <label>` (`🚨 critical`, `⚠️ warning`, `ℹ️ info`);
-   normalise to the bare label. The `File` cell is `path:line` (or
-   `path` for path-only findings).
+   normalise to the bare label. The `File` cell is typically
+   backticked (`` `src/auth.ts:55` ``, matching what `prompts/default.md`
+   emits) and may additionally be bold (`` **`src/auth.ts:55`** ``);
+   **strip surrounding backticks AND surrounding `**` before splitting
+   on `:`** — otherwise the join against the GraphQL `path` field
+   (unquoted) misses every row and every finding falls to the `info`
+   fallback below.
 3. For each inline comment, look up a row where the parsed `path` +
    `line` match exactly. On match, set `comment.severity = row.severity`.
 4. On **no match** (the model posted an inline anchor the summary
@@ -587,12 +609,23 @@ path + line range is reachable in the current working tree.
    tree (e.g. renamed since the review), warn and skip: *"`<path>`
    isn't in the current tree — the file may have been renamed. Falling
    back to `skip`."*
-2. **Verify the pre-image**. Read lines `start`–`end` from the file
-   and confirm they match what the suggestion is replacing. If the
-   context doesn't match (developer's already edited nearby), warn:
-   *"Lines <start>–<end> in `<path>` no longer match the context the
-   suggestion was written against. Applying anyway may produce
-   incorrect output. Options: force / skip / discuss."*
+2. **Verify the pre-image**. A GitHub `\`\`\`suggestion\`\`\`` block
+   carries **only the replacement text** — not the lines it replaces.
+   Derive the expected pre-image from the inline comment's `diffHunk`
+   field (fetched in Step 2b): take its non-`+` lines (the ` ` context
+   lines and `-` removed lines from the review's original diff) and
+   trim to the `start`–`end` window. Compare against the working-tree
+   file's lines `start`–`end`. If the two match, proceed. If they
+   diverge (developer's already edited nearby, or a different SHA
+   than the review anchored on), warn: *"Lines `<start>`–`<end>` in
+   `<path>` no longer match the diff hunk the suggestion was written
+   against. Applying anyway may produce incorrect output. Options:
+   force / skip / discuss."* Fallback when `diffHunk` is empty (rare —
+   the review posted without one): call `gh pr diff <PR_NUMBER>
+   --patch` at the marker SHA and extract the hunk covering
+   `path:start–end`. If neither source of expected pre-image is
+   available, refuse the apply and route to `skip / discuss` — never
+   silently overwrite.
 3. **Preview the change**. Show a compact 3-way diff:
    ```
    <path>:<start>–<end>
@@ -834,8 +867,8 @@ Skill:
 
   5. "1 finding on your PR. What next?
        - done          → I've shown the summary.
-       - walk through  → I'll go finding-by-finding.
-       - discuss       → just print the body so you can copy it."
+       - walk through  → I'll go finding-by-finding (each finding then
+                         offers apply / defer / skip / discuss / stop)."
 
 Developer: "done"
 

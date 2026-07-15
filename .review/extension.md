@@ -251,14 +251,17 @@ extend the security posture to the whole surface consumers touch.
   mapping pattern instead: assign the value to an env var, then
   reference `"$VAR"` in the script.
 - **Always `critical`:** any new/modified workflow using the
-  `pull_request_target` event without an explicit `if:` guard
-  restricting write-scoped checkouts to trusted contexts (author in
-  `OWNER,MEMBER,COLLABORATOR`, or base-repo ref only). This event
-  runs with base-branch secrets and a full write token; combined
-  with `actions/checkout@vN` on `github.head_ref` it is the
-  most-exploited RCE pattern on GitHub Actions. See
-  [`docs/SECURITY.md § "pull_request_target"`](docs/SECURITY.md) for
-  the codified guard shape.
+  `pull_request_target` event. This event runs with base-branch
+  secrets and a full write token; combined with `actions/checkout@vN`
+  on `github.head_ref` it is the most-exploited RCE pattern on GitHub
+  Actions. This repo's [`docs/SECURITY.md`](docs/SECURITY.md) codifies
+  the position: **never use `pull_request_target` with an agent-runner
+  provider** (line 50), and gate untrusted checkouts with
+  `if: github.event.pull_request.head.repo.full_name == github.repository`
+  (line 48). If a new workflow genuinely needs `pull_request_target`
+  (e.g. to label PRs from forks), flag it and require an inline
+  justification comment naming exactly which secret/write-scope step
+  runs before the untrusted checkout and how it is guarded.
 - **Always `critical`:** a new/modified workflow job missing an
   explicit `permissions:` block. Default token permissions from the
   repo settings may still be `write-all`; explicit
