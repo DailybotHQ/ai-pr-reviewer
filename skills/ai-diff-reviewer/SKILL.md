@@ -11,18 +11,21 @@ allowed-tools: Bash, Read, Grep, Glob
 # AI Diff Reviewer — Local & CI Companion Skill
 
 The [**AI Diff Reviewer**](https://github.com/marketplace/actions/ai-diff-reviewer)
-is a GitHub Action that reviews every PR from CI. **This skill is its
-local counterpart** — the same reviewer, driven by your coding agent
-(Cursor, Claude Code, Codex, Gemini, Copilot, Cline, Windsurf), on the
-branch you're editing right now. It also installs and configures the
-CI Action itself when your repo doesn't have it yet.
+is a GitHub Action that runs an LLM review on every pull request in
+CI. **This skill is its local counterpart** — the same reviewer,
+driven by your coding agent (Cursor, Claude Code, Codex, Gemini,
+Copilot, Cline, Windsurf), on the branch you're editing right now. It
+also installs and configures the CI Action itself when your repo
+doesn't have it yet.
 
 **Two audiences, same skill.**
 
 - If your repo **already runs the Action in CI** → use the skill
-  locally to catch what CI would catch, seconds before pushing.
-  Byte-identical prompt + shared `.review/extension.md` = the local
-  review says exactly what the CI review will say.
+  locally to catch what CI would catch, seconds before pushing. When
+  CI is wired to the same extension file
+  (`prompt-extension-file: .review/extension.md`), local and CI
+  reviews match — same base prompt, same overrides. See the "Parity
+  guarantee (Flow B)" section below for the wiring details.
 - If your repo **doesn't have the Action yet** (or you don't want it)
   → the skill still gives you the full review locally, AND — when
   you're ready — helps you install the Action in CI with sensible
