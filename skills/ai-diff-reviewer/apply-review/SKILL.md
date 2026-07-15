@@ -241,28 +241,51 @@ Resolve the login in this order (first non-empty wins):
    since this is almost always wrong for PAT consumers.
 
 The Step 2b query already returns the top-level `comments` nodes
-with `author.login`, so no extra API call is needed for step 2 above.
-Concretely, after running the GraphQL query, do:
+with `author.login`. To keep the sub-skill's runtime deps aligned
+with `metadata.requires.anyBins` (`git` + `gh` only — **no**
+standalone `jq`), issue a small dedicated `gh api graphql` call for
+the marker-author read, using `gh`'s built-in `--jq` filter to
+extract the login without shelling out to `jq`:
 
 ```bash
 BOT_LOGIN="${AIPRR_BOT_LOGIN:-}"
+
 if [ -z "$BOT_LOGIN" ]; then
-  # Preferred: read from the most recent marker comment in the query response.
-  BOT_LOGIN="$(printf '%s\n' "$GRAPHQL_RESPONSE" \
-    | jq -r '[.data.repository.pullRequest.comments.nodes[]
-             | select((.isMinimized|not) and (.body | startswith("<!-- ai-pr-reviewer-marker -->")))]
-             | sort_by(.createdAt) | reverse | .[0].author.login // empty')"
+  # Preferred: derive from the most recent non-minimized marker comment.
+  # Uses gh's built-in --jq (no standalone jq dependency).
+  BOT_LOGIN="$(gh api graphql \
+    -F owner="${REPO%%/*}" -F repo="${REPO##*/}" -F number="$PR_NUMBER" \
+    -f query='
+    query($owner: String!, $repo: String!, $number: Int!) {
+      repository(owner: $owner, name: $repo) {
+        pullRequest(number: $number) {
+          comments(first: 100) {
+            nodes { body isMinimized createdAt author { login } }
+          }
+        }
+      }
+    }' \
+    --jq '[.data.repository.pullRequest.comments.nodes[]
+           | select((.isMinimized | not)
+                    and (.body | startswith("<!-- ai-pr-reviewer-marker -->")))]
+           | sort_by(.createdAt) | reverse | .[0].author.login // empty' \
+    2>/dev/null)"
 fi
+
 if [ -z "$BOT_LOGIN" ]; then
+  # Fallback: current authenticated user (only accurate on first-run repos
+  # where no marker exists yet). Warn the developer that this is a guess.
   BOT_LOGIN="$(gh api user --jq .login 2>/dev/null || echo 'github-actions[bot]')"
 fi
 ```
 
-(If `jq` isn't available, use `gh api graphql --jq '…'` on the
-follow-up read of the same data; the point is that `AIPRR_BOT_LOGIN`
-→ marker author → `gh api user` is the mandated priority, and the
-snippet must reflect it — do NOT ship a bash line that hardcodes
-`github-actions[bot]` as the primary source.)
+`gh api graphql --jq` runs the filter inside `gh` itself — it does
+not shell out to standalone `jq`, so this snippet stays inside the
+`git` + `gh`-only dep constraint declared in `metadata.requires`.
+Do NOT reintroduce a standalone `jq | ...` pipe here — the moment
+you do, the primary marker-author path breaks on vanilla macOS /
+minimal agents and the fallback (`gh api user`) mis-filters live
+reviews for every PAT / automation-account consumer.
 
 ### 2b. Run the GraphQL query
 
@@ -344,8 +367,9 @@ is used to render the surrounding patch when the developer needs
 context — that display belongs in **Step 4's presentation table**
 (next to the file/line) and/or **Step 6a's walkthrough banner** for
 the current finding, NOT in Step 5 (which is only the top-level
-routing menu: `done` / `walk through` / `filter to critical only` /
-`export unresolved`). `diffHunk` also serves as an optional
+routing menu: `done` / `walk through` / `critical only` / `warnings
+and up` / `filter by leg` / `cancel`). `diffHunk` also serves as an
+optional
 consistency check inside Step 6b — but it is **not** the primary
 source of the expected pre-image; that role belongs to
 `git show <marker-sha>:<path>` (see Step 6b for the full
@@ -572,7 +596,11 @@ contract.
 
 ### 4a. Single-leg output (single-provider consumer)
 
-```markdown
+The outer fence uses **four** backticks so the nested `` ``` `` in
+the finding-body placeholder below renders as literal code, not a
+premature fence close.
+
+````markdown
 ## Verdict (from CI review on <PR URL>)
 <one sentence — pulled verbatim from the review body's Verdict line
 when present, otherwise inferred from the highest-severity finding.>
@@ -600,7 +628,7 @@ when present, otherwise inferred from the highest-severity finding.>
 
 **Recommendation:** approve / request-changes / comment-only
 **Review SHA:** <sha> (matches HEAD ✓ | HEAD is 2 commits newer ⚠️)
-```
+````
 
 ### 4b. Multi-leg output (this repo + power consumers)
 
@@ -707,7 +735,11 @@ menu collapses to four options).
 
 ### 6a. Per-finding presentation
 
-```text
+The outer fence uses **four** backticks so the nested `` ``` ``
+suggestion-block placeholder inside renders as literal code, not a
+premature fence close.
+
+````text
 ──────────────────────────────────────────────────────────
 Finding <k> of <n>: <path>:<line>  [<severity emoji> <severity>]  [<legs>]
 
@@ -731,7 +763,7 @@ Options:
                    comment reply. You handle the discussion in the UI.
   - stop        → end the walkthrough here; go to Step 7 summary.
 ──────────────────────────────────────────────────────────
-```
+````
 
 ### 6b. Handling `apply`
 
@@ -763,11 +795,45 @@ path + line range is reachable in the current working tree.
 
    Then compare that slice line-for-line against the working tree's
    `<path>` at lines `start`–`end`. If they match, proceed to
-   preview. If they diverge (developer's already edited nearby, or a
-   different SHA than the review anchored on), warn: *"Lines
-   `<start>`–`<end>` in `<path>` no longer match the file at the
-   reviewed commit. Applying anyway may produce incorrect output.
-   Options: force / skip / discuss."*
+   preview (step 3 below). If they diverge (developer's already
+   edited nearby, or a different SHA than the review anchored on),
+   present the three-option mismatch menu — and NEVER fall through
+   to the happy-path preview automatically:
+
+   *"Lines `<start>`–`<end>` in `<path>` no longer match the file at
+   the reviewed commit. Applying anyway may produce incorrect
+   output. Options: `force` / `skip` / `discuss`."*
+
+   - **`skip`** — take no action; advance to the next finding in
+     Step 6 (identical to the top-level `skip` option).
+   - **`discuss`** — surface the full finding body so the developer
+     can copy it into a PR comment reply; advance to the next
+     finding (identical to top-level `discuss`).
+   - **`force`** — the escape hatch when the developer has *read*
+     the divergence and wants to overwrite anyway (e.g. because
+     their local edits are trivial reformatting and the suggestion
+     still applies logically). Procedure:
+
+     1. Print a second banner making the risk explicit: *"You're
+        about to overwrite lines `<start>`–`<end>` in `<path>` even
+        though the working tree differs from what the review saw.
+        This may discard local edits. Type `yes force` to confirm,
+        anything else to cancel."*
+     2. Require the literal string `yes force` (not just `yes`, not
+        `y`, not `apply`) — the exact-string requirement is the
+        second, deliberately-annoying confirmation the guardrail
+        depends on.
+     3. On `yes force`: skip the pre-image check, jump straight to
+        preview step 3, then on the preview's own `yes` write via
+        the `Edit` tool. On anything else: cancel and re-present
+        the original three-option mismatch menu.
+
+     Once `force` is chosen and the write completes, log the fact
+     in Step 7's summary (*"1 apply-with-force"* row) so the
+     developer has an audit trail of which finding bypassed the
+     safety check. `force` never becomes silent-default and never
+     applies without both the mismatch banner AND the `yes force`
+     literal.
 
    **Secondary consistency signal: `diffHunk`.** When present, cross-
    check the sliced pre-image against the `diffHunk`'s post-image
@@ -1055,7 +1121,11 @@ Skill:
 
 ### Dialogue B — Multi-leg matrix, critical walkthrough
 
-```text
+The outer fence uses **four** backticks so the nested `` ``` ``
+suggestion block below renders as literal code, not a premature
+fence close.
+
+````text
 Developer: "walk me through the critical findings"
 
 Skill:
@@ -1173,7 +1243,7 @@ Developer: "yes"
        - Stage + commit:            git add src/auth.ts && git commit
        - Push:                      git push
        - Watch the re-review:       gh pr checks 384 --watch
-```
+````
 
 ### Dialogue C — Stale review (CI still running)
 
