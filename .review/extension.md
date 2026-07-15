@@ -254,11 +254,15 @@ extend the security posture to the whole surface consumers touch.
   `pull_request_target` event. This event runs with base-branch
   secrets and a full write token; combined with `actions/checkout@vN`
   on `github.head_ref` it is the most-exploited RCE pattern on GitHub
-  Actions. This repo's [`docs/SECURITY.md`](docs/SECURITY.md) codifies
-  the position: **never use `pull_request_target` with an agent-runner
-  provider** (line 50), and gate untrusted checkouts with
-  `if: github.event.pull_request.head.repo.full_name == github.repository`
-  (line 48). If a new workflow genuinely needs `pull_request_target`
+  Actions. This repo's [`docs/SECURITY.md` → *Agent-runner providers:
+  residual exfiltration surface*](docs/SECURITY.md#agent-runner-providers-residual-exfiltration-surface-read-before-enabling)
+  codifies the position in that section's mitigation bullets:
+  **never use `pull_request_target` with an agent-runner provider**,
+  and gate untrusted checkouts with
+  `if: github.event.pull_request.head.repo.full_name == github.repository`.
+  Cite that section anchor rather than raw line numbers — the
+  numbering drifts on the next SECURITY.md edit; the anchor is
+  stable. If a new workflow genuinely needs `pull_request_target`
   (e.g. to label PRs from forks), flag it and require an inline
   justification comment naming exactly which secret/write-scope step
   runs before the untrusted checkout and how it is guarded.

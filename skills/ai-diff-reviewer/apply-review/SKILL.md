@@ -253,6 +253,7 @@ query($owner: String!, $repo: String!, $number: Int!) {
               path
               line
               startLine
+              side
               diffHunk
               isMinimized
             }
@@ -274,11 +275,17 @@ single-line ones. `originalLine` is the outdated-position field
 state) and is **not** the multi-line-range start — do not use it here.
 
 The `diffHunk` field carries the raw diff hunk the comment was
-anchored on (the `-`, `+`, and context lines around the anchor).
-Step 6b's pre-image verification reads the non-`+` lines from
-`diffHunk` to compare against the working-tree state — that's how the
-apply flow avoids overwriting lines the developer has already edited.
-Without `diffHunk`, the pre-image contract is not enforceable.
+anchored on (the `-`, `+`, and context lines around the anchor); the
+`side` field says whether the anchor is on the pre-image (`LEFT`) or
+post-image (`RIGHT`) of the diff. Step 6b's pre-image verification
+uses `side` to decide which hunk lines to compare against the
+working tree — `+` and context lines for `RIGHT`, `-` and context
+for `LEFT`. `findings_to_gh_inline_comments()` in
+`scripts/reviewer.py` posts anchors with `side: RIGHT` by default,
+so most comments will match against the post-image; `LEFT` shows up
+only when a finding explicitly targets a removed line. Without
+`diffHunk` **and** `side`, the pre-image contract is not
+enforceable.
 
 `BOT_LOGIN` is **not** a GraphQL variable — it's applied client-side
 in Step 2c's filter. GitHub's GraphQL API rejects unused declared
@@ -305,16 +312,28 @@ Emit the filtered set to your working context as a list of
 ### 2d. Anchor + freshness check
 
 Tracking markers are top-level **issue comments** — they have no
-`commit.oid`. Extract the SHA from the marker body's `Full SHA: \`<sha>\``
-line (rendered by `render_tracking_body_working()` /
-`render_tracking_body_done()` / `render_tracking_body_failed()` in
-`scripts/reviewer.py`). As a secondary check, join the marker to its
-matching non-minimized review (same provider marker + same SHA)
-and read that review's `commit.oid` — reviews DO have `commit.oid`.
-If the two disagree (marker body `Full SHA:` says X but the joined
-review's `commit.oid` says Y), surface both to the developer as a
-diagnostic — it usually means a mid-flight failure between marker
-transition and review submission.
+`commit.oid`. The SHA source depends on the marker state (the H3 tells
+you which one: `_Working…_` vs. `✅ done` / `🚫 done` vs. `❌ failed`):
+
+- **Working markers** (`render_tracking_body_working()` in
+  `scripts/reviewer.py`) — include a `Full SHA: \`<sha>\`` line in
+  the body. Parse it. This is the in-flight case; a Working marker
+  means the review is still running or its terminal transition
+  failed.
+- **Done and failed markers** (`render_tracking_body_done()` /
+  `render_tracking_body_failed()`) — do NOT render `Full SHA:`; they
+  only carry the 7-char short SHA in the H3 (`AI review for
+  \`<7chars>\``). Resolve the full SHA by joining the marker to its
+  matching non-minimized review via the provider marker (both carry
+  `<!-- ai-pr-reviewer-provider: <id> -->`), then read the joined
+  review's `commit.oid` — that is the **primary** SHA source for
+  completed reviews (which is the common case). The 7-char prefix in
+  the H3 is a useful cross-check but is ambiguous by itself.
+
+If the joined review is missing when the marker says `done` or
+`failed` (rare — the mid-flight transition raced), fall back to the
+7-char H3 prefix and warn the developer that the review body could
+not be paired.
 
 Compare the resolved SHA against `HEAD_SHA`:
 
@@ -612,19 +631,41 @@ path + line range is reachable in the current working tree.
 2. **Verify the pre-image**. A GitHub `\`\`\`suggestion\`\`\`` block
    carries **only the replacement text** — not the lines it replaces.
    Derive the expected pre-image from the inline comment's `diffHunk`
-   field (fetched in Step 2b): take its non-`+` lines (the ` ` context
-   lines and `-` removed lines from the review's original diff) and
-   trim to the `start`–`end` window. Compare against the working-tree
-   file's lines `start`–`end`. If the two match, proceed. If they
-   diverge (developer's already edited nearby, or a different SHA
-   than the review anchored on), warn: *"Lines `<start>`–`<end>` in
-   `<path>` no longer match the diff hunk the suggestion was written
-   against. Applying anyway may produce incorrect output. Options:
-   force / skip / discuss."* Fallback when `diffHunk` is empty (rare —
-   the review posted without one): call `gh pr diff <PR_NUMBER>
-   --patch` at the marker SHA and extract the hunk covering
-   `path:start–end`. If neither source of expected pre-image is
-   available, refuse the apply and route to `skip / discuss` — never
+   and `side` fields (fetched in Step 2b), then compare against the
+   working-tree file's lines `start`–`end`. The rule differs by
+   anchor side:
+   - **`side == "RIGHT"` (the default `findings_to_gh_inline_comments()`
+     posts)** — the comment anchors on a line that exists in the
+     post-image (working tree, if unchanged since the review). Build
+     the expected pre-image from the hunk's `+` and context (` `)
+     lines, stripping the leading `+` / ` ` character. These are the
+     lines that make up the anchor's file state; `-` lines represent
+     what was removed and must NOT be included.
+   - **`side == "LEFT"`** — the comment anchors on a line the review
+     already saw as removed. Build expected pre-image from the hunk's
+     `-` and context (` `) lines. RIGHT-side is the common case; a
+     RIGHT-side comment reviewed against `+`/context and then written
+     up correctly is what the apply step guards.
+
+   Trim the derived pre-image to the `start`–`end` window and
+   compare line-for-line against the working tree. If they match,
+   proceed. If they diverge (developer's already edited nearby, or a
+   different SHA than the review anchored on), warn: *"Lines
+   `<start>`–`<end>` in `<path>` no longer match the diff hunk the
+   suggestion was written against. Applying anyway may produce
+   incorrect output. Options: force / skip / discuss."*
+
+   Fallback when `diffHunk` is empty (rare — the review posted
+   without one): reconstruct the reviewed-commit file state with
+   `git show <marker-sha>:<path>` (or, when `<path>` needs to be
+   checked out on disk, `git checkout <marker-sha> -- <path>` into a
+   temp path) and read lines `start`–`end` from that snapshot. **Do
+   not** use `gh pr diff` — it always emits the PR's current tip vs
+   base and cannot be pinned to a specific SHA, so it would silently
+   compare against today's tip instead of the reviewed commit and
+   produce false matches. If `git show` also can't resolve the
+   reviewed content (e.g. the marker SHA has been force-pushed
+   away), refuse the apply and route to `skip / discuss` — never
    silently overwrite.
 3. **Preview the change**. Show a compact 3-way diff:
    ```
@@ -759,8 +800,12 @@ come back clean or with only info-level notes.
 - **Never edit source files outside a finding's `path:line` scope.**
   Suggestion blocks specify their range; the sub-skill honors that
   exactly. Adjacent lines are not touched.
-- **Never apply a suggestion when the pre-image doesn't match.**
-  Warn and offer `force / skip / discuss` — never silently overwrite.
+- **Never *silently* apply a suggestion when the pre-image doesn't
+  match.** Warn and offer `force / skip / discuss`; `force` is only
+  reachable after a second explicit "yes" from the developer at the
+  Step 6b menu. This matches the Step 6b menu's behavior — the
+  guardrail forbids sneaking past a mismatch, not the developer's
+  right to override it once they've seen the divergence.
 - **Never fabricate findings.** If Step 2 returns an empty live set
   (no markers, or all minimized), stop and diagnose — do not invent
   reviews to be "helpful".
