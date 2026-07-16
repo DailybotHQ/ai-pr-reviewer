@@ -214,7 +214,7 @@ outputs:
     description: 'Total input + output tokens consumed by the LLM in this run (cost telemetry). Empty string if the IAR pipeline crashed before populating outputs.'
     value: ${{ steps.review.outputs.iteration-tokens-used }}
   iteration-cost-vs-baseline-estimate:
-    description: 'Heuristic estimate of this run''s cost vs a projected non-IAR baseline (e.g. `"-30%"`, `"+15%"`, `"unknown"`). Empty string if the IAR pipeline crashed before populating outputs.'
+    description: 'Coarse heuristic estimate of this run''s LLM-call cost vs a projected no-dedup baseline, derived from cap expansion (`effective_cap / base_cap`) plus a small addendum-overhead flag. Always non-negative: `"0%"` when no cap expansion fires, `"+N%"` when round 1 of first-pass-exhaustive or the safety net raises the cap. Silenced-finding savings are not yet modelled (see docs/ITERATION_AWARENESS.md § 9.5). Empty string if the IAR pipeline crashed before populating outputs.'
     value: ${{ steps.review.outputs.iteration-cost-vs-baseline-estimate }}
 
 runs:

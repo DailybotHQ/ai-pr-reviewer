@@ -56,7 +56,7 @@ IAR ships with the `first-pass-exhaustive` policy — the shape the maintainer t
 
 This is enforced by two independent mechanisms:
 
-1. **Structural try/except at every call site.** Both `run_iar_pre_llm()` and `run_iar_post_llm()` are wrapped in `try/except BaseException` in `main()`. On failure the caller logs the exception, leaves the safety-net empty outputs in place, and continues to the baseline review path.
+1. **Structural try/except at every call site.** Both `run_iar_pre_llm()` and `run_iar_post_llm()` are wrapped in `try/except Exception` in `main()`. On failure the caller logs the exception, leaves the safety-net empty outputs in place, and continues to the baseline review path. `Exception` (not `BaseException`) is deliberate — the reviewer still wants `SystemExit` and `KeyboardInterrupt` to propagate (a shell `SIGINT` or an intentional `sys.exit()` must not be swallowed by IAR's safety net).
 2. **Regression test suite.** `tests/test_iar_failure_fallback.py` locks the invariant: garbled env vars still produce a valid `IARConfig`, the safety-net writer writes exactly 5 empty outputs, and `write_all_outputs()` on every exit path (skip, success, block) always includes the 5 IAR outputs. This suite runs in CI on every PR and MUST stay green.
 
 **Ways this can be broken:**
@@ -87,7 +87,7 @@ All three would fail CI. This is by design.
 | `iteration-generation` | integer string | Generation counter. Increments on new commits or rebase. Empty string if the IAR pipeline crashed. |
 | `iteration-policy-applied` | string | Which policy actually fired this run (usually matches `convergence-policy`, unless overridden by the 30% safety net). Empty string if the IAR pipeline crashed. |
 | `iteration-tokens-used` | integer string | Sum of input+output LLM tokens for this run. Cost telemetry. Empty string if the IAR pipeline crashed. |
-| `iteration-cost-vs-baseline-estimate` | string | Heuristic estimate vs a projected no-dedup baseline (e.g. `"-30%"`, `"+15%"`, `"unknown"`). Empty string if the IAR pipeline crashed. |
+| `iteration-cost-vs-baseline-estimate` | string | Coarse cost-delta heuristic derived from cap expansion (`effective_cap / base_cap`) plus a small prompt-addendum flag. Always non-negative today: `"0%"` when no cap expansion fires; `"+N%"` when round 1 of `first-pass-exhaustive` or the safety net raises the cap. Silenced-finding savings are not yet modelled (see § 9.5); the promised `"-N%"` / `"unknown"` values do NOT ship in this cost function today — do not gate CI steps on them. Empty string if the IAR pipeline crashed. |
 
 ### 3.3 Environment variable mapping
 
@@ -193,7 +193,7 @@ And the marker shows the iteration status as a short italic footer under the H3 
 _Iteration-Aware Review: gen 2, round 1, policy=`first-pass-exhaustive` (new_commits) — 8 surfaced._
 ```
 
-Developers can audit any PR by grepping the tracking marker comments for `gen \d+, round \d+` (lowercase, comma-separated — matching what `_render_iar_marker_annotation` actually emits). The transition name in parentheses distinguishes `(first_review)`, `(new_commits)`, `(rebased)`, `(same_generation)`, `(user_forced_reset)`, and safety-net variants like `(safety_net_new_lines_pct)`.
+Developers can audit any PR by grepping the tracking marker comments for `gen \d+, round \d+` (lowercase, comma-separated — matching what `_render_iar_marker_annotation` actually emits). The transition name in parentheses is one of the five natural values: `(first_review)`, `(new_commits)`, `(rebased)`, `(same_generation)`, `(user_forced_reset)`. Policy overrides — safety-net and escape-label — do NOT appear in the transition slot; they surface via the `policy_applied` slot prefixed with `safety-net-forced-` (e.g. `policy=`safety-net-forced-first-pass-exhaustive` (new_commits)`) or renamed to `escape-label-forced-full-review` (e.g. `policy=`escape-label-forced-full-review` (same_generation)`). To audit those overrides, grep `policy=\`safety-net-forced-` or `policy=\`escape-label-forced-` — the transition value continues to describe the actual generation delta.
 
 ---
 
@@ -434,7 +434,12 @@ Distinct from the escape label, there is a second **stateful** escape gesture th
 - Escape label alone → dedup skipped this run, state preserved.
 - Reviewed label removed alone (with prior state recording a successful stamp) → USER_FORCED_RESET, state discarded.
 
-**How the two are distinguished in the marker.** The annotation carries the transition name in parentheses — `(escape_label)` for one-shot bypass (state preserved) vs `(user_forced_reset)` for the reset (state discarded).
+**How the two are distinguished in the marker.** The two gestures surface in different slots of the italic footer, matching `_render_iar_marker_annotation`:
+
+- **Escape label** (state preserved): the natural `GenerationTransition` is unchanged (`same_generation`, `new_commits`, …); `policy_applied` is renamed to `escape-label-forced-full-review`. Example footer: `policy=`escape-label-forced-full-review` (same_generation)`.
+- **Reset** (state discarded): the transition itself becomes `USER_FORCED_RESET`; `policy_applied` follows the configured convergence policy (typically `first-pass-exhaustive`). Example footer: `policy=`first-pass-exhaustive` (user_forced_reset)`.
+
+To audit these programmatically, grep the marker chain: `policy=\`escape-label-forced-` for escape usage; `(user_forced_reset)` for resets.
 
 **The load-bearing `reviewed_label_applied` safety guard.** The reset detection requires four conditions to fire — (1) `applied-label` is configured, (2) prior IAR state exists, (3) that prior state records the reviewer had previously stamped the label (`prior_state.reviewed_label_applied == True`), and (4) the label is absent from the PR now. Condition (3) is critical: without it, any blocked review (`block-on-critical` fired, so the reviewer never stamped the label) followed by the natural re-trigger would look identical to a deliberate reset and wipe fingerprint memory.
 
@@ -508,7 +513,7 @@ IAR cost: input_tokens=8432, output_tokens=2103, git_ops_ms=1250, total_wall_clo
 
 Two outputs allow programmatic access:
 - `iteration-tokens-used` = `input_tokens + output_tokens` (per run).
-- `iteration-cost-vs-baseline-estimate` = heuristic `-X%` / `+Y%` / `unknown` based on `state.history[]` averages.
+- `iteration-cost-vs-baseline-estimate` — a **coarse, always-non-negative** heuristic derived from cap expansion (`effective_cap / base_cap`) plus a small addendum flag (`+5%` when the IAR exhaustive prompt addendum is spliced). Today the function returns either `"0%"` (no cap expansion) or `"+N%"` (round 1 of `first-pass-exhaustive` / safety net raises the cap). **The signal savings from silenced findings and `state.history[]` averages are not yet modelled** — a future revision may extend the function to emit `"-N%"` / `"unknown"` as originally sketched, but consumers today MUST NOT gate CI steps on those values (the condition will simply never fire).
 
 Example: gate a downstream CI step on IAR cost:
 
@@ -720,6 +725,14 @@ The tool-call cap enforcement in the agent-runner code path (Claude Code / Curso
 **Scope:** currently only `wall_clock_ms` shows the mis-attribution symptom because `tokens_used` is always 0 (the metadata capture from provider responses isn't wired into `RunTelemetry` yet). The current-run telemetry does surface correctly via `write_iar_outputs_populated` (`iteration-tokens-used`, `iteration-cost-vs-baseline-estimate`) — the gap is per-generation attribution inside the marker's `history[]`, not per-run reporting.
 
 **Follow-up:** accumulate telemetry across a generation's rounds (add a `tokens_used_this_gen` + `wall_clock_ms_this_gen` accumulator to `IterationState`, increment on every post-LLM step, and only fold the accumulators into `history[-1]` when `advance_generation` closes the entry). Non-blocking for the shipped runtime; matters most when token accounting lands.
+
+### 13.4 Cost-vs-baseline heuristic is coarse and non-negative
+
+`_estimate_cost_vs_baseline` combines cap-expansion (`effective_cap / base_cap - 1`) with a flat `+5%` addendum flag when the exhaustive prompt is spliced. It ignores `silenced_count` / `surfaced_count`, never consults `state.history[]`, and can only emit `"0%"` or `"+N%"` — the `"-N%"` / `"unknown"` values sketched in the original spec do NOT ship today.
+
+**Consequence.** § 3.2, § 9.5, README, `action.yml`, and `skills/ai-diff-reviewer/setup/reference.md` now describe only the values the function actually returns. Consumers MUST NOT gate CI on `iteration-cost-vs-baseline-estimate == '-30%'` — the condition will never fire under the current implementation.
+
+**Follow-up.** Extend the heuristic to (a) fold in silenced-finding token savings on `iterative` / `round-capped` rounds and (b) surface `"unknown"` when `state.history[]` lacks enough data to project a baseline. Once implemented, restore the `"-N%"` / `"unknown"` language across the four surfaces listed above.
 
 ---
 

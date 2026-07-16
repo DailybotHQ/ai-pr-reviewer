@@ -457,7 +457,7 @@ downstream steps to consume.
 | `iteration-generation` | IAR generation counter; increments on new commits or rebase. Empty if the IAR pipeline crashed. |
 | `iteration-policy-applied` | Which IAR policy actually fired (usually matches `convergence-policy`; the 30% safety net or escape label can override). Empty if the IAR pipeline crashed. |
 | `iteration-tokens-used` | Total LLM input+output tokens consumed this run (cost telemetry). Empty if the IAR pipeline crashed. |
-| `iteration-cost-vs-baseline-estimate` | Heuristic estimate of this run's cost vs a projected no-dedup baseline (e.g. `-30%`, `+15%`, `unknown`). Empty if the IAR pipeline crashed. |
+| `iteration-cost-vs-baseline-estimate` | Coarse cost-delta heuristic (cap expansion + addendum flag). Always `"0%"` or `"+N%"` today — silenced-finding savings are not yet modelled. Empty if the IAR pipeline crashed. |
 
 ---
 

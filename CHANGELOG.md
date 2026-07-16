@@ -270,6 +270,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it to `IAR_FINGERPRINT_BODY_CHARS` next to the other IAR module
   constants. Cosmetic; no behavioral impact.
 
+### Fixed (round-6 self-review doc + telemetry-contract sweep)
+
+Round-6 self-review flagged 3 doc warnings + 2 comment infos. Runtime
+was again signed off as merge-ready (*"Runtime invariants look correct
+and are locked by 456 passing tests. Remaining issues are operator-
+facing doc/telemetry drift."*). All 5 items fixed:
+
+- **`docs/ITERATION_AWARENESS.md § 4.5`** — removed the residual
+  `(safety_net_new_lines_pct)` reference in the transition-slot
+  audit paragraph (missed by the round-5 sweep, which only fixed
+  § 7.2 / § 10.2). The paragraph now correctly lists the five
+  natural transition values and points policy-override audits at
+  `policy=\`safety-net-forced-` / `policy=\`escape-label-forced-`.
+- **`docs/ITERATION_AWARENESS.md § 8.5`** — the "how the two are
+  distinguished" paragraph claimed escape shows as `(escape_label)`
+  in the transition slot. It doesn't — `dispatch_policy` renames
+  the `policy_applied` slot to `escape-label-forced-full-review`
+  and leaves the natural transition untouched. Rewrote to describe
+  the actual footer shape for both gestures and gave programmatic
+  audit greps.
+- **`scripts/reviewer.py:6051`** — replaced the stale "When IAR is
+  enabled" comment with the correct "on round 1 of a new generation
+  under `first-pass-exhaustive` (or when the safety net fires)"
+  wording. IAR is unconditional now; the effective-cap raise fires
+  under specific policy conditions, not an on/off switch.
+- **`docs/ITERATION_AWARENESS.md § 2`** — the safety-contract text
+  claimed `main()` wraps IAR in `try/except BaseException`, but both
+  call sites use `except Exception`. `Exception` is the correct
+  choice (avoids swallowing `SystemExit` / `KeyboardInterrupt`);
+  updated the spec to match the code and explained why.
+- **Cost-vs-baseline heuristic contract narrowed to what
+  `_estimate_cost_vs_baseline` actually returns.** The function
+  today only combines cap expansion + a flat `+5%` addendum flag —
+  it can emit `"0%"` or `"+N%"` but never `"-N%"` / `"unknown"`.
+  The four documentation surfaces (`action.yml`, `README.md`,
+  `docs/ITERATION_AWARENESS.md § 3.2 / § 9.5`,
+  `skills/ai-diff-reviewer/setup/reference.md`) were advertising
+  the fuller `-30%` / `"unknown"` values from the original spec.
+  Rewrote each to describe only the shipping return values and
+  added an explicit warning that consumers MUST NOT gate CI on
+  `iteration-cost-vs-baseline-estimate == '-30%'` (the condition
+  will never fire). New `docs/ITERATION_AWARENESS.md § 13.4`
+  catalogues this as a known limitation with the follow-up work
+  needed to restore the fuller heuristic.
+
 ### Fixed (round-5 self-review doc-drift sweep)
 
 Round-5 self-review found 5 doc/example drift items and 1 already-tracked

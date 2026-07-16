@@ -6048,11 +6048,12 @@ def main() -> int:
             # Enforce max_inline_comments on the agent-runner path too. The
             # tool handler enforces this for chat-completions providers; the
             # cap is a documented safety control (docs/SECURITY.md) that
-            # applies to every provider family. When IAR is enabled, the
-            # effective cap may be raised on round 1 of a new generation
-            # (first-pass-exhaustive / safety net) so the LLM can surface
-            # a more complete initial pass; subsequent rounds converge
-            # back to the baseline cap.
+            # applies to every provider family. On round 1 of a new
+            # generation under `first-pass-exhaustive` (or when the 30%
+            # safety net fires), IAR raises the effective cap via
+            # `exhaustive-first-pass-cap-multiplier` so the LLM can
+            # surface a more complete initial pass; subsequent rounds
+            # converge back to the baseline cap.
             if len(result.findings) > effective_max_inline_comments:
                 dropped: int = (
                     len(result.findings) - effective_max_inline_comments
