@@ -379,8 +379,8 @@ Omit the section entirely when there are no UI changes — never write
 Example:
 - **What breaks:** the `api-key` input has been renamed to
   `provider-api-key` in `action.yml`.
-- **Who is affected:** every consumer of `DailybotHQ/ai-diff-reviewer@v2` (and any remaining `@v1` pins)
-  or `@v2.x` — YAML workflows will fail with "invalid input" at boot.
+- **Who is affected:** every consumer of `DailybotHQ/ai-diff-reviewer@v2`
+  / `@v2.x` — YAML workflows will fail with "invalid input" at boot.
 - **Migration:** rename the key in your workflow YAML:
   `with: { api-key: ... }` → `with: { provider-api-key: ... }`.
   No code changes required.
@@ -885,8 +885,10 @@ Skill:
        - **What breaks:** the `api-key` input is removed. Workflows
          pinning `DailybotHQ/ai-diff-reviewer@v2` will fail at boot with
          "invalid input `api-key`".
-       - **Who is affected:** every consumer of `@v2.x` — the change is
-         major-bump-worthy. Consumers pinned to `@v1` are unaffected.
+       - **Who is affected:** every consumer of `@v2.x` who upgrades —
+         the change is major-bump-worthy (ships as the next major).
+         Consumers who stay on their current major pin are unaffected
+         until they upgrade.
        - **Migration:** rename the key in your workflow YAML:
          `api-key: ${{ secrets.X }}` → `provider-api-key: ${{ secrets.X }}`.
          No other changes required.

@@ -27,7 +27,7 @@ The product name in user-facing strings is **"AI Diff Reviewer"** (capitalised e
 | Providers (user-facing) | [docs/PROVIDERS.md](docs/PROVIDERS.md) |
 | Performance | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) |
 | Iteration-Aware Review | [docs/ITERATION_AWARENESS.md](docs/ITERATION_AWARENESS.md) |
-| Migrating to v2 | [docs/MIGRATION_v2.md](docs/MIGRATION_v2.md) |
+| v2 pin + platform notes | [docs/MIGRATION_v2.md](docs/MIGRATION_v2.md) |
 | Docs index | [docs/README.md](docs/README.md) |
 | Skills & Agents Catalog | [.agents/docs/skills_agents_catalog.md](.agents/docs/skills_agents_catalog.md) |
 | Deep Work Plan skill | [.agents/skills/deepworkplan/SKILL.md](.agents/skills/deepworkplan/SKILL.md) |
@@ -173,7 +173,7 @@ Whenever you change runtime behaviour:
 
 ### 8. SemVer for Releases (MANDATORY)
 
-Releases follow Semantic Versioning. Tags are `vX.Y.Z`. The `release.yml` workflow auto-updates the moving major tag for the current line (`v2`) on every `v2.x.y` release; consumers pinning `@v2` get patches and minor features automatically. The previous major alias (`v1`) freezes at `v1.8.0` and is not advanced by v2 releases. Never delete a published tag — consumers pin to it.
+Releases follow Semantic Versioning. Tags are `vX.Y.Z`. The `release.yml` workflow auto-updates the moving major tag for the current line (`v2`) on every `v2.x.y` release; consumers pinning `@v2` get patches and minor features automatically. Never delete a published tag — consumers pin to it.
 
 ### 9. Marketplace Branding Stable
 
@@ -185,7 +185,7 @@ The current values are:
 - `branding.icon: 'check-circle'`
 - `branding.color: 'purple'`
 
-**Repo slug ≠ Marketplace slug.** The git repo lives at `DailybotHQ/ai-diff-reviewer` (historical, with published tags v1.0.0–v1.4.2) and new copy-paste examples pin against that path (`uses: DailybotHQ/ai-diff-reviewer@v2`; `@v1` remains valid and frozen at `v1.8.0`). The Marketplace listing is a separate slug derived from `name:` — currently `ai-diff-reviewer`. The two are decoupled by design: consumers see the friendly name in Marketplace search; their workflows keep using the stable repo path.
+**Repo slug ≠ Marketplace slug.** The git repo lives at `DailybotHQ/ai-diff-reviewer` and copy-paste examples pin against that path (`uses: DailybotHQ/ai-diff-reviewer@v2`). The Marketplace listing is a separate slug derived from `name:` — currently `ai-diff-reviewer`. The two are decoupled by design: consumers see the friendly name in Marketplace search; their workflows keep using the stable repo path.
 
 ### Rename decision log (chronological)
 

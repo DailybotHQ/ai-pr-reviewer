@@ -82,8 +82,8 @@ It is **not** a replacement for human code review. It's an additional reviewer t
 
 - **License:** MIT.
 - **Channel:** GitHub Marketplace (publicly searchable at [`marketplace/actions/ai-diff-reviewer`](https://github.com/marketplace/actions/ai-diff-reviewer)) + direct repo URL for `uses: DailybotHQ/ai-diff-reviewer@v2`.
-- **Repo path:** `DailybotHQ/ai-diff-reviewer` (renamed 2026-07-14 from `DailybotHQ/ai-pr-reviewer`; the old path still resolves via GitHub's permanent 301 redirect, so existing `@v1` pins keep working).
-- **Versioning:** SemVer. The recommended pin is the moving major `@v2` (tracks latest `v2.x.y`). `@v1` freezes at `v1.8.0` and does not auto-move to v2.
+- **Repo path:** `DailybotHQ/ai-diff-reviewer`.
+- **Versioning:** SemVer. Default pin is the moving major `@v2` (tracks latest `v2.x.y`).
 - **Provider parity:** as of `v1.1.0` the action ships with **four** providers across two families:
   - Chat-completions family (this action drives the tool-use loop): `anthropic`.
   - Agent-runner family (vendor CLI drives the loop; findings return via `.aiprr/findings.json`): `claude-code`, `cursor`, `codex`.
@@ -108,27 +108,18 @@ It is **not** a replacement for human code review. It's an additional reviewer t
   - **CI action:** reviews its own PRs via [`.github/workflows/self-review.yml`](../.github/workflows/self-review.yml). The direct Anthropic baseline runs on every PR/push; the CLI-provider legs run when their secret is configured. Active legs use distinct `self-reviewed:*` labels so each provider's review is separately identifiable in the PR conversation.
   - **Skill:** the vendored copy at `.agents/skills/ai-diff-reviewer/` is re-installed via `npx skills update` after every release, so a broken install flow fails the release itself.
 
-## Roadmap (not a commitment)
+## Current major + roadmap (not a commitment)
 
-The shipped versions so far:
+**Current major: v2** — pin `uses: DailybotHQ/ai-diff-reviewer@v2`. See [`MIGRATION_v2.md`](MIGRATION_v2.md).
 
 | Version | Headline |
 |---|---|
-| **v1.0.0** (2026-05-29) | Initial release — Anthropic provider, composite action, severity gating, tracking comment, 422 fallback. |
-| **v1.1.0** (2026-07-05) | Three new agent-runner providers (`claude-code`, `cursor`, `codex`) alongside the incumbent `anthropic` — zero migration for `@v1` consumers. |
-| **v1.2.x** (2026-07-11 → 2026-07-14) | Cost-scoped dogfooding, per-provider `collapse-previous`, provider-side bug fixes making `claude-code` + `codex` actually usable end-to-end. |
-| **v1.3.x** (2026-07-14) | Marketplace listing published; `author-association` gate for public-repo abuse defense; Claude Code accepts subscription OAuth tokens as `api-key`. |
-| **v1.4.x** (2026-07-14) | Full four-leg self-review matrix on every ready-labeled PR (removed the critical-surface filter); vendored `dailybot` skill dogfood; strictness dogfood at `block-on-critical`. |
-| **v1.5.0** (2026-07-14) | Coordinated rename to **AI Diff Reviewer** (unblocked the Marketplace publish) + **the local companion `ai-diff-reviewer` skill** with the `generate-extension` and `setup` sub-skills + the `.review/extension.md` convention as a single source of truth. |
-| **v1.6.x** (2026-07-14) | `open-pr` sub-skill; dual-surface flow docs; dogfood install hardening. |
-| **v1.7.0** (2026-07-15) | `apply-review` sub-skill closes the CI → local loop. |
-| **v1.8.0** (2026-07-15) | Unconditional Iteration-Aware Review + user-forced reset + `skip-review-label` emergency bypass. |
-| **v2.0.0** (shipping) | SemVer major for the IAR platform: recommended pin `@v2` / skill `2.0.0`; `@v1` freezes at `v1.8.0`. No `action.yml` inputs renamed or removed. |
+| **v2.0.0** (shipping) | IAR platform major — unconditional Iteration-Aware Review, user-forced reset, `skip-review-label` emergency bypass, full companion skill pack (`setup` / `generate-extension` / `open-pr` / `apply-review`). Default pin `@v2` / skill `2.0.0`. No `action.yml` inputs renamed or removed. |
 
-The upcoming work — no commitment on ordering, all `v1.x` unless flagged:
+Upcoming work — no commitment on ordering; ships on the **v2.x** line unless flagged as a new major:
 
-- **Raw chat-completions providers** (`openai`, `gemini`, `bedrock`) — for teams who want to use those models without installing the corresponding vendor CLI. Bedrock is pending a stdlib-only SigV4 design discussion.
+- **Raw chat-completions providers** (`openai`, `gemini`, `bedrock`) — for teams who want those models without installing the corresponding vendor CLI. Bedrock is pending a stdlib-only SigV4 design discussion.
 - **Community-curated prompt library** at `prompts/community/<stack>.md` — Rails, Django, Next.js, Go services, etc. Curated extension files consumers can reference from `prompt-extension-file:`.
-- **`.aiprr/findings.json` v2 schema** — optional `suggestions` field for line-range code snippets, backwards-compatible via forward-compat parser.
+- **`.aiprr/findings.json` schema extensions** — optional `suggestions` field for line-range code snippets, backwards-compatible via forward-compat parser.
 - **More local sub-skills** as the pattern proves out — likely candidates: a `triage` sub-skill for filing follow-up issues from remaining findings, a `changelog` sub-skill for authoring `CHANGELOG.md` entries in the same shape as the commits.
-- **v2.0** — only if a breaking change to the public input/output contract of `action.yml` is unavoidable. There's no such change on the horizon; the abstraction has held across six minor versions.
+- **v3.0** — only if a breaking change to the public input/output contract of `action.yml` is unavoidable. There's no such change on the horizon.

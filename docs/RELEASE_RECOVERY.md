@@ -32,7 +32,7 @@ edge case that bypasses `--atomic`, the state to recognise is:
 - Main branch does NOT contain the `chore(release): sync skill artifacts
   for vX.Y.Z [skip release]` commit that Step 2.5 generated.
 - No GitHub Release for `vX.Y.Z` exists (Step 5 never ran).
-- Major alias tag (`v1`) still points at the previous release (Step 3's
+- Major alias tag (`v2`) still points at the previous release (Step 3's
   `git tag -f` never ran because of `set -euo pipefail` aborting on the
   Step 3 push failure).
 
@@ -65,11 +65,11 @@ git show vX.Y.Z --stat | head -20
 git log origin/main..vX.Y.Z --oneline
 # Should show ONE commit — the `chore(release): sync skill artifacts`.
 
-# And @v1 is still on the old release. Peel both refs to their
-# underlying commit SHA — v1 today is an annotated tag pointing at the
-# previous release tag object, so a bare `rev-parse v1` returns the
-# tag-object SHA and wouldn't compare cleanly against a commit SHA.
-git rev-parse v1^{commit}     # ← previous release commit SHA
+# And @v2 is still on the old release. Peel both refs to their
+# underlying commit SHA — if the major alias is still an annotated tag
+# pointing at a tag object, a bare `rev-parse v2` returns the tag-object
+# SHA and wouldn't compare cleanly against a commit SHA.
+git rev-parse v2^{commit}     # ← previous release commit SHA
 git rev-parse vX.Y.Z^{commit} # ← new release commit SHA (the sync commit)
 ```
 
@@ -148,8 +148,8 @@ the recovery PR carried additional changes (hardening, docs), `main`'s
 tree will also differ from `vX.Y.Z`'s tree — that's fine, those extras
 will ship in a subsequent release.
 
-The relevant invariant for consumers is that `@v1` should point at the
-newest `v1.x.y` release tag, so move it to `vX.Y.Z` (not to `origin/main`):
+The relevant invariant for consumers is that `@v2` should point at the
+newest `v2.x.y` release tag, so move it to `vX.Y.Z` (not to `origin/main`):
 
 ```bash
 git fetch origin --tags
@@ -159,21 +159,21 @@ git fetch origin --tags
 git show vX.Y.Z:skills/ai-diff-reviewer/SKILL.md | grep '^version:'
 # Expected: version: "X.Y.Z"
 
-# Move v1 to vX.Y.Z. Force is correct — v1 is a moving pointer by design.
+# Move v2 to vX.Y.Z. Force is correct — v2 is a moving pointer by design.
 #
-# The `vX.Y.Z^{}` peel is load-bearing: without it, `git tag -f v1 vX.Y.Z`
-# creates v1 as a nested annotated tag pointing at the vX.Y.Z tag object
+# The `vX.Y.Z^{}` peel is load-bearing: without it, `git tag -f v2 vX.Y.Z`
+# creates v2 as a nested annotated tag pointing at the vX.Y.Z tag object
 # (which then points at the commit). Both are valid Git refs, but nested
-# tags make `git rev-parse v1^{commit}` require an extra hop, and
+# tags make `git rev-parse v2^{commit}` require an extra hop, and
 # tag-object SHAs on GitHub's ref API don't compare equal to commit SHAs.
-# Peeling to `^{}` makes v1 a lightweight tag directly at the commit,
-# matching what a consumer running `git checkout v1` expects.
-git tag -f v1 "vX.Y.Z^{}"
-git push origin v1 --force
+# Peeling to `^{}` makes v2 a lightweight tag directly at the commit,
+# matching what a consumer running `git checkout v2` expects.
+git tag -f v2 "vX.Y.Z^{}"
+git push origin v2 --force
 
 # Verify remote agrees — both must print the SAME commit SHA.
 git fetch origin --tags --force
-git rev-parse v1^{commit}       # commit v1 now points at (via peel)
+git rev-parse v2^{commit}       # commit the major alias now points at
 git rev-parse vX.Y.Z^{commit}   # commit vX.Y.Z points at
 ```
 
@@ -185,7 +185,7 @@ it manually with auto-generated notes:
 ```bash
 # Filter to release tags (`vMAJOR.MINOR.PATCH`) only — matches the same
 # pattern auto-release.yml Step 2 uses to compute `previous_tag`.
-# Excludes major aliases (`v1`), pre-release tags, and anything else
+# Excludes major aliases (`v2`), pre-release tags, and anything else
 # that could otherwise slip in with `git tag --sort=-v:refname | sed -n 2p`.
 PREV=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname \
   | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
@@ -294,7 +294,7 @@ After a Step 3.5 abort the state is:
 
 - ✅ Tag `vX.Y.Z` on remote (Step 3 succeeded)
 - ✅ `main` contains the Step 2.5 sync commit (Step 3 pushed it)
-- ✅ `@v1` was moved to `vX.Y.Z` (last line of Step 3)
+- ✅ `@v2` was moved to `vX.Y.Z` (last line of Step 3)
 - ❌ Vendored `.agents/skills/` NOT refreshed (Step 3.5 aborted)
 - ❌ **No GitHub Release for `vX.Y.Z`** (Step 4 didn't run)
 - ❌ No Marketplace update (that trigger fires on Release creation)

@@ -8,26 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 > **Shipping as v2.0.0.** Merge of this line cuts a SemVer major via
-> `auto-release.yml` (`feat!:` commit). The moving `@v2` alias becomes
-> the recommended consumer pin; `@v1` freezes at `v1.8.0`.
+> `auto-release.yml` (`feat!:` commit). **`@v2` is the default consumer
+> pin** going forward (skill `version: "2.0.0"`).
 
-### Migration (v1 → v2)
+### v2 pin surface
 
 Full guide: [`docs/MIGRATION_v2.md`](docs/MIGRATION_v2.md).
 
-- **Recommended pin:** `uses: DailybotHQ/ai-diff-reviewer@v2` and
+- **Default pin:** `uses: DailybotHQ/ai-diff-reviewer@v2` and
   `npx skills add DailybotHQ/ai-diff-reviewer@v2 --skill ai-diff-reviewer`.
-  Companion skill frontmatter is `version: "2.0.0"`.
-- **`@v1` stays on the v1.x line** (latest tag `v1.8.0`). Existing
-  workflows that pin `@v1` keep working and do **not** auto-move to v2.
-- **`action.yml` contract:** no inputs renamed or removed. New IAR /
-  `skip-review-label` inputs remain optional with the same defaults as
-  on the v1.8.0 tag line.
-- **Behavioral note (already on v1.8.0, now the v2 platform story):**
-  Iteration-Aware Review runs on every CI review. Round 2+ of a
-  generation may dedupe non-critical findings you already saw; local
-  skill reviews stay a full pass. Escape / reset / emergency-bypass
-  gestures: [`docs/ITERATION_AWARENESS.md`](docs/ITERATION_AWARENESS.md),
+- **`action.yml` contract:** no inputs renamed or removed.
+- **Platform behaviour:** Iteration-Aware Review on every CI review;
+  local skill reviews stay a full pass. Escape / reset /
+  emergency-bypass: [`docs/ITERATION_AWARENESS.md`](docs/ITERATION_AWARENESS.md),
   [`docs/TRIGGER_MODES.md`](docs/TRIGGER_MODES.md).
 
 ### Changed

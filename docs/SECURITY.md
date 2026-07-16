@@ -85,7 +85,7 @@ Each is pinned by major version. The choice to pin major rather than commit-SHA 
 ### Releases
 
 - Releases are signed by GitHub's release workflow (`actions/create-release` or manual).
-- The moving major tag for the current line (`v2`) is updated by `.github/workflows/release.yml` immediately after each `v2.x.y` publish, automated by the `release` event. The previous major alias (`v1`) remains at `v1.8.0` and is not advanced by v2 releases.
+- The moving major tag for the current line (`v2`) is updated by `.github/workflows/release.yml` immediately after each `v2.x.y` publish, automated by the `release` event.
 - Consumers who require pinned-SHA security can pin to a specific commit instead of `@v2`.
 
 ## Secrets

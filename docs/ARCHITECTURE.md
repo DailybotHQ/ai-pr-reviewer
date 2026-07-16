@@ -153,7 +153,7 @@ Sibling deliverable to the GitHub Action. Installed into a consumer repo via `np
 1. **Zero LLM calls of its own.** Every LLM interaction happens inside the developer's coding agent. This is what makes the skill zero-cost to install (no API key round-trip) and provider-agnostic.
 2. **Read-only by default.** The parent review flow only reads. Every sub-skill that writes files asks for explicit consent first.
 3. **Non-blocking on failure.** If the skill can't run (missing `gh` CLI, no git remote, corrupted diff), it prints a clear error and exits — the developer's primary work is never blocked.
-4. **Symmetric with the Action.** Same base prompt, same severity model, same `.review/extension.md` extension convention, same output format. Pinning the same version on both surfaces guarantees identical review behaviour.
+4. **Symmetric with the Action.** Same base prompt, same severity model, same `.review/extension.md` extension convention, same output format. Pinning the same version on both surfaces guarantees the same methodology and severity model (CI may additionally dedupe on round 2+ via IAR; local reviews stay a full pass).
 
 **Dogfooding contract:** this repo vendors its own skill copy at [`.agents/skills/ai-diff-reviewer/`](../.agents/skills/ai-diff-reviewer/), refreshed automatically by [`auto-release.yml`](../.github/workflows/auto-release.yml) Step 3.5 after every release. A skill change that ships broken `npx skills add` compatibility fails Step 3.5 of the very release that publishes it.
 

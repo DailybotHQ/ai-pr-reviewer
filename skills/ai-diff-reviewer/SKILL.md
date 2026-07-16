@@ -49,7 +49,9 @@ the action source.
 **Version parity.** The [`prompt.md`](prompt.md) in this skill is
 byte-identical to the one the Action ships in the same tagged release
 (enforced by CI's `Skills — prompt-sync invariant` job). Pinning
-`@v2.0.0` on both surfaces guarantees identical reviews.
+`@v2.0.0` on both surfaces guarantees the same methodology and severity
+model (CI may additionally dedupe on round 2+ via Iteration-Aware
+Review; local reviews stay a full pass).
 
 Source: <https://github.com/DailybotHQ/ai-diff-reviewer> · License: MIT
 
