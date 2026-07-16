@@ -480,6 +480,10 @@ review) so the rules below protect its invariants.
 
 ## PR hygiene
 
+- When the `set_pr_complexity` tool is available (`complexity-labels-enabled`),
+  call it **once** before `submit_review` on every PR — even docs-only
+  changes get a `low`/`medium`/`high` assessment. Skipping it leaves the
+  PR without a `complexity:*` label.
 - PR title in Conventional Commits format (matches the squash-merge
   subject).
 - PR body follows `## Summary / ## Change Log / ## Risks`.
