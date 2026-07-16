@@ -271,6 +271,40 @@ If you want to reduce the action's blast radius further:
 - **Provider data retention.** Anthropic's policy applies to anything the action sends. As of this writing, Anthropic does not train on Messages API data, but you should verify against the provider's current Terms of Service for your specific compliance needs.
 - **The `severity` field is model-asserted, not verified.** A model that systematically under-tags severity will under-block. The bundled default prompt explicitly defines severity levels to mitigate this; calibrate via a custom prompt if your team needs stricter assignments.
 
+## Iteration-Aware Review (IAR) trust boundary (v1.6.0+, opt-in)
+
+The IAR subsystem (see [`ITERATION_AWARENESS.md`](ITERATION_AWARENESS.md)) adds three surfaces worth calling out explicitly. All are **opt-in** — with `iteration-awareness-enabled: false` (the default), none of the code paths below run and the trust model is byte-identical to pre-v1.6.0.
+
+### New subprocess boundary — `git diff` / `git show` / `git rev-parse`
+
+IAR shells out to `git` (never `shell=True`, always argv-list) for four purposes: computing a deterministic hash of `git diff base..head` (generation detection), reading file content at a specific SHA (`git show <sha>:<path>` for finding-fingerprint code context), computing new-line percentages for the safety net (`git diff --numstat`), and resolving `origin/<base>` to a SHA (`git rev-parse`). SHA arguments come from trusted sources (git HEAD, the GitHub webhook payload, or the runner's own checkout — never from PR body / description / label text). The `<path>` argument to `git show` routes through `safe_repo_path()` (same helper the model-facing `read_file` uses), so path traversal on the git surface is impossible for the same reasons it's impossible on the tool surface.
+
+### Prompt splicing — `IAR_EXHAUSTIVE_PROMPT_ADDENDUM`
+
+On round 1 of a new generation under `first-pass-exhaustive`, IAR appends a **hardcoded** string constant to the system prompt to instruct the model to be exhaustive. The constant lives at module scope in `scripts/reviewer.py` and is never sourced from user input, env, or config. No `iar_config.*` field is interpolated into the prompt. There is no user-controllable prompt-splicing surface.
+
+### Marker-embedded state block — untrusted JSON from PR body
+
+IAR persists per-PR iteration state as a JSON block inside the tracking marker comment (embedded between HTML comment markers). Because anyone with write access to the PR body — or a compromised bot account — could edit that block, the parser (`_parse_state_from_marker_body`) treats every field as untrusted string data:
+
+- Validates `data["version"] == IAR_STATE_SCHEMA_VERSION` **before** reading any other field. Unknown versions log + return `None` (which is handled downstream as "first review").
+- Wraps all numeric fields in `int()` and all string/list fields in `str()`/`list()` so type-confusion attacks (e.g. `"generation": [1, 2, 3]`) fail with a caught `TypeError`/`ValueError` rather than propagating.
+- Catches `JSONDecodeError`, `ValueError`, `TypeError`, and the internal `IterationStateParseError` — never raises. On any failure, the run degrades to a fresh first review (safe default).
+- Fingerprint strings stored in `resolved_fingerprints` / `open_fingerprints_this_gen` are used only in `==` and `in` comparisons against newly-computed fingerprints — never as subprocess args, HTTP URLs, path components, or shell strings.
+- Convergence policy strings pulled from the block are used only to populate `state.policy_applied` (rendered in the marker annotation); the policy that governs the current run's behavior always comes from `iar_config.policy` (via `build_iar_config` with a whitelist), not from the parsed state.
+
+### User-controllable inputs
+
+Two new inputs accept user text: `convergence-policy` and `iteration-escape-label`. Both are validated at parse time — the policy is compared against a whitelist and falls back to `iterative` on any unknown value; the escape label is compared with `in pr_labels` (a Python list membership check on strings pulled from the GitHub REST `labels` field). Neither is ever passed to a subprocess, HTTP URL, or shell string.
+
+### API surface delta
+
+Zero new endpoints. The one HTTP call added by IAR (`_fetch_pr_labels` in Task 8) reuses the existing `gh_request` helper against `GET /repos/{owner}/{repo}/pulls/{pr}`, which requires no additional token scope beyond the `pull-requests: read` the reviewer already needs. The marker-comment read + write path is unchanged from pre-IAR runs (existing `gh_request` GraphQL/REST). No token elevation required.
+
+### Cost telemetry
+
+`RunTelemetry` records `start_time_monotonic: float`, `tokens_used: int`, and `estimated_baseline_tokens: int`. All three fields are numeric — no user strings, no PII, no secrets. The five IAR action outputs surface only these numerics plus the enum-validated policy name and the round/generation counters. There is no path by which a value derived from the PR body could reach `iteration-tokens-used` or `iteration-cost-vs-baseline-estimate`.
+
 ## Supply-chain audit checklist
 
 For organisations that need to audit before adopting:
