@@ -222,11 +222,11 @@ def finding_fingerprint(finding: Finding, code_context: CodeContext | None) -> s
         context_hash = "no_context"  # file didn't exist at review SHA
     return hashlib.sha256(
         f"{finding.path}|{finding.line}|{finding.severity}|"
-        f"{finding.body[:200]}|{context_hash}".encode()
+        f"{finding.body[:IAR_FINGERPRINT_BODY_PREFIX_CHARS]}|{context_hash}".encode()
     ).hexdigest()[:16]
 ```
 
-Note the body is truncated to 200 chars: catches meaningful content differences without being brittle to trivial LLM output variation.
+Note the body is truncated to `IAR_FINGERPRINT_BODY_PREFIX_CHARS = 200` chars (module-level constant next to `IAR_CONTEXT_HASH_RADIUS`): catches meaningful content differences without being brittle to trivial LLM output variation.
 
 ### 5.3 Behavior matrix
 
@@ -718,11 +718,7 @@ The tool-call cap enforcement in the agent-runner code path (Claude Code / Curso
 
 **Follow-up:** the clean fix is either (a) plumb `code_contexts` to the agent-runner truncation site so `finding_fingerprint` can produce merge-compatible hashes, or (b) move the cap enforcement into `run_iar_post_llm` so the pipeline is single-path. Either resolves the semantic mismatch of `code_context=None` fingerprints from the truncation site vs `code_context=<real>` fingerprints from the post-LLM stage.
 
-### 13.2 Fingerprint body slice is a magic constant
-
-`finding.body[:200]` in `finding_fingerprint` (`scripts/reviewer.py`) is inlined as a magic number rather than promoted to a module-level `IAR_FINGERPRINT_BODY_CHARS: int = 200` next to `IAR_CONTEXT_HASH_RADIUS`. The value is stable and documented in this file (§ 5.2), but a single named constant would let tests and docs reference one source of truth. Cosmetic; no behavioral impact.
-
-### 13.3 Per-generation telemetry stays at placeholder values
+### 13.2 Per-generation telemetry stays at placeholder values
 
 `state.history[]` entries carry `tokens_used=0` + `wall_clock_ms=0` placeholders that are never populated. On a `NEW_COMMITS` / `REBASED` transition, `advance_generation` closes the prior generation's `history[]` entry and IAR could — but currently does not — backfill telemetry into that closed entry. The previous approach (backfilling with the CURRENT run's telemetry at post-LLM time) was incorrect because the current run is round 1 of the NEW generation, so its tokens / wall-clock belong to the new gen, not the closed one. Attributing them backward misreports per-generation cost history and poisons the cost-vs-baseline estimate once token accounting lands.
 
@@ -730,13 +726,25 @@ The tool-call cap enforcement in the agent-runner code path (Claude Code / Curso
 
 **Follow-up:** accumulate telemetry across a generation's rounds (add a `tokens_used_this_gen` + `wall_clock_ms_this_gen` accumulator to `IterationState`, increment on every post-LLM step, and only fold the accumulators into `history[-1]` when `advance_generation` closes the entry). Non-blocking for the shipped runtime; matters most when token accounting lands.
 
-### 13.4 Cost-vs-baseline heuristic is coarse and non-negative
+### 13.3 Cost-vs-baseline heuristic is coarse and non-negative
 
 `_estimate_cost_vs_baseline` combines cap-expansion (`effective_cap / base_cap - 1`) with a flat `+5%` addendum flag when the exhaustive prompt is spliced. It ignores `silenced_count` / `surfaced_count`, never consults `state.history[]`, and can only emit `"0%"` or `"+N%"` — the `"-N%"` / `"unknown"` values sketched in the original spec do NOT ship today.
 
 **Consequence.** § 3.2, § 9.5, README, `action.yml`, and `skills/ai-diff-reviewer/setup/reference.md` now describe only the values the function actually returns. Consumers MUST NOT gate CI on `iteration-cost-vs-baseline-estimate == '-30%'` — the condition will never fire under the current implementation.
 
 **Follow-up.** Extend the heuristic to (a) fold in silenced-finding token savings on `iterative` / `round-capped` rounds and (b) surface `"unknown"` when `state.history[]` lacks enough data to project a baseline. Once implemented, restore the `"-N%"` / `"unknown"` language across the four surfaces listed above.
+
+### 13.4 `scripts/reviewer.py` has grown past the file-size ceiling
+
+The IAR subsystem added ~1300 lines to `scripts/reviewer.py`, pushing the file to roughly 6700 LOC — comfortably past the ~4500-line soft ceiling in [`docs/STANDARDS.md § "File size"`](STANDARDS.md). Per Rule #2, the runtime is stdlib-only and lives in a single source file, so the standard splitting playbook (extract to a subpackage) trades the file-size ceiling against a load-bearing project invariant.
+
+**Consequence.** New code, tests, and reviewers navigate a larger file than the standard recommends. The dedicated IAR subsections in `scripts/reviewer.py` are heavily commented and grouped with clear section banners (`# ---- IAR: <topic> ----`) to compensate.
+
+**Follow-up.** Two paths were considered and deferred:
+1. **Extract IAR to a submodule inside `scripts/`** (e.g. `scripts/iar/state.py`, `scripts/iar/dispatch.py`) imported by `scripts/reviewer.py`. Preserves stdlib-only, but changes the `run: python3 ${{ github.action_path }}/scripts/reviewer.py` composite-action contract's implicit "single-file runtime" assumption and would require the CI compile-check to walk the subpackage.
+2. **Split `scripts/reviewer.py` into orchestrator + step scripts wired by `action.yml`**. Larger refactor; would enforce a natural boundary between the diff-fetching / IAR-state / LLM-call / posting phases but is out of scope for this PR.
+
+Both paths deferred to a dedicated refactor PR that can be reviewed on its own without the IAR-behavioural noise mixed in.
 
 ---
 

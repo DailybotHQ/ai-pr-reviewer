@@ -356,6 +356,16 @@ IAR_DEFAULT_CAP_MULTIPLIER: int = 3
 # = 21-line window.
 IAR_CONTEXT_HASH_RADIUS: int = 10
 
+# Prefix of the finding body included in the fingerprint payload before
+# hashing (docs/ITERATION_AWARENESS.md § 5.2). Trades fingerprint
+# stability (short prefix = more collisions across cosmetically
+# different findings) against LLM-wording-drift robustness (long prefix
+# = re-phrased-same-issue evades dedup). 200 chars covers the typical
+# "≤ 3-sentence single-issue" body without pulling in trailing
+# quote-block noise; the code-context hash carries the disambiguation
+# load for near-collisions on the prefix.
+IAR_FINGERPRINT_BODY_PREFIX_CHARS: int = 200
+
 # When a generation change (NEW_COMMITS / REBASED) brings more than this
 # percentage of new lines relative to the total diff, the safety net
 # forces first-pass-exhaustive for that round regardless of the configured
@@ -2763,7 +2773,7 @@ def finding_fingerprint(
         context_hash = "no_context"
     payload: str = (
         f"{finding.path}|{finding.line}|{finding.severity}|"
-        f"{finding.body[:200]}|{context_hash}"
+        f"{finding.body[:IAR_FINGERPRINT_BODY_PREFIX_CHARS]}|{context_hash}"
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
@@ -3612,7 +3622,7 @@ def _estimate_cost_vs_baseline(
     override raising the cap). Silenced findings are a NET SAVE on
     the submission side (fewer GitHub API calls, less user noise) but
     do NOT affect LLM cost and are NOT modelled here — see
-    `docs/ITERATION_AWARENESS.md § 13.4` for the follow-up plan to
+    `docs/ITERATION_AWARENESS.md § 13.3` for the follow-up plan to
     extend this to a `"-N%"` / `"unknown"` heuristic. Downstream
     consumers today MUST NOT gate CI on `== '-N%'`; the condition
     will never fire under the current implementation.
@@ -3654,10 +3664,15 @@ def compute_reviewed_label_applied(
 
     Returns `True` if ANY of:
       1. `label_stamped` — this run's `gh_apply_label` call succeeded.
-      2. `applied_label in current_labels` — the label was already on
-         the PR at trigger time (a prior run stamped it; this run may
-         be a blocked follow-up or a no-op re-trigger, but the label
-         is still present).
+      2. `_labels_contain_ci(current_labels, applied_label)` — the
+         label was already on the PR at trigger time (a prior run
+         stamped it; this run may be a blocked follow-up or a no-op
+         re-trigger, but the label is still present). Uses the
+         same case-insensitive helper as `label-gate`, the
+         escape-label check, and the skip-review-label check, so
+         a casing mismatch between the configured `applied-label`
+         and the GitHub-returned name can never falsely clear the
+         arming bit and wrongly disarm a legitimate reset gesture.
       3. `prior_state.reviewed_label_applied is True` — the previous
          run's marker recorded a successful stamp AND this run took
          a path (blocked, escape-label, etc.) that does not remove

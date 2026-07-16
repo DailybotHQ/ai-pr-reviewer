@@ -270,6 +270,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it to `IAR_FINGERPRINT_BODY_CHARS` next to the other IAR module
   constants. Cosmetic; no behavioral impact.
 
+### Fixed (round-12 self-review: doc-drift sweep + magic-number promotion)
+
+Round-12 self-review **passed the strictness gate** (highest severity =
+warning, `self-reviewed:cursor` label stamped, PR green) and flagged
+4 warnings + 1 info — all doc/polish, no runtime bugs:
+
+- **Two more case-sensitive-label doc drift sites** (round-11 fixed
+  the `IAR — User-controllable inputs` section but the follow-on
+  reviewer caught two other spots): `docs/SECURITY.md § API surface
+  delta` for skip-review-label still said `skip_review_label in
+  current_labels`, and `compute_reviewed_label_applied`'s docstring
+  (signal 2) said `applied_label in current_labels`. Both updated
+  to `_labels_contain_ci` and cross-referenced with `label-gate`,
+  escape-label, and skip-review-label as the four consumers of
+  the same helper.
+- **`examples/iteration-aware.yml` comment** claimed "every input
+  below matches the shipped default" but `max-review-rounds: 5`
+  is non-default (default is `0 = unlimited`). Copy-paste
+  consumers who kept the value would silently be running under a
+  `round-capped: 5` semantics if they later switched policies.
+  Rewrote the comment to explicitly mark `max-review-rounds` as
+  `NON-DEFAULT (demo)` and split the DEFAULT vs demo inputs.
+- **`finding.body[:200]` magic number** in `finding_fingerprint`
+  promoted to module-level `IAR_FINGERPRINT_BODY_PREFIX_CHARS: int
+  = 200` next to `IAR_CONTEXT_HASH_RADIUS`. Removed the "known
+  limitation" § 13.2 entry (no longer a limitation); § 13.3/13.4
+  renumbered. Doc code-block in ITERATION_AWARENESS.md § 5.2 also
+  updated to reference the constant.
+- **File-size overflow note.** `scripts/reviewer.py` grew past the
+  ~4500-line soft ceiling in `docs/STANDARDS.md` due to the IAR
+  landing. Added a new § 13.4 "Known limitation" documenting the
+  overflow, the two considered refactor paths (submodule vs
+  orchestrator-step split), and the deferral rationale — both
+  paths trade the file-size ceiling against the load-bearing
+  "single-file stdlib runtime" invariant, so the refactor
+  deserves its own PR to be reviewed on its own.
+
 ### Fixed (round-11 self-review: bot_login hoist + doc alignment)
 
 Round-11 self-review **passed the strictness gate** (highest severity =

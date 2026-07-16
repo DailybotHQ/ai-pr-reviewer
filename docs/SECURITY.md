@@ -340,7 +340,7 @@ On a skip run the reviewer explicitly does NOT perform any of the following, so 
 
 Zero new endpoints. The skip check reuses the existing `gh_request` REST helper against `GET /repos/{owner}/{repo}/pulls/{pr}` (already called for the label-gate check). The one new HTTP call is `POST /repos/{owner}/{repo}/issues/{pr}/comments` for the tracking comment, which the reviewer already uses on every non-skipped run. No token elevation required.
 
-The label name flows into a single Python string comparison (`skip_review_label in current_labels`) and into `render_tracking_body_skipped_by_label()` where it is `str`-interpolated into a Markdown code fence — never a subprocess arg, HTTP URL path component, or shell string.
+The label name flows through the `_labels_contain_ci` helper (whitespace-trimmed, case-insensitive membership over strings pulled from the GitHub REST `labels` field — same helper `label-gate`, the escape label, and the reviewed-label reset check use) and into `render_tracking_body_skipped_by_label()` where it is `str`-interpolated into a Markdown code fence — never a subprocess arg, HTTP URL path component, or shell string.
 
 ## Supply-chain audit checklist
 

@@ -47,18 +47,20 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           strictness: block-on-critical
 
-          # Iteration-Aware Review tuning knobs — every input below
-          # matches the shipped default. All four can be omitted
-          # entirely and you'll get the same behavior. Kept explicit
-          # here as documentation.
+          # Iteration-Aware Review tuning knobs — inputs marked DEFAULT
+          # can be omitted entirely and you'll get the same behavior;
+          # `max-review-rounds` is a NON-default demonstration of the
+          # input shape. Kept explicit here as documentation.
           convergence-policy: first-pass-exhaustive        # DEFAULT
           # Round 1 of a new generation gets 3x the baseline cap so the
           # LLM can surface a comprehensive initial pass.
           exhaustive-first-pass-cap-multiplier: 3          # DEFAULT
-          # Only used by the `round-capped` policy; harmless here.
-          # Set to 5 in this example to show the input shape (default
-          # is 0 = unlimited).
-          max-review-rounds: 5
+          # NOT the default (default is 0 = unlimited). Only used by
+          # the `round-capped` policy — harmless under
+          # `first-pass-exhaustive` above. Shown here to illustrate
+          # the input shape; delete it if you're not switching to
+          # `round-capped`.
+          max-review-rounds: 5                             # NON-DEFAULT (demo)
           # Add this label to any PR to force a full (un-deduped) review
           # for that specific run. Persisted state is preserved so the
           # next normal run resumes the dedup timeline.
