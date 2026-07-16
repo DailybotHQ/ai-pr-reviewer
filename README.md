@@ -16,7 +16,7 @@ The same [`prompts/default.md`](prompts/default.md) drives both surfaces. Pinnin
 
 | Surface | Where it runs | Install |
 |---|---|---|
-| **GitHub Action** — auto-review every PR | On `ubuntu-latest` in your CI | Add `uses: DailybotHQ/ai-diff-reviewer@v1` to a workflow → [§ jump](#in-ci--as-a-github-action) |
+| **GitHub Action** — auto-review every PR | On `ubuntu-latest` in your CI | Add `uses: DailybotHQ/ai-diff-reviewer@v2` to a workflow → [§ jump](#in-ci--as-a-github-action) |
 | **Coding-agent skill** — review before you push | In your coding agent (Cursor, Claude Code, Codex, Gemini, Copilot, Cline, Windsurf) | `npx skills add DailybotHQ/ai-diff-reviewer --skill ai-diff-reviewer` → [§ jump](#locally--as-a-coding-agent-skill) |
 
 **Use them together** — install the skill for pre-push checks, install the Action for the merge gate, share **one `.review/extension.md`** for your repo-specific rules, and the two stay in perfect sync (see [§ Bringing them together](#bringing-them-together--reviewextensionmd)).
@@ -90,7 +90,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0   # required: the action uses `git diff origin/<base>...HEAD`
-      - uses: DailybotHQ/ai-diff-reviewer@v1
+      - uses: DailybotHQ/ai-diff-reviewer@v2
         with:
           api-key: ${{ secrets.ANTHROPIC_API_KEY }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -130,7 +130,7 @@ The action ships **four LLM providers** in two families. Pick one with the `prov
 
 ```yaml
 # Cursor — flat-rate on Pro
-- uses: DailybotHQ/ai-diff-reviewer@v1
+- uses: DailybotHQ/ai-diff-reviewer@v2
   with:
     provider: cursor
     api-key: ${{ secrets.CURSOR_API_KEY }}
@@ -139,7 +139,7 @@ The action ships **four LLM providers** in two families. Pick one with the `prov
 
 ```yaml
 # OpenAI Codex
-- uses: DailybotHQ/ai-diff-reviewer@v1
+- uses: DailybotHQ/ai-diff-reviewer@v2
   with:
     provider: codex
     api-key: ${{ secrets.OPENAI_API_KEY }}
@@ -153,7 +153,7 @@ Ready-to-copy workflows per provider: [`examples/provider-claude-code.yml`](exam
 Like Cursor, `claude-code` can bill against a **Claude Pro/Max subscription**. Run `claude setup-token` on a machine logged into your plan, store the resulting `sk-ant-oat…` token as a secret, and pass it as `api-key` — the action auto-detects the prefix and uses subscription auth:
 
 ```yaml
-- uses: DailybotHQ/ai-diff-reviewer@v1
+- uses: DailybotHQ/ai-diff-reviewer@v2
   with:
     provider: claude-code
     api-key: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}   # sk-ant-oat… subscription token
@@ -219,7 +219,7 @@ Consume them in a later step by giving the action step an `id`:
 
 ```yaml
       - id: review
-        uses: DailybotHQ/ai-diff-reviewer@v1
+        uses: DailybotHQ/ai-diff-reviewer@v2
         with:
           api-key: ${{ secrets.ANTHROPIC_API_KEY }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -276,7 +276,7 @@ Threat model & full detail: [docs/SECURITY.md § "Author-association gate"](docs
 ### Run only on PRs labelled `ready`, apply `pr-reviewed` on success
 
 ```yaml
-- uses: DailybotHQ/ai-diff-reviewer@v1
+- uses: DailybotHQ/ai-diff-reviewer@v2
   with:
     api-key: ${{ secrets.ANTHROPIC_API_KEY }}
     github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -287,7 +287,7 @@ Threat model & full detail: [docs/SECURITY.md § "Author-association gate"](docs
 ### Block merge on critical findings
 
 ```yaml
-- uses: DailybotHQ/ai-diff-reviewer@v1
+- uses: DailybotHQ/ai-diff-reviewer@v2
   with:
     api-key: ${{ secrets.ANTHROPIC_API_KEY }}
     github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -320,7 +320,7 @@ A *failing* required check blocks the merge; a *skipped* one does not. With **se
 ### Custom prompt for your codebase
 
 ```yaml
-- uses: DailybotHQ/ai-diff-reviewer@v1
+- uses: DailybotHQ/ai-diff-reviewer@v2
   with:
     api-key: ${{ secrets.ANTHROPIC_API_KEY }}
     github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -339,7 +339,7 @@ The prompt is the most powerful knob. See [docs/PROMPTS.md](docs/PROMPTS.md) for
 Run only when you signal readiness by adding a label; toggle the label off/on to re-run:
 
 ```yaml
-- uses: DailybotHQ/ai-diff-reviewer@v1
+- uses: DailybotHQ/ai-diff-reviewer@v2
   with:
     api-key: ${{ secrets.ANTHROPIC_API_KEY }}
     github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -354,7 +354,7 @@ Full guide: [docs/TRIGGER_MODES.md](docs/TRIGGER_MODES.md). Want unlabeled PRs t
 Let the reviewer write a first-draft body when the current one is empty or under 50 chars. Guarded by a marker so it never overwrites your edits.
 
 ```yaml
-- uses: DailybotHQ/ai-diff-reviewer@v1
+- uses: DailybotHQ/ai-diff-reviewer@v2
   with:
     api-key: ${{ secrets.ANTHROPIC_API_KEY }}
     github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -368,7 +368,7 @@ Full guide: [docs/PR_METADATA_CHECKS.md](docs/PR_METADATA_CHECKS.md).
 Apply a `complexity:low/medium/high` label based on cognitive load, files touched, and security surface — not line count:
 
 ```yaml
-- uses: DailybotHQ/ai-diff-reviewer@v1
+- uses: DailybotHQ/ai-diff-reviewer@v2
   with:
     api-key: ${{ secrets.ANTHROPIC_API_KEY }}
     github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -380,7 +380,7 @@ Apply a `complexity:low/medium/high` label based on cognitive load, files touche
 If you want the review attributed to a specific bot account (e.g. so branch protection rules can require approval from "anyone except the bot"):
 
 ```yaml
-- uses: DailybotHQ/ai-diff-reviewer@v1
+- uses: DailybotHQ/ai-diff-reviewer@v2
   with:
     api-key: ${{ secrets.ANTHROPIC_API_KEY }}
     github-token: ${{ secrets.AUTOMATION_GITHUB_TOKEN }}   # PAT for your bot account
@@ -391,7 +391,7 @@ If you want the review attributed to a specific bot account (e.g. so branch prot
 For a public repo, external contributors can open PRs — and each review costs real money (~50K–200K tokens per PR). The `author-association` input (default `OWNER,MEMBER,COLLABORATOR`, v1.3.0+) gates reviews on the PR author's relationship to the repo; the field comes from GitHub's payload and cannot be spoofed. Belt-and-suspenders combined with a label gate:
 
 ```yaml
-- uses: DailybotHQ/ai-diff-reviewer@v1
+- uses: DailybotHQ/ai-diff-reviewer@v2
   with:
     api-key: ${{ secrets.ANTHROPIC_API_KEY }}
     author-association: 'OWNER,MEMBER,COLLABORATOR,CONTRIBUTOR'  # optional: allow returning contributors
@@ -423,16 +423,16 @@ The job-level `timeout-minutes: 15` is recommended — the agentic loop has its 
 
 The second surface: the **exact same review methodology** the CI Action runs, executed by your local coding agent (Cursor, Claude Code, Codex, Gemini, Copilot, Cline, Windsurf) on the branch you're working on right now — no push required. Useful for pre-flight checks, iterating on prompt-extension rules, or getting a second opinion on a WIP branch without opening a draft PR.
 
-The skill's [`prompt.md`](skills/ai-diff-reviewer/prompt.md) is a byte-identical copy of the Action's shipped [`prompts/default.md`](prompts/default.md), kept in sync by [`auto-release.yml`](.github/workflows/auto-release.yml) on every release cut. Pin the same version on both surfaces → **local review says X ⇒ CI will say X too**.
+The skill's [`prompt.md`](skills/ai-diff-reviewer/prompt.md) is a byte-identical copy of the Action's shipped [`prompts/default.md`](prompts/default.md), kept in sync by [`auto-release.yml`](.github/workflows/auto-release.yml) on every release cut. Pin the same version on both surfaces → **same methodology and severity model locally and in CI** (CI may additionally dedupe on round 2+ via Iteration-Aware Review; local reviews stay a full pass).
 
 ## Quick start (skill)
 
 ```bash
-# Latest v1.x
+# Latest v2.x
 npx skills add DailybotHQ/ai-diff-reviewer --skill ai-diff-reviewer
 
 # Or pin to a specific action version for reproducibility:
-npx skills add DailybotHQ/ai-diff-reviewer@v1 --skill ai-diff-reviewer
+npx skills add DailybotHQ/ai-diff-reviewer@v2 --skill ai-diff-reviewer
 ```
 
 `npx skills` vendors the skill into `.agents/skills/ai-diff-reviewer/` in your repo and records source + content hash in `skills-lock.json` so teammates restore identical bytes with `npx skills experimental_install`. Bump with `npx skills update ai-diff-reviewer`.
@@ -498,7 +498,7 @@ The skill uses your local agent's own tools (Read / Grep / Glob) to gather conte
 **Recommendation:** approve / request-changes / comment-only
 ```
 
-Reproducing this exact shape (verdict → findings table → per-finding body → notes → recommendation) is what lets you trust "the local review says X, so CI will say X too." Full flow: [`skills/ai-diff-reviewer/SKILL.md`](skills/ai-diff-reviewer/SKILL.md).
+Reproducing this exact shape (verdict → findings table → per-finding body → notes → recommendation) is what lets you trust the same methodology and severity model on both surfaces. On CI round 2+ of a generation, Iteration-Aware Review may additionally dedupe findings a local full pass would still list — expected, not a parity bug. Full flow: [`skills/ai-diff-reviewer/SKILL.md`](skills/ai-diff-reviewer/SKILL.md).
 
 ## Sub-skill: `setup` — install the Action via wizard
 
@@ -561,7 +561,7 @@ The two surfaces converge on a single **repo-specific extension file** — a pla
 **Put your custom overrides in `.review/extension.md`** at your repo root — the local skill auto-detects it, and your CI workflow references the same file via the `prompt-extension-file:` input:
 
 ```yaml
-- uses: DailybotHQ/ai-diff-reviewer@v1
+- uses: DailybotHQ/ai-diff-reviewer@v2
   with:
     api-key: ${{ secrets.ANTHROPIC_API_KEY }}
     github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -607,7 +607,7 @@ The Action's runtime (the local skill mirrors these steps in your coding agent):
 10. **Apply label** — applies `applied-label` if set and the strictness gate didn't block.
 11. **Strictness gate** — exits 2 if blocked, 0 otherwise.
 
-The local companion skill diverges at two boundaries: (1) it prints findings instead of posting to GitHub, and (2) it does **not** run the IAR dedup pipeline — a local review is always a full pass against the current diff (it may surface findings CI has already silenced on round 2+ of the same generation). Same base prompt, same severity model, same output shape. IAR steps 6 and 8 apply only on Action runs; see [docs/ITERATION_AWARENESS.md](docs/ITERATION_AWARENESS.md).
+The local companion skill diverges at two boundaries: (1) it prints findings instead of posting to GitHub, and (2) it does **not** run the IAR dedup pipeline — a local review is always a full pass against the current diff (it may surface findings CI has already deduped on round 2+ of the same generation). Same base prompt, same severity model, same output shape. IAR steps 6 and 8 apply only on Action runs; see [docs/ITERATION_AWARENESS.md](docs/ITERATION_AWARENESS.md).
 
 For the full design, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/PROVIDERS.md](docs/PROVIDERS.md), [docs/PROMPTS.md](docs/PROMPTS.md), [docs/STRICTNESS.md](docs/STRICTNESS.md).
 
@@ -680,7 +680,7 @@ Yes. The default `secrets.GITHUB_TOKEN` has the right scope; just make sure the 
 Yes — see [`.github/workflows/self-review.yml`](.github/workflows/self-review.yml) in this repo for the pattern. This repo also vendors its own skill copy at [`.agents/skills/ai-diff-reviewer/`](.agents/skills/ai-diff-reviewer/) refreshed automatically on every release — dogfooding the install flow every time we publish.
 
 **How do version pins between the Action and the skill line up?**
-They're intended to be identical. `uses: DailybotHQ/ai-diff-reviewer@v1.4.2` in CI + `npx skills add DailybotHQ/ai-diff-reviewer@v1.4.2 --skill ai-diff-reviewer` locally = byte-identical prompt on both surfaces. Pinning to the moving `@v1` alias on both sides also works — new patches and minor features flow to both simultaneously.
+They're intended to be identical. `uses: DailybotHQ/ai-diff-reviewer@v2.0.0` in CI + `npx skills add DailybotHQ/ai-diff-reviewer@v2.0.0 --skill ai-diff-reviewer` locally = byte-identical prompt on both surfaces. Pinning to the moving `@v2` alias on both sides also works — new patches and minor features flow to both simultaneously.
 
 ---
 

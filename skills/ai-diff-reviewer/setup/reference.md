@@ -3,7 +3,7 @@
 Every input the [AI Diff Reviewer](https://github.com/DailybotHQ/ai-diff-reviewer)
 GitHub Action accepts, in one place. Adapted from `action.yml` in the
 canonical repository; this file is regenerated alongside skill releases,
-so it always matches the `@v1` behavior.
+so it always matches the `@v2` behavior.
 
 **When to read this file:** the developer asks a specific question about
 an input — *"what does `strictness` do?"*, *"how do I pin the Claude
@@ -498,4 +498,4 @@ by the auto-release workflow's skill-sync step. If you spot a drift
 (a new input in `action.yml` that's missing here, or a description
 mismatch), file an issue at
 https://github.com/DailybotHQ/ai-diff-reviewer/issues — this file
-should always be a truthful summary of the `@v1` contract.
+should always be a truthful summary of the `@v2` contract.

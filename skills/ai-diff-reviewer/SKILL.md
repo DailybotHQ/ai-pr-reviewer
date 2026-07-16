@@ -1,7 +1,7 @@
 ---
 name: ai-diff-reviewer
 description: Local & CI companion to the AI Diff Reviewer GitHub Action (DailybotHQ/ai-diff-reviewer on GitHub, "AI Diff Reviewer" on the Marketplace). Router for five capabilities — (1) run a local review of the current branch's diff using the SAME methodology as the CI action, (2) generate a repo-tailored `.review/extension.md` via the `generate-extension` sub-skill, (3) install and configure the GitHub Action itself in a repo that doesn't have it yet via the `setup` sub-skill (also doubles as the reference manual for every `action.yml` input), (4) author a well-documented pull request from the current branch's diff (Conventional-Commits title inference, structured body, PR-template merge, `gh pr create`/`edit`) via the `open-pr` sub-skill, (5) read the AI review the CI Action posted back on the current branch's open PR, present findings in the same format as the local review, and optionally walk the developer through each finding to apply/defer/skip (multi-leg-aware, per-finding consent, no commits/pushes) via the `apply-review` sub-skill. Auto-detects `.review/extension.md` (or `.github/ai-diff-reviewer/extension.md` as fallback) and layers it on top of the shipped default prompt for full local↔CI parity. Use when the developer wants a local pre-flight review before pushing, asks "run a code review on my current changes", wants to customize the reviewer to this repo, asks "how do I set up ai diff reviewer?", asks a reference-style question about any of the action's inputs, asks to "open a PR", "create the pull request", or "write the PR body" for the current branch, or asks "what did the CI review say?", "apply the AI review's fixes", or "walk me through the review findings".
-version: "1.8.0"
+version: "2.0.0"
 documentation_url: https://github.com/DailybotHQ/ai-diff-reviewer/blob/main/skills/ai-diff-reviewer/SKILL.md
 user-invocable: true
 metadata: {"openclaw":{"emoji":"🔍","homepage":"https://github.com/DailybotHQ/ai-diff-reviewer","requires":{"anyBins":["git"]}}}
@@ -49,7 +49,7 @@ the action source.
 **Version parity.** The [`prompt.md`](prompt.md) in this skill is
 byte-identical to the one the Action ships in the same tagged release
 (enforced by CI's `Skills — prompt-sync invariant` job). Pinning
-`@v1.4.2` on both surfaces guarantees identical reviews.
+`@v2.0.0` on both surfaces guarantees identical reviews.
 
 Source: <https://github.com/DailybotHQ/ai-diff-reviewer> · License: MIT
 
@@ -65,16 +65,19 @@ into one of two flows — pick the one that matches the repo's use case:
 | Flow | Use when | Sub-skills to run | Sub-skills to skip |
 |---|---|---|---|
 | **A. Local-only** | You want your coding agent to run the same review methodology on the branch you're working on right now, but you do NOT want the review to fire in CI on every PR. Common for personal repos, experimental repos, repos where the team hasn't opted into automated PR review yet. | **Optional but recommended:** `generate-extension` (once, to tailor `.review/extension.md`). Then the parent `run a local review` flow on every branch — works with or without an extension file (falls back to the shipped base prompt if Step 2.5 is declined). Optionally `open-pr` at the end. | `setup` — do NOT run it. It writes `.github/workflows/pr-review.yml`, which activates the CI Action. `apply-review` — nothing to apply (no CI review posts back to the PR without the Action installed). |
-| **B. Dual-surface** | You want both: pre-flight local review before pushing AND a full CI review on every PR, with identical rules on both surfaces. Recommended for team repos and anything production-facing. | `setup` (once, installs the CI Action + accepts the Step 5 handoff to `generate-extension`), then the parent `run a local review` flow on every branch. `open-pr` when the PR is ready. After push, once CI has posted its review, `apply-review` closes the loop (read the CI findings, walk through them, apply fixes). | Nothing — all five capabilities are used across the lifecycle. |
+| **B. Dual-surface** | You want both: pre-flight local review before pushing AND a full CI review on every PR, sharing the same methodology and severity model on both surfaces (CI may additionally dedup on round 2+ via IAR — see below). Recommended for team repos and anything production-facing. | `setup` (once, installs the CI Action + accepts the Step 5 handoff to `generate-extension`), then the parent `run a local review` flow on every branch. `open-pr` when the PR is ready. After push, once CI has posted its review, `apply-review` closes the loop (read the CI findings, walk through them, apply fixes). | Nothing — all five capabilities are used across the lifecycle. |
 
 **Parity guarantee (Flow B).** When `setup` writes the workflow with
 `prompt-extension-file: .review/extension.md` wired in (default when
 you accept the Step 5 handoff to `generate-extension`), the CI Action
 reads the same file your local agent uses. Same base prompt + same
-extension file = same review methodology, locally and in CI. If the
-Step 5 handoff is declined, `setup` omits `prompt-extension-file` and
-you get base-prompt parity only — you can add the input manually
-later, or re-run `setup` and accept the handoff.
+extension file = same review methodology and severity model, locally
+and in CI. CI may still post a *shorter* finding set on round 2+ of a
+generation because Iteration-Aware Review dedups there (local reviews
+never do — see below). If the Step 5 handoff is declined, `setup`
+omits `prompt-extension-file` and you get base-prompt parity only —
+you can add the input manually later, or re-run `setup` and accept
+the handoff.
 
 **CI-only surfaces (not mirrored locally).** Two Action capabilities
 run only in GitHub Actions, not in this skill's local review flow:
@@ -84,7 +87,7 @@ run only in GitHub Actions, not in this skill's local review flow:
    `first-pass-exhaustive`), escape label (`full-review-please`),
    and user-forced reset (remove `applied-label` then re-trigger).
    A local review is always a **full pass** against the current
-   diff — it may surface findings CI has already silenced on
+   diff — it may surface findings CI has already deduped on
    round 2+ of the same generation. Spec:
    [`docs/ITERATION_AWARENESS.md`](https://github.com/DailybotHQ/ai-diff-reviewer/blob/main/docs/ITERATION_AWARENESS.md).
    Tuning example:
@@ -117,11 +120,11 @@ distinction only matters at first-time setup.
 ## Install
 
 ```bash
-# Latest v1.x
+# Latest v2.x
 npx skills add DailybotHQ/ai-diff-reviewer --skill ai-diff-reviewer
 
 # Or pin to a specific tag for reproducibility
-npx skills add DailybotHQ/ai-diff-reviewer@v1.4.2 --skill ai-diff-reviewer
+npx skills add DailybotHQ/ai-diff-reviewer@v2.0.0 --skill ai-diff-reviewer
 ```
 
 This vendors the skill into `.agents/skills/ai-diff-reviewer/` in the
@@ -445,8 +448,11 @@ post on a PR — this is the parity contract:
 ```
 
 Reproducing this exact shape (verdict → findings table → per-finding
-body → notes → recommendation) is what lets a developer trust "the
-local review says X, so CI will say X too."
+body → notes → recommendation) is what lets a developer trust the
+same methodology and severity model on both surfaces. On CI round 2+
+of a generation, Iteration-Aware Review may additionally dedupe
+findings that a local full pass would still list — that difference is
+expected, not a parity bug (see **CI-only surfaces** above).
 
 **Optional next-step hint.** When the review is clean (no 🚨 critical or
 ⚠️ warning findings) OR when the developer explicitly signals they're
@@ -504,7 +510,7 @@ The **same file** should be referenced from your CI workflow's
 
 ```yaml
 # .github/workflows/pr-review.yml
-- uses: DailybotHQ/ai-diff-reviewer@v1
+- uses: DailybotHQ/ai-diff-reviewer@v2
   with:
     api-key: ${{ secrets.ANTHROPIC_API_KEY }}
     github-token: ${{ secrets.GITHUB_TOKEN }}

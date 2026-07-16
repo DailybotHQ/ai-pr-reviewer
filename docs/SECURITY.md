@@ -86,7 +86,7 @@ Each is pinned by major version. The choice to pin major rather than commit-SHA 
 
 - Releases are signed by GitHub's release workflow (`actions/create-release` or manual).
 - The moving major tag (`v1`) is updated by `.github/workflows/release.yml` immediately after each `v1.x.y` publish, automated by the `release` event.
-- Consumers who require pinned-SHA security can pin to a specific commit instead of `@v1`.
+- Consumers who require pinned-SHA security can pin to a specific commit instead of `@v2`.
 
 ## Secrets
 
@@ -259,7 +259,7 @@ All of the above endpoints are called inside broad `try/except Exception` blocks
 
 If you want to reduce the action's blast radius further:
 
-1. **Pin to a specific commit SHA** instead of `@v1`. Trade-off: you stop getting patches automatically.
+1. **Pin to a specific commit SHA** instead of `@v2`. Trade-off: you stop getting patches automatically.
 2. **Run the action only on PRs from non-fork branches.** Use `if: github.event.pull_request.head.repo.full_name == github.repository`. Trade-off: contributors from forks don't get the review.
 3. **Use a self-hosted runner** with restricted egress (only `api.anthropic.com` and `api.github.com`). Trade-off: you maintain runner infra.
 4. **Use a fine-grained PAT** for `github-token` with only `pull-requests: write` and `contents: read` on the specific repo, instead of the default `secrets.GITHUB_TOKEN`. Trade-off: PAT rotation is your responsibility.
@@ -351,4 +351,4 @@ For organisations that need to audit before adopting:
 - [ ] Verify no outbound network calls beyond the two documented endpoints.
 - [ ] Verify the redaction list and path-traversal protections.
 - [ ] Verify the action.yml branding and inputs match what's published on the Marketplace.
-- [ ] Pin to a commit SHA or a specific `vX.Y.Z` tag rather than `@v1` for change control.
+- [ ] Pin to a commit SHA or a specific `vX.Y.Z` tag rather than `@v2` for change control.

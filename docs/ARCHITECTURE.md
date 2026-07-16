@@ -125,7 +125,7 @@ The entire runtime in one file (~4000 LOC, fully type-hinted, stdlib-only). Sect
 7. **Severity / strictness** — `overall_severity()` aggregates the per-comment severities; `evaluate_strictness()` maps `(severity, strictness)` to a blocking decision.
 8. **Agentic loop** — `drive_review()`. Drives `provider.complete()` in a loop, executes any tools the model calls, prunes conversation history in pairs to bound token cost, terminates when the model calls `submit_review` or hits the turn cap.
 9. **Tracking comment renderers** — `render_tracking_body_working/done/failed`. Pure functions; emit the marker.
-10. **`main()`** — orchestrates the lifecycle: load env, label gate, collapse, tracking, prompt resolution, agentic loop (wrapped in failure-update guards), review submission, label application, strictness gate, action outputs.
+10. **`main()`** — orchestrates the lifecycle: load env, author/trigger gates, `skip-review-label` emergency bypass (short-circuit before LLM), collapse, tracking, prompt resolution, IAR pre-LLM, agentic loop (wrapped in failure-update guards), IAR post-LLM, review submission, label application, strictness gate, action outputs.
 
 ### `prompts/default.md`
 
