@@ -279,6 +279,25 @@ SEVERITY_RANK: dict[str, int] = {
     SEVERITY_CRITICAL: 3,
 }
 
+
+def _sort_findings_criticals_first(findings: list["Finding"]) -> list["Finding"]:
+    """Return a copy of `findings` sorted so critical severity findings
+    come first, warnings second, infos third — preserving within-tier
+    order via a stable sort. Used everywhere the runtime truncates a
+    findings list against a cap, so the critical-always-surfaces
+    safety rail (docs/ITERATION_AWARENESS.md § 7.1) is preserved
+    regardless of the order the LLM (or an agent-runner CLI) emitted
+    findings in. Findings with an unknown severity string are treated
+    as SEVERITY_INFO (rank 1) so they sort behind warnings/criticals
+    but ahead of unranked entries — the safe fallback.
+    """
+    return sorted(
+        findings,
+        key=lambda f: SEVERITY_RANK.get(f.severity, SEVERITY_RANK[SEVERITY_INFO]),
+        reverse=True,
+    )
+
+
 # Marker embedded in the tracking comment so downstream automation can find
 # the most recent review unambiguously, even if other bots also comment.
 REVIEW_MARKER: str = "<!-- ai-pr-reviewer-marker -->"
@@ -344,7 +363,7 @@ IAR_CONTEXT_HASH_RADIUS: int = 10
 IAR_SAFETY_NET_NEW_LINES_PCT: int = 30
 
 # IterationState JSON schema version embedded in the marker state block
-# (docs/ITERATION_AWARENESS.md § 13). Increment when the schema breaks
+# (docs/ITERATION_AWARENESS.md § 12). Increment when the schema breaks
 # backward-read compatibility; also extend _parse_state_from_marker_body
 # with backward-read logic before incrementing.
 IAR_STATE_SCHEMA_VERSION: int = 1
@@ -1869,7 +1888,7 @@ def write_iar_outputs_empty() -> None:
 # (treated as "first review, no prior state") with a debug log — the
 # subsystem must never crash the reviewer on a malformed marker.
 #
-# See docs/ITERATION_AWARENESS.md § 13 for the JSON schema (version 1).
+# See docs/ITERATION_AWARENESS.md § 12 for the JSON schema (version 1).
 
 
 class IterationStateParseError(Exception):
@@ -1882,7 +1901,7 @@ class IterationStateParseError(Exception):
 class IterationState:
     """Persisted IAR state (version 1). Read from the last marker, updated
     in-memory during the run, and re-embedded into the new marker at the
-    end. See docs/ITERATION_AWARENESS.md § 13 for the schema contract.
+    end. See docs/ITERATION_AWARENESS.md § 12 for the schema contract.
 
     Field notes:
     - `version`: schema version; matches IAR_STATE_SCHEMA_VERSION.
@@ -1946,7 +1965,7 @@ class IterationState:
 
 # Cap on `history` list length. 20 generations is plenty for the lifetime
 # of a single PR while keeping the marker body under ~10KB even in
-# pathological cases. See docs/ITERATION_AWARENESS.md § 13.
+# pathological cases. See docs/ITERATION_AWARENESS.md § 12.
 IAR_HISTORY_MAX_ENTRIES: int = 20
 
 
@@ -2820,9 +2839,20 @@ def apply_first_pass_exhaustive_policy(
         # splice the addendum. `findings` at this point is already the
         # LLM's output (produced with the raised cap upstream); we
         # truncate defensively in case the model produced more.
+        #
+        # Criticals-first sort BEFORE truncation is load-bearing for
+        # the hardcoded critical-always-surfaces safety rail (docs
+        # § 7.1). A naive `findings[:effective_cap]` would drop
+        # criticals if the model happened to emit them past position N,
+        # silently bypassing the rail on round-1 of every generation.
+        # `stable_sort_by_severity` preserves the model's within-tier
+        # ordering (so info/warning ordering stays intact within their
+        # tiers) while lifting all criticals to the front — the tail
+        # truncation then only ever sheds warnings/infos.
         effective_cap: int = base_max_inline_comments * cap_multiplier
+        prioritized: list[Finding] = _sort_findings_criticals_first(findings)
         return PolicyResult(
-            findings_to_surface=list(findings[:effective_cap]),
+            findings_to_surface=list(prioritized[:effective_cap]),
             findings_silenced=[],
             effective_max_inline_comments=effective_cap,
             prompt_addendum=IAR_EXHAUSTIVE_PROMPT_ADDENDUM,
@@ -5953,7 +5983,14 @@ def main() -> int:
                     f"findings; capping to effective-max-inline-comments="
                     f"{effective_max_inline_comments} ({dropped} dropped)"
                 )
-                result.findings = result.findings[:effective_max_inline_comments]
+                # Criticals-first before truncation — same load-bearing
+                # invariant as apply_first_pass_exhaustive_policy round 1:
+                # never let a naive `[:cap]` silently drop a critical
+                # finding past the cap. See docs/ITERATION_AWARENESS.md
+                # § 7.1 (critical-always-surfaces safety rail).
+                result.findings = _sort_findings_criticals_first(
+                    result.findings
+                )[:effective_max_inline_comments]
                 # Recompute overall_severity — dropping the tail may lower it.
                 result.overall_severity = overall_severity(
                     [f.severity for f in result.findings]
@@ -6203,6 +6240,39 @@ def main() -> int:
             tracking_body,
             {"label_toggle_generation": label_toggle_generation},
         )
+    # ------------------------------------------------------------------
+    # Apply success label (only if not blocked) — must happen BEFORE the
+    # IAR state embed so `reviewed_label_applied` reflects the ACTUAL
+    # outcome of the label stamp, not the intent. If we set the bit to
+    # `True` before the stamp and the stamp then fails (network hiccup,
+    # revoked permissions, deleted-label race, etc.), the next run's
+    # USER_FORCED_RESET detection sees `reviewed_label_applied=True` +
+    # label absent → wrongly fires a reset that wipes dedup memory.
+    # Attempting the stamp first and recording the observed outcome
+    # keeps the marker honest.
+    # ------------------------------------------------------------------
+    label_stamped: bool = False
+    if applied_label and not blocked:
+        try:
+            gh_apply_label(
+                token=gh_token,
+                repo=repo,
+                pr_number=pr_number,
+                label=applied_label,
+            )
+            log(f"Applied label {applied_label!r}")
+            label_stamped = True
+        except Exception as e:  # noqa: BLE001 — best-effort GH API call;
+            # a label-stamp failure MUST NOT crash the reviewer (the
+            # review has already posted successfully), but we must record
+            # the failure so USER_FORCED_RESET's guard reads the truth.
+            log(
+                f"Failed to apply label {applied_label!r} (non-fatal, "
+                f"marker will record reviewed_label_applied=False): {e}"
+            )
+    elif applied_label and blocked:
+        log(f"Skipped applying {applied_label!r} — strictness gate blocked")
+
     # IAR marker embed: append a one-line annotation for developers who
     # skim the marker + embed the machine-readable state block that the
     # next run will parse. Skipped only if the pre-LLM or post-LLM step
@@ -6214,15 +6284,14 @@ def main() -> int:
         and iar_pre_context is not None
     ):
         # Load-bearing for USER_FORCED_RESET: record whether the applied
-        # label WILL be stamped on this run (i.e., the review posted AND
-        # the strictness gate did not block). The next run reads this
-        # bit to distinguish "the user removed the reviewed label
-        # deliberately" from "the previous run was blocked so the label
-        # was never stamped in the first place" — the former is a real
-        # reset gesture, the latter is a natural re-trigger.
-        iar_state_final.reviewed_label_applied = bool(
-            applied_label and not blocked
-        )
+        # label WAS ACTUALLY stamped on this run (not "would be" — we
+        # attempted it above and captured the observed outcome). The
+        # next run reads this bit to distinguish "the user removed the
+        # reviewed label deliberately" from "the previous run was
+        # blocked / failed to stamp so the label was never on the PR
+        # in the first place" — the former is a real reset gesture,
+        # the latter is a natural re-trigger.
+        iar_state_final.reviewed_label_applied = label_stamped
         tracking_body = tracking_body + _render_iar_marker_annotation(
             state=iar_state_final,
             policy_result=iar_policy_final,
@@ -6235,20 +6304,6 @@ def main() -> int:
         comment_id=tracking_id,
         body=tracking_body,
     )
-
-    # ------------------------------------------------------------------
-    # Apply success label (only if not blocked)
-    # ------------------------------------------------------------------
-    if applied_label and not blocked:
-        gh_apply_label(
-            token=gh_token,
-            repo=repo,
-            pr_number=pr_number,
-            label=applied_label,
-        )
-        log(f"Applied label {applied_label!r}")
-    elif applied_label and blocked:
-        log(f"Skipped applying {applied_label!r} — strictness gate blocked")
 
     # ------------------------------------------------------------------
     # Action outputs

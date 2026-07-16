@@ -217,6 +217,54 @@ class FirstPassExhaustivePolicyTests(unittest.TestCase):
         )
         self.assertEqual(len(got.findings_to_surface), 30)
 
+    def test_round_1_truncation_preserves_criticals_over_the_cap(
+        self,
+    ) -> None:
+        """Critical-always-surfaces safety rail (docs § 7.1) must hold
+        under truncation. When the model emits criticals PAST the
+        effective cap, a naive `findings[:cap]` would silently drop
+        them — the reviewer must sort criticals-first before truncating.
+
+        Setup: base_cap=10, multiplier=3 → effective_cap=30. Model emits
+        40 findings, all of which are info EXCEPT positions 35–39 (5
+        critical findings past position 30). Under the buggy behaviour
+        those 5 criticals get dropped; under the fix, all 5 criticals
+        move to the front and truncation only sheds infos.
+        """
+        findings: list[reviewer.Finding] = [
+            _finding(line=i, severity="info") for i in range(1, 35)
+        ] + [
+            _finding(line=i, severity="critical") for i in range(35, 40)
+        ] + [
+            _finding(line=i, severity="info") for i in range(40, 45)
+        ]
+        got: reviewer.PolicyResult = (
+            reviewer.apply_first_pass_exhaustive_policy(
+                findings=findings,
+                prior_state=None,
+                code_contexts={},
+                base_max_inline_comments=10,
+                cap_multiplier=3,
+                is_round_1_of_generation=True,
+            )
+        )
+        self.assertEqual(len(got.findings_to_surface), 30)
+        critical_count: int = sum(
+            1 for f in got.findings_to_surface if f.severity == "critical"
+        )
+        self.assertEqual(
+            critical_count, 5,
+            msg="All 5 criticals must survive truncation via the "
+                "criticals-first sort — never let the tail truncation "
+                "silently bypass the critical-always-surfaces safety rail.",
+        )
+        # All 5 criticals should be at the front (verifying the sort ordering)
+        for i in range(5):
+            self.assertEqual(
+                got.findings_to_surface[i].severity, "critical",
+                msg=f"Position {i} must be a critical after the sort.",
+            )
+
     def test_round_1_gen_2_re_fires_exhaustive(self) -> None:
         """After generation advance, round 1 gen 2 → exhaustive again.
         The is_round_1_of_generation param carries that signal."""

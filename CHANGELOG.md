@@ -144,7 +144,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test_iar_state_layer.py`, `test_iar_generation_tracking.py`,
   `test_iar_dedup.py`, `test_iar_policies.py`, `test_iar_dispatch.py`,
   and `test_iar_observability.py` cover the pure IAR helpers. Total
-  suite: **445 tests** (all passing).
+  suite: **447 tests** (all passing).
 
 ### Fixed
 - **IAR × `collapse-previous` ordering bug.** Before this fix, on the
@@ -192,6 +192,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already cleared. New test in
   `test_iar_dispatch.py::DispatchPolicyPrecedenceTests` locks the
   precedence contract.
+- **Round-1 exhaustive truncate could drop critical findings past the
+  cap.** In `apply_first_pass_exhaustive_policy` and the agent-runner
+  cap-enforce path, a naive `findings[:effective_cap]` was applied
+  when the model overshot the cap. If the LLM emitted a critical
+  finding at position 31 (or beyond) with `effective_cap=30`, the tail
+  truncation silently dropped it — bypassing the hardcoded
+  critical-always-surfaces safety rail
+  (docs/ITERATION_AWARENESS.md § 7.1). Fix: introduce
+  `_sort_findings_criticals_first` and call it BEFORE every truncation
+  site, so criticals move to the front regardless of the model's
+  emission order and the tail only sheds warnings/infos. New test
+  `test_iar_policies.py::test_round_1_truncation_preserves_criticals_over_the_cap`
+  locks the invariant.
+- **`reviewed_label_applied=True` recorded before `gh_apply_label`
+  succeeded.** Previously the IAR marker embed set
+  `reviewed_label_applied` from `bool(applied_label and not blocked)`
+  BEFORE attempting the label stamp. If the stamp then failed
+  (network hiccup, revoked permissions, deleted-label race), the
+  marker asserted the label was applied when in reality it was not
+  — the next run then saw "reviewed label absent + state claims it
+  was applied" and wrongly fired USER_FORCED_RESET, wiping dedup
+  memory. Fix: attempt the label stamp FIRST inside a try/except,
+  capture the OBSERVED outcome in a local `label_stamped: bool`,
+  and only THEN embed that value into the state block. A stamp
+  failure logs a non-fatal warning and records `False`, keeping the
+  reset gesture honest across transient GH API failures.
+- **Stale `docs/ITERATION_AWARENESS.md § 13` references in
+  `scripts/reviewer.py`.** The schema section was renumbered to § 12
+  when the "Migration guide" was removed, but four inline comments
+  still pointed at § 13. Updated in-place — no behavior change.
 
 - **New "Security audit alignment" section in `.review/extension.md`.**
   Codifies the review rules that keep the two external security

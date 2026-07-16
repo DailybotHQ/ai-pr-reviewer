@@ -395,13 +395,25 @@ both contracts across future PRs.
   active the user's intent is "start clean" and the escape short-circuit
   MUST be skipped so the configured policy's exhaustive first-pass path
   fires. See `docs/ITERATION_AWARENESS.md § 8.5` precedence rules.
-- **Always `warning`:** setting `IterationState.reviewed_label_applied`
-  to a value other than `bool(applied_label and not blocked)` at the
-  end of a run, or omitting the assignment entirely. The bit is the
-  sole signal the next run has to distinguish "developer removed the
-  reviewed label deliberately" from "reviewer never stamped it because
-  the run was blocked" — anything else breaks the reset gesture's
-  guard.
+- **Always `critical`:** setting `IterationState.reviewed_label_applied`
+  from anything other than the OBSERVED outcome of `gh_apply_label`
+  (i.e., a local `label_stamped: bool` set to `True` only inside the
+  try-block after the API call succeeds, `False` otherwise), OR
+  omitting the assignment entirely, OR embedding the state block
+  BEFORE the label-stamp attempt. The bit is the sole signal the
+  next run has to distinguish "developer removed the reviewed label
+  deliberately" from "reviewer never stamped it because the run was
+  blocked or the stamp failed" — anything else races the label-stamp
+  outcome against the state write and can silently wipe dedup memory
+  on a network hiccup.
+- **Always `critical`:** any change that truncates a `list[Finding]`
+  against `effective_max_inline_comments` (or any cap) via a naive
+  `findings[:cap]` without first sorting criticals-to-the-front via
+  `_sort_findings_criticals_first`. The critical-always-surfaces
+  safety rail (docs § 7.1) is hardcoded and non-configurable — a
+  cap-drop that sheds a critical silently bypasses it. Both round-1
+  exhaustive AND the agent-runner cap-enforce path currently obey
+  this invariant; any new truncation site must too.
 - **Always `info`:** using the term "silence" for a finding IAR
   chose not to submit. The correct term is "dedup" or "silence"
   depending on the reason (dedup = the finding matches a prior
