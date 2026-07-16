@@ -270,6 +270,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it to `IAR_FINGERPRINT_BODY_CHARS` next to the other IAR module
   constants. Cosmetic; no behavioral impact.
 
+### Fixed (round-5 self-review doc-drift sweep)
+
+Round-5 self-review found 5 doc/example drift items and 1 already-tracked
+info. Runtime was independently signed off as merge-ready by the reviewer
+(*"Runtime invariants look correct and are well locked by tests (456 passing).
+A few documentation mismatches will mislead operators auditing markers or
+copying the 'quality-sensitive' profile."*). All five drift items fixed:
+
+- **`docs/ITERATION_AWARENESS.md § 8.2` "delete the marker to reset"
+  advice was false under shipped defaults.** With
+  `collapse-previous: true` (the default), `_fetch_latest_marker_body`'s
+  tier-2 fallback (§ 7.3) reads the latest **minimized** marker that
+  still carries IAR state, so deleting the visible marker leaves prior
+  state accessible and the next run continues the generation instead
+  of becoming `first_review`. Rewrote the paragraph to point at the
+  real reset gesture (§ 8.5 reviewed-label removal), and noted that a
+  delete-based reset would require removing **every** marker in the
+  conversation with `<!-- ai-pr-reviewer-iteration-state`.
+- **`docs/ITERATION_AWARENESS.md § 7.2` safety-net marker example
+  invented a `(safety_net_new_lines_pct)` transition token that the
+  runtime never emits.** The runtime prefixes the `policy_applied`
+  slot with `safety-net-forced-` and keeps the `transition` value at
+  the natural `new_commits` / `rebased`. Rewrote the example to show
+  the actual output (`policy=`safety-net-forced-first-pass-exhaustive`
+  (new_commits)`) and added a "grep this to audit safety-net firings"
+  callout. Same drift fixed in § 10.2's walkthrough table.
+- **`docs/ITERATION_AWARENESS.md § 8.1` + § 10.3 escape-label examples
+  used the same aspirational H3 shape** (`### AI review for abc123 —
+  done · escape-label forced full review (state preserved) · ...`)
+  that the runtime never emits. Rewrote both to the shipping shape
+  (short H3 + italic footer with `policy=`escape-label-forced-full-review`).
+- **`docs/PERFORMANCE.md` "quality-sensitive" recommended profile was
+  factually wrong.** It combined `convergence-policy: round-capped`
+  with `exhaustive-first-pass-cap-multiplier: 5`, but `round-capped`
+  ignores the multiplier entirely (`action.yml`'s input description is
+  explicit: "Ignored by other policies"). Consumers copying this
+  block would have expected a 50-finding round-1 net and got baseline
+  10-cap iterative behaviour. Fixed to `first-pass-exhaustive` (the
+  only policy that amplifies round 1), and added a separate
+  "round-cap discipline" profile for consumers who genuinely want a
+  hard round cap without amplification. Explanatory blockquote now
+  makes the policy-vs-multiplier composition rule explicit.
+- **`docs/ARCHITECTURE.md § Iteration-Aware Review` + new
+  `docs/ITERATION_AWARENESS.md § 3.4`** now document the load-bearing
+  dependency on `tracking-comment: true`. If a consumer disables the
+  tracking comment (`tracking-comment: false`), `gh_update_issue_comment`
+  no-ops (`comment_id <= 0`) and IAR never persists a state block.
+  Every subsequent run then classifies as `first_review` and re-burns
+  round-1 exhaustive under the default policy — a silent convergence
+  killer. Both docs now call this out explicitly.
+- **`examples/README.md`** now lists the new `iteration-aware.yml`
+  in the contents table (repo convention + AGENTS.md Rule #7:
+  "Add a row to the table above in the same PR"). Description
+  points readers at the IAR spec for context.
+
 ### Fixed (round-4 self-review sweep)
 
 Final polish pass driven by the self-review of the doc-sweep commit

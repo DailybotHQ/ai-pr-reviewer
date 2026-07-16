@@ -102,6 +102,12 @@ Each input is forwarded to `scripts/reviewer.py` via the existing `AIPRR_*` conv
 
 The `AIPRR_*` prefix is a private convention (see `AGENTS.md` Rule #4 for its stability status).
 
+### 3.4 Load-bearing dependency on `tracking-comment: true`
+
+IAR persists state by embedding a `<!-- ai-pr-reviewer-iteration-state -->` JSON block inside the reviewer's tracking marker comment on the PR. If the consumer disables the tracking comment (`tracking-comment: false`), `gh_update_issue_comment` sees `comment_id <= 0` and the embed becomes a silent no-op — IAR still runs in memory, but nothing gets persisted for the next run to read. Every subsequent run then reads `prior_state = None` and classifies as `first_review`, re-firing round-1 exhaustive under the shipped default policy.
+
+**Consequence.** `tracking-comment: true` (the default) is a hard requirement for IAR convergence. Disabling it does not disable IAR outright — it disables IAR *persistence*, which is the same thing from a cost/behaviour standpoint. Consumers who want to disable IAR entirely have no supported knob today; the recommended path is to keep the tracking comment on and tune `convergence-policy` (`iterative` is the lightest option that still deduplicates within a generation). See [`ARCHITECTURE.md § Iteration-Aware Review`](ARCHITECTURE.md).
+
 ---
 
 ## 4. Generation model
@@ -333,15 +339,17 @@ if finding.severity == "critical":
 
 **Detection.** `compute_new_lines_pct` uses `git diff --numstat` on the three-dot range (`current_base_sha...current_head_sha`) and computes `new_added / (total_added + total_removed) * 100`, where `new_added` counts only lines added between the prior review's head and the current head (`prior_head_sha..current_head_sha`, two-dot on purpose — both are head SHAs on the same branch). Context lines are NOT in the denominator (`--numstat` doesn't emit them; `--stat` would but the code deliberately picks `--numstat` for machine-parseable output).
 
-**Loud + audible.** The marker annotation footer reflects the safety net via its transition name — `(safety_net_new_lines_pct)`:
+**Loud + audible.** The marker annotation footer reflects the safety net via the `policy_applied` slot — the runtime prefixes the policy name with `safety-net-forced-` when the safety net overrides the configured policy. The `transition` slot keeps its natural value (`new_commits` or `rebased`); the safety net is a policy override, not a new transition kind, so no `safety_net_*` token appears in the transition slot. Actual output shape:
 
 ```
 ### AI review for def456 — ✅ done
 
 ...standard review summary + strictness gate lines...
 
-_Iteration-Aware Review: gen 2, round 1, policy=`first-pass-exhaustive` (safety_net_new_lines_pct) — 18 surfaced._
+_Iteration-Aware Review: gen 2, round 1, policy=`safety-net-forced-first-pass-exhaustive` (new_commits) — 18 surfaced._
 ```
+
+To audit safety-net firings, grep the marker chain for `policy=\`safety-net-forced-` — that's the reliable signal.
 
 Debug log entry:
 
@@ -379,17 +387,23 @@ If the PR has the specified label attached when the reviewer runs:
 - **Dedup is skipped for this run.** All findings the LLM produces surface (subject to the base `max-inline-comments` cap).
 - **Persisted state is NOT mutated.** The marker's embedded state block is left unchanged from the prior review. When the label is removed and a subsequent review runs, IAR resumes from where it left off.
 - **Prompt splicing is NOT applied.** The system prompt is unchanged from what would be sent without IAR.
-- The marker title reflects the escape:
+- The marker footer reflects the escape via `policy_applied` — same shape as the safety-net override, but with the `escape-label-forced-full-review` policy name:
 
 ```
-### AI review for abc123 — done · escape-label forced full review (state preserved) · 12 findings
+### AI review for abc123 — ✅ done
+
+...standard review summary + strictness gate lines...
+
+_Iteration-Aware Review: gen 3, round 6, policy=`escape-label-forced-full-review` (same_generation) — 12 surfaced._
 ```
+
+The H3 stays short (`### AI review for <sha> — <status>`); the escape-label signal is in the `policy=` slot of the italic footer, not the title.
 
 ### 8.2 Why state is preserved
 
 The escape label is meant for one-shot "I want to see everything again" moments — e.g., after a major refactor, or when the developer suspects IAR silenced something they need to see. Preserving state means the developer doesn't lose weeks of prior fingerprint history just because they clicked a button once.
 
-If the developer wants to truly reset IAR state, they can remove the marker comment manually — the reviewer treats that as a first-review case on the next run.
+If the developer wants to truly reset IAR state, use the reviewed-label removal gesture documented in § 8.5 (remove `applied-label` from the PR, then re-trigger the workflow — `USER_FORCED_RESET` fires and discards prior state on a clean slate). Do NOT try to reset by deleting the visible tracking-marker comment: under the shipped default `collapse-previous: true`, `_fetch_latest_marker_body`'s tier-2 fallback (§ 7.3) reads the latest **minimized** marker that still carries an IAR state block, so deleting the visible marker leaves the prior state accessible and the next run continues the generation instead of becoming `first_review`. Only deleting **every** marker in the PR conversation that contains `<!-- ai-pr-reviewer-iteration-state` would achieve a "delete-to-reset" outcome — the § 8.5 gesture is safer and does not touch the conversation history.
 
 ### 8.3 Recursion guard
 
@@ -549,7 +563,7 @@ Without dedup: the same PR would have taken 5-10 rounds, each surfacing new low-
 | Reviewer runs | Safety net check: 45% new lines → **auto-forces exhaustive** | Exhaustive prompt + 3x cap. |
 | Model finds 8 findings on the new code | Fingerprint check: 8 new fingerprints (context hash reflects new code) | All 8 surface. Prior 22 resolved fingerprints don't match (different code context). |
 | One of the 8 is a `critical` | Critical bypass rule (§ 7.1) | Surfaces unconditionally, even if it matched a prior fingerprint. |
-| Marker title | `Gen 2 round 1 (SAFETY NET: 45% new lines) · exhaustive first-pass forced · 8 findings (2 critical-forced-surface)` | Developer sees clearly that this is a fresh review of new content. |
+| Marker footer | `_Iteration-Aware Review: gen 2, round 1, policy=`safety-net-forced-first-pass-exhaustive` (new_commits) — 8 surfaced._` | Developer sees clearly that this is a fresh review of new content — the `safety-net-forced-` prefix in `policy=` is the reliable audit anchor. |
 
 ### 10.3 "Force full review with escape label"
 
@@ -562,10 +576,14 @@ Without dedup: the same PR would have taken 5-10 rounds, each surfacing new low-
 4. Persisted state UNCHANGED. Dev inspects findings; decides to merge.
 5. Dev removes the label. Next review (post-merge, if it happens) resumes normal IAR behavior.
 
-Marker title:
+Marker footer:
 
 ```
-### AI review for def456 — done · escape-label forced full review (state preserved) · 12 findings
+### AI review for def456 — ✅ done
+
+...standard review summary + strictness gate lines...
+
+_Iteration-Aware Review: gen 3, round 6, policy=`escape-label-forced-full-review` (same_generation) — 12 surfaced._
 ```
 
 ---

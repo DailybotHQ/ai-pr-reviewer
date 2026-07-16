@@ -214,9 +214,25 @@ iteration-escape-label: full-review-please
 
 **Quality-sensitive (biggest first-pass net, silence noise later):**
 ```yaml
-convergence-policy: round-capped
-max-review-rounds: 3                       # exhaustive round 1, dedup 2-3, silence 4+
+convergence-policy: first-pass-exhaustive  # ONLY this policy amplifies round 1
 exhaustive-first-pass-cap-multiplier: 5    # round 1 gets 50 max instead of 10
+max-review-rounds: 0                       # unused by first-pass-exhaustive
+```
+
+> **Note.** `exhaustive-first-pass-cap-multiplier` is only consulted by
+> `first-pass-exhaustive` (and the safety-net override) — `round-capped`
+> uses the baseline cap on every round and then silences all non-critical
+> findings past `max-review-rounds`. If you want the biggest round-1 net,
+> use `first-pass-exhaustive`. If you want a hard round cap with no
+> amplification, `round-capped` is the right choice — just don't expect
+> the multiplier to compose across policies (`action.yml`'s input
+> description is explicit: "Ignored by other policies").
+
+**Round-cap discipline (bound total rounds, no round-1 amplification):**
+```yaml
+convergence-policy: round-capped
+max-review-rounds: 3                       # baseline cap rounds 1-3, silence non-critical from round 4+
+exhaustive-first-pass-cap-multiplier: 1    # ignored by round-capped, safe default
 ```
 
 ### Reading the cost telemetry
