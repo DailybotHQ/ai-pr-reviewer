@@ -144,7 +144,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test_iar_state_layer.py`, `test_iar_generation_tracking.py`,
   `test_iar_dedup.py`, `test_iar_policies.py`, `test_iar_dispatch.py`,
   and `test_iar_observability.py` cover the pure IAR helpers. Total
-  suite: **456 tests** (all passing).
+  suite currently: **468 tests** (all passing). Updated across
+  round-11..round-13 self-review fixes; the running counter is
+  intentional — a slowly climbing total signals that every new
+  behaviour lands with regression coverage.
 
 ### Fixed
 - **IAR × `collapse-previous` ordering bug.** Before this fix, on the
@@ -269,6 +272,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (§ 13.2). Value is stable and documented; a follow-up will promote
   it to `IAR_FINGERPRINT_BODY_CHARS` next to the other IAR module
   constants. Cosmetic; no behavioral impact.
+
+### Fixed (round-13 self-review: skip-label collision guard + test coverage)
+
+Round-13 self-review **passed** (PR green, label stamped). 3 warnings +
+2 infos, all real but small — the load-bearing one is the new
+skip-label collision guard:
+
+- **`detect_skip_label_collisions()` — new misconfiguration guard.**
+  `skip-review-label` is an emergency-bypass hatch (silently skips
+  the review). If a user accidentally sets it to the same value as
+  `label-gate`, `applied-label`, or `iteration-escape-label`, every
+  normal trigger silently becomes a skip — the exact opposite of
+  what the developer typed. The three failure modes were previously
+  undocumented and undetected. New pure helper detects all three
+  collisions, `main()` aborts at startup with an exit-1
+  `CONFIGURATION ERROR:` log naming the colliding label. Comparison
+  is case-insensitive (matches `_labels_contain_ci` at the check
+  sites) and whitespace-trimmed. 9 new regression tests in
+  `SkipLabelCollisionGuardTests`.
+- **Hoisted `bot_login` lookup got a proper `# noqa: BLE001` WHY
+  comment** — the round-11 hoist landed with the noqa but no
+  explanation of the "best-effort GH API call" pattern documented
+  in `docs/DEVELOPMENT_GUIDELINES.md` / `.review/extension.md`.
+- **CHANGELOG test count updated** from stale `456` to current
+  `477` (rising counter is now called out as intentional so
+  future readers see it climb with each self-review round rather
+  than assume it's drift).
+- **`stable_sort_by_severity` comment drift** in
+  `apply_first_pass_exhaustive_policy` — the helper was renamed
+  to `_sort_findings_criticals_first` in round-3; the
+  round-3-adjacent comment still referenced the old name.
+- **`action.yml` + `README.md` + `skills/ai-diff-reviewer/setup/
+  reference.md`** updated to document the new misconfig-guard
+  behaviour so consumers know why the reviewer would exit-1
+  loudly on a colliding label config.
 
 ### Fixed (round-12 self-review: doc-drift sweep + magic-number promotion)
 

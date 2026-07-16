@@ -198,6 +198,15 @@ Every workflow using AI Diff Reviewer sets these two.
   policy that restricts who can apply the label. The runtime does
   not police that — it's a repository-policy question the consumer
   owns.
+- **Misconfig guard:** the reviewer aborts loudly at startup if
+  this value collides with `label-gate`, `applied-label`, or
+  `iteration-escape-label`. Each collision would silently convert
+  every normal review trigger into a skip (or, for the
+  `applied-label` case, freeze IAR state at round 1 forever).
+  Failure surfaces as an exit-1 `CONFIGURATION ERROR:` log entry
+  naming the colliding label; rename `skip-review-label` to a
+  distinct value (recommended: `skip-ai-review`, `hotfix-no-review`)
+  to resolve.
 - **See:** `docs/TRIGGER_MODES.md § Emergency-bypass label` in the
   action repo for the full contract and worked security example.
 

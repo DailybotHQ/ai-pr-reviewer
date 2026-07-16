@@ -1689,6 +1689,128 @@ class TrackingRenderTests(unittest.TestCase):
         self.assertNotIn(reviewer.PROVIDER_MARKER_PREFIX, body)
 
 
+class SkipLabelCollisionGuardTests(unittest.TestCase):
+    """Regression coverage for `detect_skip_label_collisions` — the
+    misconfiguration guard that runs before `main()` invokes the
+    skip-review short-circuit. Round-13 F1: if `skip-review-label`
+    matches any of the runtime's other semantic labels, every normal
+    trigger silently becomes a skip. This guard aborts loudly instead.
+
+    Also locks the case-insensitive comparison (matches
+    `_labels_contain_ci` and `resolve_trigger_action` semantics)."""
+
+    def test_no_skip_label_configured_no_collision(self) -> None:
+        """Empty `skip-review-label` disables the feature entirely, so
+        no collision is possible even if the other labels are set."""
+        result: list[str] = reviewer.detect_skip_label_collisions(
+            skip_review_label="",
+            label_gate="Ready",
+            applied_label="ai-reviewed",
+            iteration_escape_label="full-review-please",
+        )
+        self.assertEqual(result, [])
+
+    def test_distinct_labels_no_collision(self) -> None:
+        """Well-configured setup with four distinct labels: safe."""
+        result: list[str] = reviewer.detect_skip_label_collisions(
+            skip_review_label="skip-ai-review",
+            label_gate="Ready",
+            applied_label="ai-reviewed",
+            iteration_escape_label="full-review-please",
+        )
+        self.assertEqual(result, [])
+
+    def test_collision_with_label_gate_detected(self) -> None:
+        """Same as label-gate → every gated review silently skips."""
+        result: list[str] = reviewer.detect_skip_label_collisions(
+            skip_review_label="Ready",
+            label_gate="Ready",
+            applied_label="ai-reviewed",
+            iteration_escape_label="full-review-please",
+        )
+        self.assertEqual(len(result), 1)
+        self.assertIn("label-gate", result[0])
+
+    def test_collision_with_applied_label_detected(self) -> None:
+        """Same as applied-label → first successful review arms the
+        skip on every subsequent trigger, freezing IAR at round 1."""
+        result: list[str] = reviewer.detect_skip_label_collisions(
+            skip_review_label="ai-reviewed",
+            label_gate="Ready",
+            applied_label="ai-reviewed",
+            iteration_escape_label="full-review-please",
+        )
+        self.assertEqual(len(result), 1)
+        self.assertIn("applied-label", result[0])
+
+    def test_collision_with_escape_label_detected(self) -> None:
+        """Same as escape label → the "force full review" gesture is
+        silently converted into a "skip review" gesture."""
+        result: list[str] = reviewer.detect_skip_label_collisions(
+            skip_review_label="full-review-please",
+            label_gate="Ready",
+            applied_label="ai-reviewed",
+            iteration_escape_label="full-review-please",
+        )
+        self.assertEqual(len(result), 1)
+        self.assertIn("iteration-escape-label", result[0])
+
+    def test_collision_detection_is_case_insensitive(self) -> None:
+        """Casing mismatch between config and PR labels can never be
+        the load-bearing signal that skip-label is safe — the check
+        must match `_labels_contain_ci` semantics used at the call
+        sites."""
+        result: list[str] = reviewer.detect_skip_label_collisions(
+            skip_review_label="READY",
+            label_gate="ready",
+            applied_label="ai-reviewed",
+            iteration_escape_label="full-review-please",
+        )
+        self.assertEqual(len(result), 1)
+        self.assertIn("label-gate", result[0])
+
+    def test_multiple_collisions_reported_together(self) -> None:
+        """A pathological config that collides with two other labels
+        surfaces both in the error message so the developer sees the
+        full picture in one abort, not one collision at a time."""
+        result: list[str] = reviewer.detect_skip_label_collisions(
+            skip_review_label="Ready",
+            label_gate="Ready",
+            applied_label="Ready",
+            iteration_escape_label="Ready",
+        )
+        self.assertEqual(len(result), 3)
+        self.assertTrue(any("label-gate" in c for c in result))
+        self.assertTrue(any("applied-label" in c for c in result))
+        self.assertTrue(
+            any("iteration-escape-label" in c for c in result)
+        )
+
+    def test_whitespace_padding_normalised(self) -> None:
+        """User might paste a label with trailing whitespace from a
+        copy-paste. Guard must catch the collision anyway."""
+        result: list[str] = reviewer.detect_skip_label_collisions(
+            skip_review_label="  skip-ai-review  ",
+            label_gate="Ready",
+            applied_label="skip-ai-review",
+            iteration_escape_label="full-review-please",
+        )
+        self.assertEqual(len(result), 1)
+        self.assertIn("applied-label", result[0])
+
+    def test_empty_label_gate_ignored(self) -> None:
+        """Consumers who don't use `label-gate` leave it as `""`.
+        An empty gate is "not configured" and must not spuriously
+        collide with an empty `skip-review-label`."""
+        result: list[str] = reviewer.detect_skip_label_collisions(
+            skip_review_label="skip-ai-review",
+            label_gate="",
+            applied_label="",
+            iteration_escape_label="full-review-please",
+        )
+        self.assertEqual(result, [])
+
+
 class OutputWritingTests(unittest.TestCase):
     def setUp(self) -> None:
         self._fd, self._path = tempfile.mkstemp()

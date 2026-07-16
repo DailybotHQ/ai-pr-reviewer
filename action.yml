@@ -83,7 +83,7 @@ inputs:
     required: false
     default: ''
   skip-review-label:
-    description: 'Optional emergency-bypass label (e.g. `skip-ai-review`). When BOTH the workflow trigger fires AND this label is present on the PR, the reviewer short-circuits: no LLM call, no findings, no state mutation — the GitHub check reports success (exit 0) so the merge can proceed. A tracking comment is posted explaining WHY the review was skipped so the audit trail stays intact. Intended for hotfixes / rollbacks / trivially safe changes where an LLM review would burn tokens for no incremental value. SECURITY: anyone who can label a PR can bypass code review — combine with a CODEOWNERS/ruleset rule that restricts who can apply this label. Empty (default) = feature disabled; opt-in.'
+    description: 'Optional emergency-bypass label (e.g. `skip-ai-review`). When BOTH the workflow trigger fires AND this label is present on the PR, the reviewer short-circuits: no LLM call, no findings, no state mutation — the GitHub check reports success (exit 0) so the merge can proceed. A tracking comment is posted explaining WHY the review was skipped so the audit trail stays intact. Intended for hotfixes / rollbacks / trivially safe changes where an LLM review would burn tokens for no incremental value. SECURITY: anyone who can label a PR can bypass code review — combine with a CODEOWNERS/ruleset rule that restricts who can apply this label. MISCONFIG GUARD: the reviewer aborts loudly at startup if this label equals `label-gate`, `applied-label`, or `iteration-escape-label` (each collision would silently convert every normal review trigger into a skip). Empty (default) = feature disabled; opt-in.'
     required: false
     default: ''
 

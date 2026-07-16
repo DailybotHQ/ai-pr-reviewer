@@ -3030,10 +3030,10 @@ def apply_first_pass_exhaustive_policy(
         # § 7.1). A naive `findings[:effective_cap]` would drop
         # criticals if the model happened to emit them past position N,
         # silently bypassing the rail on round-1 of every generation.
-        # `stable_sort_by_severity` preserves the model's within-tier
-        # ordering (so info/warning ordering stays intact within their
-        # tiers) while lifting all criticals to the front — the tail
-        # truncation then only ever sheds warnings/infos.
+        # `_sort_findings_criticals_first` preserves the model's
+        # within-tier ordering (so info/warning ordering stays intact
+        # within their tiers) while lifting all criticals to the front —
+        # the tail truncation then only ever sheds warnings/infos.
         effective_cap: int = base_max_inline_comments * cap_multiplier
         prioritized: list[Finding] = _sort_findings_criticals_first(findings)
         return PolicyResult(
@@ -3325,6 +3325,57 @@ def _labels_contain_ci(*, needle: str, haystack: list[str]) -> bool:
     if not needle_norm:
         return False
     return any(lbl.strip().lower() == needle_norm for lbl in haystack)
+
+
+def detect_skip_label_collisions(
+    *,
+    skip_review_label: str,
+    label_gate: str,
+    applied_label: str,
+    iteration_escape_label: str,
+) -> list[str]:
+    """Return a list of human-readable collision descriptions when
+    `skip-review-label` matches any of the runtime's other semantic
+    labels. Empty list means safe to proceed. Used by `main()` to
+    fail loudly on misconfiguration before the reviewer runs, rather
+    than silently converting every trigger into a skip.
+
+    The three collision cases:
+      - **label-gate:** the label that gates whether the reviewer
+        runs at all. If `skip-review-label == label-gate`, then
+        applying the gate label to request a review IMMEDIATELY
+        cancels the request. Every gated review silently skips.
+      - **applied-label:** the label stamped by the reviewer on
+        successful completion. If `skip-review-label == applied-
+        label`, then the first successful review arms the skip on
+        every subsequent trigger — state freezes at round 1
+        forever, IAR never advances, no new findings ever surface.
+      - **iteration-escape-label:** the "force a full un-deduped
+        review" gesture. If `skip-review-label == escape-label`,
+        the developer's request for a thorough re-review is
+        silently converted into a skip — the exact opposite of
+        the requested behaviour.
+
+    Empty strings for `label-gate` / `applied-label` are ignored
+    (means "not configured"). The escape label always has a value
+    (`IAR_DEFAULT_ESCAPE_LABEL` if unset) so it is always checked.
+    All comparisons are case-insensitive to match `_labels_contain_ci`
+    semantics at the runtime check sites.
+    """
+    skip_norm: str = skip_review_label.strip().lower()
+    if not skip_norm:
+        return []
+    collisions: list[str] = []
+    if label_gate and skip_norm == label_gate.strip().lower():
+        collisions.append(f"label-gate ({label_gate!r})")
+    if applied_label and skip_norm == applied_label.strip().lower():
+        collisions.append(f"applied-label ({applied_label!r})")
+    escape_norm: str = iteration_escape_label.strip().lower()
+    if escape_norm and skip_norm == escape_norm:
+        collisions.append(
+            f"iteration-escape-label ({iteration_escape_label!r})"
+        )
+    return collisions
 
 
 def check_escape_label(
@@ -5801,6 +5852,36 @@ def main() -> int:
     skip_review_label: str = os.environ.get(
         "AIPRR_SKIP_REVIEW_LABEL", ""
     ).strip()
+
+    # Load-bearing misconfiguration guard: `skip-review-label` is an
+    # emergency-bypass hatch (silently skipping the review). If it
+    # collides with any of the runtime's other semantic labels,
+    # every normal trigger silently becomes a skip. Abort loudly.
+    # See detect_skip_label_collisions() for the collision matrix.
+    if skip_review_label:
+        _iar_escape_label_default: str = (
+            os.environ.get("AIPRR_ITERATION_ESCAPE_LABEL", "").strip()
+            or IAR_DEFAULT_ESCAPE_LABEL
+        )
+        _collisions: list[str] = detect_skip_label_collisions(
+            skip_review_label=skip_review_label,
+            label_gate=label_gate,
+            applied_label=applied_label,
+            iteration_escape_label=_iar_escape_label_default,
+        )
+        if _collisions:
+            log(
+                f"CONFIGURATION ERROR: skip-review-label "
+                f"{skip_review_label!r} collides with: "
+                f"{', '.join(_collisions)}. "
+                "This would cause every normal review trigger to be "
+                "silently skipped. Rename skip-review-label to a "
+                "distinct value (recommended: 'skip-ai-review', "
+                "'hotfix-no-review', or similar). Aborting."
+            )
+            write_all_outputs(skipped=False)
+            return 1
+
     collapse_previous: bool = parse_bool(
         os.environ.get("AIPRR_COLLAPSE_PREVIOUS", "true"), default=True
     )
@@ -6096,7 +6177,14 @@ def main() -> int:
             gh_token, repo=repo, pr_number=pr_number
         )
         log(f"Authenticated as: {bot_login}")
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001 — best-effort GH API call:
+        # bot identity resolution is optional context (used by the
+        # collapse-previous loop's author filter AND the round-10 IAR
+        # marker author filter). If it fails (permission problem, API
+        # outage, marker-scan fallback exhausted, etc.), both consumers
+        # degrade to their pre-filter behaviour (over-review, never
+        # under-surface) rather than crashing the whole review — the
+        # documented safe fallback for the whole reviewer's identity path.
         log(f"bot-login lookup failed (non-fatal): {e}")
 
     # ------------------------------------------------------------------
