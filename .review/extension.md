@@ -316,6 +316,54 @@ extend the security posture to the whole surface consumers touch.
   knows about; a workflow it doesn't see silently rots and its
   third-party actions stay unpatched.
 
+## Iteration-Aware Review (IAR) conventions
+
+The IAR subsystem is opt-in but load-bearing: consumers who enable it
+depend on the exact behavior contracts documented in
+[`docs/ITERATION_AWARENESS.md`](../docs/ITERATION_AWARENESS.md). These
+rules protect that contract across future PRs to this repo.
+
+- **Always `critical`:** removal or rename of any of the 5 IAR inputs
+  (`iteration-awareness-enabled`, `convergence-policy`,
+  `max-review-rounds`, `exhaustive-first-pass-cap-multiplier`,
+  `iteration-escape-label`) or any of the 5 IAR outputs
+  (`iteration-round`, `iteration-generation`, `iteration-policy-applied`,
+  `iteration-tokens-used`, `iteration-cost-vs-baseline-estimate`).
+  Public contract — same rule as Rule #4 applies (v2.0.0 required).
+- **Always `critical`:** moving, weakening, or making configurable the
+  hardcoded critical-always-surfaces branch in
+  `dedupe_findings_against_prior()` (`scripts/reviewer.py`,
+  docs/ITERATION_AWARENESS.md § 7.1). Every convergence policy funnels
+  through this function precisely so the rail cannot be bypassed. A
+  code review that lets a `severity == critical` finding be silenced
+  by any policy or configuration is a correctness bug, not a
+  refactor.
+- **Always `critical`:** raising the default of `max_tokens` or
+  `MAX_TURNS` under the banner of "IAR tuning". IAR's only cap knob
+  is `max-inline-comments` and only on round 1 of a new generation.
+  Per AGENTS.md DON'T #9, other budget defaults require a documented
+  cost-per-review impact analysis first.
+- **Always `warning`:** a code path where IAR is enabled but not gated
+  on `iar_config.enabled` at the call site. The regression suite
+  `tests/test_backward_compat_iar_off.py` guards this — any change
+  that regresses it must be explicitly justified in the PR body.
+- **Always `warning`:** a new IAR helper that reads or writes network
+  I/O outside `try/except` at the `main()` call site. IAR must NEVER
+  crash the reviewer — every IAR failure path in `run_iar_pre_llm` /
+  `run_iar_post_llm` falls back to the baseline (IAR-off) review.
+- **Always `warning`:** a change to `IterationState` schema fields
+  without a corresponding backward-compat parse test in
+  `tests/test_iar_state_layer.py`. Older markers written by prior
+  IAR versions must continue to parse — new fields default to
+  `""` / `[]` / `0` as appropriate. Version-bump the
+  `IAR_STATE_SCHEMA_VERSION` constant only for genuinely
+  breaking changes (never in a `v1.x` release).
+- **Always `info`:** using the term "silence" for a finding IAR
+  chose not to submit. The correct term is "dedup" or "silence"
+  depending on the reason (dedup = the finding matches a prior
+  fingerprint; silence = the policy chose to hide it). The
+  `SilencedFinding.reason` field carries this distinction.
+
 ## PR hygiene
 
 - PR title in Conventional Commits format (matches the squash-merge

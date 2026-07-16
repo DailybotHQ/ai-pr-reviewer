@@ -109,6 +109,7 @@ That's the minimum. Open a PR; the action posts a tracking comment, runs a revie
 - **Optional label gate**: only run when a PR carries a label (e.g. `ready`).
 - **Optional "reviewed" label**: applied automatically after a successful, non-blocked review.
 - **Self-healing on GitHub 422**: if the model anchors a comment outside the diff, the action retries summary-only instead of losing every other comment.
+- **Iteration-Aware Review (opt-in)**: dedup findings against prior rounds so the same warnings don't come back forever. Off by default; enable with `iteration-awareness-enabled: true`. Four convergence policies, a 30% new-lines safety net that forces an exhaustive pass when a big push arrives, and a hardcoded "criticals always surface" rail that no policy can bypass. See [docs/ITERATION_AWARENESS.md](docs/ITERATION_AWARENESS.md) for the full spec and [examples/iteration-aware.yml](examples/iteration-aware.yml) for a recommended config.
 
 ## Providers
 

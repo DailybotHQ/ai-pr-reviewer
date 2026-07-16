@@ -231,6 +231,48 @@ Each install step:
 2. Runs the vendor's install command, optionally pinned via the corresponding `*-version` input.
 3. Emits a `--version` line as a smoke assertion — if the binary is not on PATH, the composite step fails loudly here instead of the reviewer's `install()` sanity check firing 20 lines later.
 
+### 10. Iteration-Aware Review — a cross-cutting subsystem (v1.6.0+, opt-in)
+
+Iteration-Aware Review (IAR) is a subsystem that wraps the reviewer's main loop with a state layer, a generation-tracking layer, a content-anchored deduplication engine, and four convergence policies. It is **opt-in** (default off) and every code path is gated on `iar_config.enabled` at the call site, so consumers who don't enable it get byte-identical behavior to prior releases (enforced by the 19-test regression suite `tests/test_backward_compat_iar_off.py`).
+
+**Read/write flow per review run (when enabled):**
+
+```
+main()
+├── (pre-LLM) run_iar_pre_llm()
+│   ├── read_prior_iteration_state()  ← GraphQL: last non-minimized marker
+│   ├── _resolve_base_sha() + compute_generation_range_hash()
+│   ├── detect_generation_change()    ← FIRST_REVIEW / SAME_GEN / NEW_COMMITS / REBASED
+│   ├── compute_new_lines_pct()       ← for safety net
+│   ├── _fetch_pr_labels()            ← for escape label
+│   └── dispatch_policy(findings=[])  ← extract prompt_addendum + effective cap
+│                                       └─ Precedence: escape label > safety net > configured policy
+│
+├── (LLM turn loop — unchanged)       ← consumes effective cap + system_prompt with optional addendum
+│
+├── (post-LLM) run_iar_post_llm()
+│   ├── _load_code_contexts_for_findings()  ← git show per unique file path
+│   ├── dispatch_policy(findings=result.findings)  ← surfacing decision
+│   ├── mutates result.findings                    ← surfaced subset
+│   ├── advance_generation() OR increment_round_in_generation()
+│   └── update open_fingerprints_this_gen + resolved_fingerprints
+│
+├── (post-LLM tracking body)          ← _render_iar_marker_annotation appended;
+│                                       embed_iteration_state() writes JSON blob
+│
+└── (post-LLM outputs)                ← write_iar_outputs_populated() over the empty
+                                        defaults from write_all_outputs
+```
+
+**Load-bearing invariants:**
+
+- **Zero external state.** The IterationState JSON lives inside the tracking marker's HTML comment. No new file on disk, no new API surface, no new database.
+- **Critical safety rail.** `dedupe_findings_against_prior()` unconditionally surfaces any `severity == critical` finding, regardless of policy or prior state. This branch is HARDCODED inside the dedup function and MUST NOT be moved into a policy, made configurable, or bypassed. Every convergence policy funnels through this function precisely so the rail cannot be forgotten.
+- **Never crashes the reviewer.** Both `run_iar_pre_llm` and `run_iar_post_llm` are wrapped in `try/except` at the call site in `main()`. On any IAR failure the reviewer falls back to the baseline (IAR-off) path and logs the exception — the CI check still gets a review, IAR just skips this run.
+- **Escape label = zero state mutation.** When the user applies the escape label to a PR, dispatch_policy surfaces every finding without dedup AND `run_iar_post_llm` returns the prior state unchanged. The next normal run resumes the dedup timeline as if the escape never happened.
+
+Full spec: [`ITERATION_AWARENESS.md`](ITERATION_AWARENESS.md). Cost + latency model: [`PERFORMANCE.md § Iteration-Aware Review`](PERFORMANCE.md#iteration-aware-review-iar--cost-and-latency-model).
+
 ## What lives where
 
 | Concern | Lives in |

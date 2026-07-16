@@ -36,10 +36,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `action.yml`. Consumers on `@v1` see no change unless they explicitly
   opt in.
 
+### Convergence policies
+- **`iterative`** (default when IAR is on): dedup only. Steady-state
+  LLM cost is the pre-IAR baseline; the reviewer just posts *deltas*.
+- **`first-pass-exhaustive`** (recommended for most consumers): round 1
+  of each generation runs with an expanded `max-inline-comments` cap
+  (via `exhaustive-first-pass-cap-multiplier`, default `3×`) and a
+  ~150-token prompt addendum telling the model to prefer completeness
+  over conciseness. Round 2+ of the same generation delegate to
+  `iterative` (dedup only). Recommended for consumers who see the
+  "same warnings on every re-run" symptom.
+- **`round-capped`** (`max-review-rounds: N`): behaves like `iterative`
+  for the first N rounds of a generation; from round N+1 onward,
+  non-critical findings are silenced. Criticals still surface (safety
+  rail). Warning: composing this with `strictness: block-on-warning`
+  can silence a warning that would otherwise block — documented in
+  [docs/STRICTNESS.md § Strictness × Iteration-Aware Review](docs/STRICTNESS.md).
+- **`critical-gate`** (strict cross-generation dedup): silences
+  fingerprints in `resolved_fingerprints` across generations, so a
+  non-critical finding the developer previously fixed does not
+  resurface even after new commits. Criticals still surface.
+
+### Safety net + escape hatch
+- **30% new-lines safety net**: when a `NEW_COMMITS` or `REBASED`
+  transition adds ≥ 30% new lines to the current diff, the dispatcher
+  forces `first-pass-exhaustive` for that run regardless of configured
+  policy. Prevents accidental silencing on large pushes.
+- **Escape label** (default `full-review-please`): a human applying
+  this label to a PR bypasses dedup for the next run only. Persisted
+  state is preserved so the following normal run resumes the dedup
+  timeline from before the escape.
+
+### Observability + cost telemetry
+- IAR emits five populated action outputs (`iteration-round`,
+  `iteration-generation`, `iteration-policy-applied`,
+  `iteration-tokens-used`, `iteration-cost-vs-baseline-estimate`) on
+  every enabled run. When disabled, all five are empty strings —
+  downstream steps always see a defined value (last-write-wins on
+  `$GITHUB_OUTPUT`).
+- The tracking-marker comment gains a one-line human-readable
+  annotation (gen, round, policy, transition, surfaced/silenced
+  counts) plus an embedded JSON state block the next run parses.
+- Cost model documented in [docs/PERFORMANCE.md § Iteration-Aware
+  Review](docs/PERFORMANCE.md) with a lifetime cost matrix per policy,
+  per-round wall-clock breakdown, and three recommended
+  cost/quality/balanced tuning profiles.
+
+### Failure semantics
+- IAR wraps its pre-LLM and post-LLM steps in `try/except` at the
+  `main()` call site. On any IAR failure the reviewer logs the
+  exception and falls back to baseline (IAR-off) behavior — the CI
+  check still gets a review, IAR just skips that specific run.
+  Consumers never experience an IAR bug as "no review at all".
+
+### Documentation + examples
+- New authoritative spec at [docs/ITERATION_AWARENESS.md](docs/ITERATION_AWARENESS.md).
+- New example workflow at [examples/iteration-aware.yml](examples/iteration-aware.yml).
+- IAR sections added to [docs/STRICTNESS.md](docs/STRICTNESS.md),
+  [docs/PROMPTS.md](docs/PROMPTS.md),
+  [docs/PERFORMANCE.md](docs/PERFORMANCE.md),
+  [docs/PRODUCT_SPEC.md](docs/PRODUCT_SPEC.md),
+  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+- README gains a feature callout in "What you get out of the box" and
+  the inputs/outputs tables list all 5 new inputs + 5 new outputs.
+
 ### Regression contract
 - New test suite `tests/test_backward_compat_iar_off.py` asserts
   byte-identical runtime behavior when the master switch is off. CI
   fails any PR where this suite regresses.
+- 190+ additional unit tests across
+  `test_iar_state_layer.py`, `test_iar_generation_tracking.py`,
+  `test_iar_dedup.py`, `test_iar_policies.py`, `test_iar_dispatch.py`,
+  and `test_iar_observability.py` cover the pure IAR helpers. Total
+  suite grew from 242 to **428 tests** (all passing).
 
 - **New "Security audit alignment" section in `.review/extension.md`.**
   Codifies the review rules that keep the two external security

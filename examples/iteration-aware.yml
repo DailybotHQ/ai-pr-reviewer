@@ -1,0 +1,67 @@
+# Recommended Iteration-Aware Review (IAR) configuration for medium-to-large
+# repos. Solves the multi-round "infinite loop" symptom (new warnings on
+# every re-run) by running an extended first pass, then deduplicating
+# against prior findings so subsequent rounds surface only deltas.
+#
+# IAR is OPT-IN: default is `iteration-awareness-enabled: false` and the
+# reviewer's behavior is byte-identical to prior releases. Enabling IAR
+# adds ~500-800 ms of ambient overhead + a one-time cap-expanded first
+# pass per generation (see docs/PERFORMANCE.md § Iteration-Aware Review
+# for the full cost matrix).
+#
+# See docs/ITERATION_AWARENESS.md for the authoritative spec.
+
+name: AI Diff Review (with IAR)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history is required so IAR's generation-tracking can
+          # `git diff base..head` correctly across force-pushes and rebases.
+          fetch-depth: 0
+
+      - id: review
+        uses: DailybotHQ/ai-diff-reviewer@v1
+        with:
+          provider: anthropic
+          api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          strictness: block-on-critical
+
+          # Iteration-Aware Review — opt-in convergence subsystem.
+          iteration-awareness-enabled: true
+          # Recommended policy: extended first pass per generation, then
+          # dedup-only on subsequent rounds. Best cost/quality trade-off.
+          convergence-policy: first-pass-exhaustive
+          # Round 1 of a new generation gets 3x the baseline cap so the
+          # LLM can surface a comprehensive initial pass.
+          exhaustive-first-pass-cap-multiplier: 3
+          # Only used by the `round-capped` policy; harmless here.
+          max-review-rounds: 5
+          # Add this label to any PR to force a full (un-deduped) review
+          # for that specific run. Persisted state is preserved so the
+          # next normal run resumes the dedup timeline.
+          iteration-escape-label: full-review-please
+
+      # OPTIONAL — surface IAR telemetry as workflow annotations for
+      # dashboards. Non-blocking; safe to remove.
+      - name: IAR cost telemetry
+        if: always() && steps.review.outputs.iteration-round != ''
+        run: |
+          echo "::notice title=IAR::gen=${{ steps.review.outputs.iteration-generation }} \
+          round=${{ steps.review.outputs.iteration-round }} \
+          policy=${{ steps.review.outputs.iteration-policy-applied }} \
+          cost=${{ steps.review.outputs.iteration-cost-vs-baseline-estimate }}"

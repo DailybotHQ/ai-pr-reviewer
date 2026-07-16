@@ -140,8 +140,117 @@ Agent-runner family only:
 
 There is no benchmark suite (adding one would violate the stdlib-only rule for the runtime). The dogfooding channel via [`.github/workflows/self-review.yml`](../.github/workflows/self-review.yml) is the real measurement: it always runs the direct Anthropic baseline leg and runs the CLI-provider legs only when critical action/runtime files change. Its Actions logs record turn count, per-turn latency, and total wallclock for every leg that actually invokes the reviewer. See [`docs/PR_REVIEW_WORKFLOW.md`](PR_REVIEW_WORKFLOW.md) for how to read those logs and how to tell which review came from which leg (via the per-provider `self-reviewed:*` labels).
 
+## Iteration-Aware Review (IAR) — Cost and Latency Model
+
+IAR (opt-in, off by default) rebuilds the "converge in 1–3 rounds instead of 5–10" experience without raising per-turn cost. This section makes the cost impact explicit so you can enable it deliberately.
+
+**One-line summary:** on the *first* review of a new commit-set with the recommended `first-pass-exhaustive` policy, the LLM may produce up to `cap_multiplier` × `max-inline-comments` findings and receives ~150 extra tokens of prompt guidance (the exhaustive addendum). On *subsequent* rounds of the same generation, IAR is close to a no-op — the LLM produces its normal set, and the reviewer dedupes them before posting. The full authoritative spec is in [`ITERATION_AWARENESS.md`](ITERATION_AWARENESS.md).
+
+**Rule #9 compliance (AGENTS.md DON'T #9):** IAR **never** raises the `max_tokens` or `MAX_TURNS` defaults. The only knob it turns is `max-inline-comments`, and only for round 1 of a new generation on the two "exhaustive-eligible" policies (`first-pass-exhaustive` and any policy short-circuited by the safety net). Round 2+ of the same generation always use the baseline cap.
+
+### Lifetime cost matrix per policy
+
+Assumes a mid-size PR reviewed 5 times over its lifetime (once on open, then 4 push/rebase iterations). Uses the default `cap_multiplier=3` and `max-inline-comments=10`. **All numbers are theoretical** — validated against real dogfooding data in Task 10 of the IAR rollout plan.
+
+| Policy | Round 1 cost | Round 2 cost | Rounds 3–5 cost | Lifetime cost vs baseline | User-visible effect |
+|---|---|---|---|---|---|
+| **(baseline, IAR off)** | 1.0× | 1.0× | 1.0× | 1.0× | Same findings re-posted each round → the "infinite loop" symptom. |
+| `iterative` | 1.0× | 1.0× | 1.0× | 1.0× | Same LLM cost; only *deltas* posted. Best steady-state ratio. |
+| `first-pass-exhaustive` | ~1.3× | 1.0× | 1.0× | ~1.06× | Extended initial pass; dedup afterwards. Recommended default. |
+| `round-capped` (max 3) | 1.0× | 1.0× | 1.0× rounds 3, then 0.5× rounds 4–5 (silence pass) | ~0.9× | Aggressive cost saver — non-critical findings silenced after round 3. |
+| `critical-gate` | 1.0× | 1.0× | 1.0× | ~0.85× | Non-critical resolved findings stay silenced across generations too. |
+
+**Ambient overhead per run (regardless of policy):**
+
+- 1 GraphQL query to read the last non-minimized tracking marker (~200 ms).
+- 1 REST call to read PR labels for escape-label detection (~100 ms).
+- 2 `git diff` invocations for the range hash + new-lines-pct (~100 ms combined on a mid-size PR).
+- 1 `git rev-parse` for the base SHA (~10 ms).
+- 1 `git show` per unique file mentioned in a finding (~10 ms each; capped by the number of findings, not the size of the diff).
+
+Total ambient overhead: **~500–800 ms per run**, well under the seconds of latency added by the LLM's own tool calls. Not measurable in end-user wall-clock.
+
+### Per-round wall-clock breakdown
+
+For a typical `first-pass-exhaustive` review on a 500-line PR:
+
+| Phase | Baseline (IAR off) | IAR round 1 (new gen) | IAR round 2+ (same gen) |
+|---|---|---|---|
+| Setup + PR fetch | ~3 s | ~3.5 s (+GraphQL marker read) | ~3.5 s |
+| LLM turn loop | 30–90 s | 40–120 s (cap × 3) | 30–90 s (baseline cap) |
+| GitHub submission | 1–3 s | 1–3 s | 1–3 s |
+| **Total** | **~40–95 s** | **~50–130 s** | **~40–95 s** |
+
+The round-1 extension is the meaningful cost, and only when a new generation actually needs it. On steady-state rounds it's noise.
+
+### Worst-case cost impact + mitigation
+
+**The failure mode you're paying to prevent:** push-heavy workflows (dozens of small commits per hour) that repeatedly trigger new generations. In principle, each `push` → `NEW_COMMITS` transition → `round_in_generation=1` → cap-expanded pass.
+
+**Mitigation guidance (choose one):**
+
+1. **Debounce your triggers** — use `on: push` for the base branch and `on: pull_request: [synchronize]` for feature branches; skip drafts. Standard workflow hygiene.
+2. **Cap ambition explicitly** — set `exhaustive-first-pass-cap-multiplier: 1` to disable cap expansion entirely, keeping only the prompt addendum. Turns "extended pass" into "same-cost pass with better guidance".
+3. **Switch to `iterative`** — no cap expansion, no prompt addendum, pure dedup engine. Same LLM cost as baseline, better UX.
+4. **Enable the 30% safety net's alternative** — the built-in safety net already forces `first-pass-exhaustive` when >= 30% of lines are new-in-generation. This is *usually* what you want. To turn it off (rare), set `iteration-awareness-enabled: false` and re-enable IAR only for the initial opening of the PR.
+
+### How to tune for cost sensitivity
+
+Three recommended profiles:
+
+**Cost-sensitive (minimize spend, tolerate some multi-round noise):**
+```yaml
+iteration-awareness-enabled: true
+convergence-policy: iterative              # dedup only, no cap expansion
+exhaustive-first-pass-cap-multiplier: 1    # ignored by iterative, safe default
+max-review-rounds: 0                       # unused by iterative
+```
+
+**Balanced (recommended default — one-shot exhaustive, then converge):**
+```yaml
+iteration-awareness-enabled: true
+convergence-policy: first-pass-exhaustive
+exhaustive-first-pass-cap-multiplier: 3    # round 1 gets 30 max instead of 10
+max-review-rounds: 5                       # unused by first-pass-exhaustive
+iteration-escape-label: full-review-please
+```
+
+**Quality-sensitive (biggest first-pass net, silence noise later):**
+```yaml
+iteration-awareness-enabled: true
+convergence-policy: round-capped
+max-review-rounds: 3                       # exhaustive round 1, dedup 2-3, silence 4+
+exhaustive-first-pass-cap-multiplier: 5    # round 1 gets 50 max instead of 10
+```
+
+### Reading the cost telemetry
+
+Every IAR-enabled run writes five outputs (empty strings when IAR is off):
+
+| Output | Meaning | Example use |
+|---|---|---|
+| `iteration-round` | Round number in the current generation (1, 2, …). | `if: steps.review.outputs.iteration-round == '1'` for round-1-only steps. |
+| `iteration-generation` | Monotonic generation counter across the PR's lifetime. | Track how many force-pushes / rebases the PR has seen. |
+| `iteration-policy-applied` | The policy actually applied (may differ from configured — safety net or escape label can override). | Detect when the safety net fired. |
+| `iteration-tokens-used` | Best-effort token count for this run. Currently `0` — populated by a future provider-hook PR. Ship the schema now so consumers can wire dashboards. |
+| `iteration-cost-vs-baseline-estimate` | Heuristic delta vs an IAR-off run (e.g. `+15%`, `-5%`, `0%`). Approximate — not a substitute for provider billing. |
+
+Example CI dashboard snippet — surface cost telemetry as a workflow annotation:
+
+```yaml
+- name: IAR cost telemetry
+  if: always() && steps.review.outputs.iteration-round != ''
+  run: |
+    echo "::notice title=IAR::gen=${{ steps.review.outputs.iteration-generation }} \
+    round=${{ steps.review.outputs.iteration-round }} \
+    policy=${{ steps.review.outputs.iteration-policy-applied }} \
+    cost=${{ steps.review.outputs.iteration-cost-vs-baseline-estimate }} \
+    tokens=${{ steps.review.outputs.iteration-tokens-used }}"
+```
+
 ## Related docs
 
 - [`STRICTNESS.md`](STRICTNESS.md) — how the model's `severity` argument maps to the GitHub check outcome (the strictness gate is decoupled from any perf constant).
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — the full runtime shape: composite-action shell, the five tools, and the review-submission flow.
 - [`SECURITY.md`](SECURITY.md) — log redaction (`redact_for_log` + `LOG_REDACT_SUBSTRINGS`) and safe path resolution.
+- [`ITERATION_AWARENESS.md`](ITERATION_AWARENESS.md) — the authoritative IAR spec (schema, policies, safety rails, upgrade path).
