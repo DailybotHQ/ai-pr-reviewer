@@ -270,6 +270,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it to `IAR_FINGERPRINT_BODY_CHARS` next to the other IAR module
   constants. Cosmetic; no behavioral impact.
 
+### Fixed (round-7 self-review: escape-label footer bug + observability polish)
+
+Round-7 caught a **real runtime bug** on the escape-label observability
+path plus 3 doc-drift stragglers and 1 comment miscalibration:
+
+- **Escape-label marker footer bug (runtime).**
+  `_render_iar_marker_annotation` was rendering `state.policy_applied`,
+  but on an escape-label run `run_iar_post_llm` returns the *prior*
+  state unchanged (that is the contract — no mutation) while the
+  current run's effective policy lives in `policy_result.policy_applied`
+  (set to `escape-label-forced-full-review` by `dispatch_policy`).
+  The footer therefore showed the PREVIOUS policy (e.g.
+  `first-pass-exhaustive`), silently defeating the audit greps
+  documented in `docs/ITERATION_AWARENESS.md § 8.5` (operators
+  greping for `policy=\`escape-label-forced-` would find zero
+  matches even when the escape label was used every single review).
+  Fixed by rendering `policy_result.policy_applied` — this also
+  keeps the safety-net override (`safety-net-forced-…`) visible
+  because that override is also set on `policy_result`, not on the
+  preserved-state. New regression test
+  `test_renders_policy_result_not_state_policy` locks the invariant.
+- **`docs/PERFORMANCE.md` cost-telemetry table** — round-6 narrowed
+  the `iteration-cost-vs-baseline-estimate` contract to `"0%"` /
+  `"+N%"` across four surfaces but missed this one, which still
+  listed `-5%` as an example. Fixed; added a "never gate CI on
+  `== '-N%'`" warning matching the other four surfaces.
+- **`_estimate_cost_vs_baseline` docstring** — still advertised
+  `"-10%"` as a typical return value. Rewrote to match the shipping
+  contract (`"0%"` / `"+N%"`), pointed at § 13.4 for the follow-up
+  extension, and clarified that `silenced_count` / `surfaced_count`
+  parameters are accepted-but-not-yet-consumed (stable signature for
+  the future silence-savings model).
+- **Marker-fetch pagination ceiling** — `_fetch_latest_marker_body`
+  was requesting `comments(last: 100)`. On very long-lived PRs where
+  100+ human/bot comments accumulate after the last state-bearing
+  marker was minimized, that marker would fall out of the window and
+  IAR would re-classify the run as `first_review` and re-burn round-1
+  exhaustive. Raised the window to `last: 250` (the practical
+  single-page ceiling for `pullRequest.comments` on the v4 GraphQL
+  endpoint) and documented the ceiling + safe failure mode
+  (over-review, never under-surface) + the follow-up cursor
+  pagination path in `docs/ITERATION_AWARENESS.md § 7.3`.
+- **Comment miscalibration** — `IAR_EXHAUSTIVE_PROMPT_ADDENDUM`
+  comment claimed `≈40 tokens`. The actual addendum is ~70 words
+  (~90-150 tokens) and `docs/PROMPTS.md` / `docs/PERFORMANCE.md`
+  already budget it at ~150. Aligned the comment.
+
 ### Fixed (round-6 self-review doc + telemetry-contract sweep)
 
 Round-6 self-review flagged 3 doc warnings + 2 comment infos. Runtime

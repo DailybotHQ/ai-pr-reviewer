@@ -285,6 +285,29 @@ class RenderMarkerAnnotationTests(unittest.TestCase):
         )
         self.assertNotIn("⚠️", got)
 
+    def test_renders_policy_result_not_state_policy(self) -> None:
+        """Regression guard for round-7 F1: on an escape-label run, the
+        state is preserved (`state.policy_applied` still carries the
+        prior policy, e.g. `first-pass-exhaustive`) but the current
+        run's effective policy is `escape-label-forced-full-review`
+        (via `dispatch_policy`). The marker footer MUST render the
+        current run's `policy_result.policy_applied`, not the
+        preserved-state value, so operators can grep marker chains
+        for `policy=`escape-label-forced-` (as documented in
+        docs/ITERATION_AWARENESS.md § 8.5) and audit escape usage
+        reliably. Same principle applies to safety-net overrides
+        (`policy=`safety-net-forced-…`)."""
+        got: str = _render_iar_marker_annotation(
+            state=self._make_state(),
+            policy_result=self._make_policy_result(
+                surfaced=5, silenced=0,
+                policy="escape-label-forced-full-review",
+            ),
+            transition=GenerationTransition.SAME_GENERATION,
+        )
+        self.assertIn("`escape-label-forced-full-review`", got)
+        self.assertNotIn(f"`{IAR_POLICY_ITERATIVE}`", got)
+
 
 # ---------------------------------------------------------------------------
 # _resolve_base_sha

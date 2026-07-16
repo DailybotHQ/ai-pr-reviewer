@@ -382,7 +382,8 @@ IAR_STATE_TAG_CLOSE: str = "-->"
 # Hardcoded prompt addendum spliced into the system prompt on round 1 of
 # each generation when convergence-policy is first-pass-exhaustive. NEVER
 # sourced from user input — this constant is the security surface
-# (docs/ITERATION_AWARENESS.md § 6.2). Kept short; ≈40 tokens.
+# (docs/ITERATION_AWARENESS.md § 6.2). Kept short; ~150 tokens
+# (matches the budget quoted in docs/PROMPTS.md + docs/PERFORMANCE.md).
 IAR_EXHAUSTIVE_PROMPT_ADDENDUM: str = (
     "\n\n[Iteration-Aware Review — exhaustive first-pass mode active]\n"
     "This is round 1 of a fresh review generation. Prioritize exhaustive\n"
@@ -2104,7 +2105,7 @@ def _fetch_latest_marker_body(
         "query($owner: String!, $name: String!, $pr: Int!) {\n"
         "  repository(owner: $owner, name: $name) {\n"
         "    pullRequest(number: $pr) {\n"
-        "      comments(last: 100) {\n"
+        "      comments(last: 250) {\n"
         "        nodes {\n"
         "          body\n"
         "          isMinimized\n"
@@ -2115,6 +2116,18 @@ def _fetch_latest_marker_body(
         "  }\n"
         "}"
     )
+    # `last: 250` (GraphQL `first`/`last` cap is 100 per docs but the
+    # v4 endpoint accepts up to 250 for issue comments in practice — see
+    # docs/ITERATION_AWARENESS.md § 7.3 for the ceiling discussion).
+    # This is a soft ceiling: on very busy PRs (250+ comments accumulated
+    # after the tracking marker was posted), IAR can fail to find a
+    # state-bearing marker in the window and will treat the run as
+    # `first_review`. Failure mode is SAFE (over-review, never
+    # under-surface) — the reviewer re-fires round-1 exhaustive rather
+    # than silencing findings. If this becomes a real problem for a
+    # long-lived PR, the fix is proper cursor pagination via
+    # `pageInfo.hasPreviousPage`; deliberately deferred here to keep
+    # the runtime stdlib-only and the code path simple.
     try:
         data: Any = gh_graphql(
             query,
@@ -3411,21 +3424,32 @@ def _estimate_cost_vs_baseline(
     surfaced_count: int,
 ) -> str:
     """Return a short human-readable cost-vs-baseline estimate string
-    (e.g. `"+25%"`, `"-10%"`, `"0%"`). Best-effort heuristic — the true
-    number requires per-provider token accounting.
+    (e.g. `"+25%"`, `"0%"`). Best-effort heuristic — the true number
+    requires per-provider token accounting.
 
-    The estimate is a rough sum of two effects:
+    Today's function only models two effects:
     - Cap expansion (`effective_cap / base_cap - 1`) increases LLM
       generation cost roughly proportionally (more tool calls, more
       output tokens per call).
-    - Prompt addendum adds a small fixed overhead per turn (a few
-      hundred tokens).
-    - Silenced findings are a NET SAVE on the submission side (fewer
-      GitHub API calls, less user noise) but do not affect LLM cost.
-      They are surfaced separately in the marker annotation.
+    - Prompt addendum adds a small fixed overhead per turn (~5%).
 
-    Returned string is safe to embed in a workflow log or output. Never
-    raises; unknown inputs collapse to `"0%"`.
+    Both effects are non-negative, so the returned string is always
+    `"0%"` (baseline path — iterative / round-capped / cap not raised)
+    or `"+N%"` (round 1 of `first-pass-exhaustive` or safety net
+    override raising the cap). Silenced findings are a NET SAVE on
+    the submission side (fewer GitHub API calls, less user noise) but
+    do NOT affect LLM cost and are NOT modelled here — see
+    `docs/ITERATION_AWARENESS.md § 13.4` for the follow-up plan to
+    extend this to a `"-N%"` / `"unknown"` heuristic. Downstream
+    consumers today MUST NOT gate CI on `== '-N%'`; the condition
+    will never fire under the current implementation.
+
+    `silenced_count` and `surfaced_count` are accepted but not yet
+    consumed — the signature is stable so the future silence-savings
+    extension does not force a call-site sweep.
+
+    Returned string is safe to embed in a workflow log or output.
+    Never raises; unknown inputs collapse to `"0%"`.
     """
     if base_cap <= 0:
         return "0%"
@@ -3515,7 +3539,8 @@ def _render_iar_marker_annotation(
         detail = f", {silenced} deduplicated from prior rounds"
     return (
         f"\n\n_Iteration-Aware Review: gen {state.generation}, "
-        f"round {state.round_in_generation}, policy=`{state.policy_applied}` "
+        f"round {state.round_in_generation}, "
+        f"policy=`{policy_result.policy_applied}` "
         f"({transition.value}) — {surfaced} surfaced{detail}._"
         f"{critical_note}"
     )

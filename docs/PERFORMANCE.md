@@ -245,7 +245,7 @@ Every run writes five outputs (empty strings only if the IAR pipeline crashed):
 | `iteration-generation` | Monotonic generation counter across the PR's lifetime. | Track how many force-pushes / rebases the PR has seen. |
 | `iteration-policy-applied` | The policy actually applied (may differ from configured — safety net or escape label can override). | Detect when the safety net fired. |
 | `iteration-tokens-used` | Best-effort token count for this run. Currently `0` — populated by a future provider-hook PR. Ship the schema now so consumers can wire dashboards. |
-| `iteration-cost-vs-baseline-estimate` | Heuristic delta vs an IAR-off run (e.g. `+15%`, `-5%`, `0%`). Approximate — not a substitute for provider billing. |
+| `iteration-cost-vs-baseline-estimate` | Coarse cost-delta heuristic derived from cap expansion + a small prompt-addendum flag. Always `"0%"` or `"+N%"` today — silenced-finding savings are not yet modelled, so a `"-N%"` value never appears (see [`docs/ITERATION_AWARENESS.md § 13.4`](ITERATION_AWARENESS.md)). Never gate CI on `== '-N%'`. |
 
 Example CI dashboard snippet — surface cost telemetry as a workflow annotation:
 

@@ -375,6 +375,8 @@ Tiers 1 and 2 combined guarantee that no consumer setting of `collapse-previous`
 
 **Test coverage:** [`tests/test_iar_state_layer.py`](../tests/test_iar_state_layer.py) `FetchLatestMarkerTests.test_prefers_visible_marker_with_state_over_minimized_with_state`, `test_falls_back_to_minimized_marker_with_state_when_no_visible`, `test_falls_back_to_any_marker_when_none_carry_state` lock the three-tier ordering.
 
+**Fetch window ceiling.** `_fetch_latest_marker_body` reads the last 250 issue comments on the PR — the largest single-page window the v4 GraphQL endpoint accepts in practice for `pullRequest.comments`. On very long-lived PRs where more than 250 human/bot comments accumulate AFTER the last state-bearing marker was minimized, IAR can fail to find any marker in the window and classify the run as `first_review` — re-firing round-1 exhaustive under the shipped default policy. Failure mode is SAFE (over-review, never under-surface — no critical finding gets silenced), but convergence is defeated on that specific run. The clean fix is cursor pagination via `pageInfo.hasPreviousPage`; deliberately deferred to keep the runtime stdlib-only and the code path simple. If your PR pattern regularly hits this ceiling, the practical workaround is either the reviewed-label reset (§ 8.5) or explicitly deleting stale non-marker comments; a follow-up patch will add pagination when a real user reports the symptom.
+
 ---
 
 ## 8. Escape hatch
