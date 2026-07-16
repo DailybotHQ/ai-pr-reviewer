@@ -273,6 +273,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it to `IAR_FINGERPRINT_BODY_CHARS` next to the other IAR module
   constants. Cosmetic; no behavioral impact.
 
+### Fixed (round-19 self-review: renumber drift + docstring polish)
+
+Round-19 self-review **passed**. 1 warning + 4 infos:
+
+- **`README.md`** local-skill divergence sentence still pointed at
+  "step 7" after the round-18 IAR renumber (Submit is step 9).
+- **`SilencedFinding` docstring** still said "Task 8 will surface…"
+  — observability already ships; present-tense rewrite.
+- **`apply_round_capped_policy` docstring** claimed post-cap routes
+  through the dedup engine; the implementation filters criticals
+  directly. Docstring now matches the code.
+- **`docs/ITERATION_AWARENESS.md` TOC** was missing § 13 Known
+  limitations (cross-linked from README / action.yml).
+- Dropped the internal `PLAN_iteration_aware_review` Task 10
+  reference from § 9.2 in favour of a PERFORMANCE.md pointer.
+
 ### Fixed (round-18 self-review: walkthrough foot-gun + README IAR pipeline)
 
 Round-18 self-review **passed** (PR green after Cursor API recovered).

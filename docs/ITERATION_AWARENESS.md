@@ -22,6 +22,7 @@
 10. [Walkthroughs](#10-walkthroughs)
 11. [Recommended configurations](#11-recommended-configurations)
 12. [Reference — `IterationState` JSON schema v1](#12-reference--iterationstate-json-schema-v1)
+13. [Known limitations](#13-known-limitations)
 
 ---
 
@@ -488,7 +489,7 @@ For a typical PR that would converge in 5 rounds without dedup:
 | **Lifetime total** | **5X** | **~2.8X** | **~3.3X** | **~2X** | **~4.5X** |
 | **vs baseline** | 0% | **−44%** | **−34%** | **−60%** | **−10%** |
 
-> **Note:** these numbers are theoretical. Dogfooding data from Task 10 of `PLAN_iteration_aware_review` will replace these estimates with empirically measured values. See `docs/PERFORMANCE.md` for the current authoritative numbers.
+> **Note:** these numbers are theoretical. Empirically measured values from self-review dogfooding will replace them over time. See [`docs/PERFORMANCE.md`](PERFORMANCE.md) for the current authoritative numbers.
 
 ### 9.3 Per-round wall-clock breakdown
 

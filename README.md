@@ -606,7 +606,7 @@ The Action's runtime (the local skill mirrors these steps in your coding agent):
 10. **Apply label** — applies `applied-label` if set and the strictness gate didn't block.
 11. **Strictness gate** — exits 2 if blocked, 0 otherwise.
 
-The local skill diverges only at the boundary: instead of posting inline comments to GitHub (step 7), it collects them in-memory and prints the review as a Markdown table in your agent's terminal. Same tools, same prompt, same output shape. IAR pre/post steps still apply locally when the companion skill runs a review against an open PR.
+The local skill diverges only at the boundary: instead of posting the review to GitHub (step 9), it collects findings in-memory and prints them as a Markdown table in your agent's terminal. Same tools, same prompt, same output shape. IAR pre/post steps (6 and 8) still apply locally when the companion skill runs a review against an open PR.
 
 For the full design, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/PROVIDERS.md](docs/PROVIDERS.md), [docs/PROMPTS.md](docs/PROMPTS.md), [docs/STRICTNESS.md](docs/STRICTNESS.md).
 

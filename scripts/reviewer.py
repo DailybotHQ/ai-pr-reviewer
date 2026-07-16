@@ -2786,8 +2786,9 @@ def finding_fingerprint(
 @dataclass(frozen=True)
 class SilencedFinding:
     """A finding that the dedup engine chose NOT to surface, with a
-    machine-readable reason for observability (Task 8 will surface
-    aggregate counts in action outputs / debug log).
+    machine-readable reason. Aggregate surfaced/silenced counts are
+    rendered in the marker annotation and the post-LLM debug log
+    (`run_iar_post_llm`).
     """
 
     finding: Finding
@@ -3095,10 +3096,15 @@ def apply_round_capped_policy(
     surface — non-critical warnings/infos are silenced with a "cap
     reached" reason.
 
-    Pre-cap: behaves like `iterative` (dedup only).
-    Post-cap: filters non-critical → silence; critical → surface via the
-    hardcoded safety rail in the dedup engine (routed through the same
-    path so the rail cannot be bypassed).
+    Pre-cap: behaves like `iterative` (dedup only via
+    `dedupe_findings_against_prior`).
+    Post-cap: this function itself filters to
+    `severity == SEVERITY_CRITICAL` and silences the rest with a
+    "cap reached" reason — it does NOT call the dedup engine. The
+    critical-always-surfaces invariant still holds because the
+    filter keeps every critical; the dedup rail is simply not on
+    this path (generation-fresh fingerprints + prior resolved set
+    are irrelevant once only criticals remain).
 
     `max_rounds == 0` means unlimited (post-cap never triggers).
 
