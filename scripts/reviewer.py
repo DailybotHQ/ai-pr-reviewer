@@ -2322,6 +2322,11 @@ def increment_round_in_generation(
 # ---------------------------------------------------------------------------
 # Provider-independent review payload
 # ---------------------------------------------------------------------------
+#
+# The IAR dedup engine consumes `Finding` instances (defined immediately
+# below) — so the fingerprinting + dedup helpers live AFTER the `Finding`
+# dataclass to avoid forward references. See the "Iteration-Aware Review
+# (IAR) — fingerprinting + dedup engine" block further down the file.
 
 
 @dataclass
@@ -2349,6 +2354,252 @@ class ReviewResult:
     summary: str = ""
     findings: list[Finding] = field(default_factory=list)
     overall_severity: str = SEVERITY_NONE
+
+
+# ---------------------------------------------------------------------------
+# Iteration-Aware Review (IAR) — fingerprinting + dedup engine
+# ---------------------------------------------------------------------------
+# The dedup engine consumes `Finding` (defined above) and prior
+# `IterationState` (defined near the top of the file). Every convergence
+# policy in Tasks 6/7 flows through `dedupe_findings_against_prior`; the
+# critical-always-surfaces safety rail is hardcoded INSIDE that function
+# and MUST NOT be moved into a policy — that's the load-bearing
+# correctness invariant of the whole subsystem
+# (docs/ITERATION_AWARENESS.md § 7.1).
+
+
+@dataclass(frozen=True)
+class CodeContext:
+    """Immutable snapshot of a file's contents at a specific SHA. Used to
+    ground the finding fingerprint in the actual code around the anchor
+    line — so a small refactor around a warning shifts the fingerprint
+    and the warning re-surfaces (correct behavior)."""
+
+    path: str
+    lines: tuple[str, ...]
+
+    def lines_around(self, line: int, radius: int) -> list[str]:
+        """Return up to `2*radius + 1` lines centered on the 1-indexed
+        anchor. Handles boundary cases (near start / end of file) by
+        truncating rather than raising."""
+        if not self.lines:
+            return []
+        start: int = max(1, line - radius)
+        end: int = min(len(self.lines), line + radius)
+        return list(self.lines[start - 1:end])
+
+
+def load_code_context(
+    *, path: str, review_sha: str, repo_root: str | None = None
+) -> CodeContext | None:
+    """Read a file's contents at a specific SHA via `git show <sha>:<path>`.
+
+    Returns `None` if the file didn't exist at that SHA (deleted,
+    pre-add, or the SHA doesn't resolve). Uses `safe_repo_path` to
+    reject any path that escapes the workspace (DO #7).
+    """
+    if not path or not review_sha:
+        return None
+    try:
+        safe_target: Path = safe_repo_path(path)
+    except ValueError as exc:
+        log(f"IAR: load_code_context refused path {path!r}: {exc}.")
+        return None
+    repo_root_path: Path = Path(repo_root).resolve() if repo_root else Path.cwd().resolve()
+    try:
+        rel_str: str = str(safe_target.relative_to(repo_root_path))
+    except ValueError:
+        rel_str = path
+    try:
+        result: subprocess.CompletedProcess[str] = subprocess.run(
+            ["git", "show", f"{review_sha}:{rel_str}"],
+            capture_output=True,
+            check=True,
+            text=True,
+            cwd=repo_root,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        # File missing at this SHA is a normal case (e.g. newly-added
+        # file where review_sha predates the add); log at debug level.
+        log(
+            f"IAR: load_code_context({rel_str}@{review_sha[:8]}) "
+            f"unavailable: {exc}."
+        )
+        return None
+    return CodeContext(
+        path=rel_str, lines=tuple(result.stdout.splitlines())
+    )
+
+
+def finding_fingerprint(
+    *, finding: Finding, code_context: CodeContext | None
+) -> str:
+    """Deterministic 16-hex-char content-anchored hash of a single
+    finding.
+
+    Two runs producing the same finding on the same code produce the
+    same fingerprint. Code changes around the anchor produce a
+    different fingerprint (correct re-surfacing when new commits land).
+
+    Fingerprint inputs:
+    - `path` + `line` + `severity` — the coarse anchor.
+    - First 200 chars of `body` — the finding identity (dedupes
+      re-worded restatements of the same finding).
+    - Hash of `2 * IAR_CONTEXT_HASH_RADIUS + 1` lines around the anchor
+      — content-anchored. When `code_context` is missing (file didn't
+      exist at review SHA), falls back to the string "no_context" so
+      the fingerprint stays deterministic across runs.
+    """
+    if code_context is not None:
+        context_lines: list[str] = code_context.lines_around(
+            finding.line, IAR_CONTEXT_HASH_RADIUS
+        )
+        context_hash: str = hashlib.sha256(
+            "\n".join(context_lines).encode("utf-8")
+        ).hexdigest()[:16]
+    else:
+        context_hash = "no_context"
+    payload: str = (
+        f"{finding.path}|{finding.line}|{finding.severity}|"
+        f"{finding.body[:200]}|{context_hash}"
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class SilencedFinding:
+    """A finding that the dedup engine chose NOT to surface, with a
+    machine-readable reason for observability (Task 8 will surface
+    aggregate counts in action outputs / debug log).
+    """
+
+    finding: Finding
+    reason: str
+
+
+@dataclass(frozen=True)
+class DedupResult:
+    """Typed return of `dedupe_findings_against_prior`.
+
+    - `surfaced`: findings the reviewer will submit to GitHub.
+    - `silenced`: findings suppressed by dedup (with reasons).
+    - `fingerprints_by_finding`: index → fingerprint for the caller to
+      write into the updated `IterationState.open_fingerprints_this_gen`.
+    """
+
+    surfaced: list[Finding]
+    silenced: list[SilencedFinding]
+    fingerprints_by_finding: dict[int, str]
+
+
+def dedupe_findings_against_prior(
+    *,
+    new_findings: list[Finding],
+    prior_state: IterationState | None,
+    code_contexts: dict[str, CodeContext | None],
+) -> DedupResult:
+    """Filter `new_findings` against prior IAR state.
+
+    CRITICAL SAFETY RAIL (docs/ITERATION_AWARENESS.md § 7.1):
+    Findings with `severity == "critical"` ALWAYS surface, unconditionally,
+    regardless of whether their fingerprint matches a prior open/resolved
+    finding. This rule is HARDCODED inside this function and MUST NOT be
+    moved into a policy, made configurable, or moved to a caller. Doing
+    so is a critical safety bug. Every policy path in Tasks 6/7 goes
+    through this function precisely so this safety rail cannot be
+    accidentally bypassed.
+
+    Non-critical dedup behavior:
+    - `first review` (prior_state is None) → all findings surface.
+    - Fingerprint matches `prior_state.open_fingerprints_this_gen` →
+      silence with reason "already reported in gen N, unresolved".
+    - Fingerprint matches `prior_state.resolved_fingerprints` → surface
+      (regression signal — the finding was resolved but re-appeared).
+      Caller may attach a "previously resolved" annotation.
+    - Otherwise → surface.
+    """
+    fingerprints_by_finding: dict[int, str] = {}
+    surfaced: list[Finding] = []
+    silenced: list[SilencedFinding] = []
+    if prior_state is None:
+        for i, finding in enumerate(new_findings):
+            fingerprints_by_finding[i] = finding_fingerprint(
+                finding=finding,
+                code_context=code_contexts.get(finding.path),
+            )
+        return DedupResult(
+            surfaced=list(new_findings),
+            silenced=[],
+            fingerprints_by_finding=fingerprints_by_finding,
+        )
+    known_open: set[str] = set(prior_state.open_fingerprints_this_gen)
+    known_resolved: set[str] = set(prior_state.resolved_fingerprints)
+    for i, finding in enumerate(new_findings):
+        fp: str = finding_fingerprint(
+            finding=finding,
+            code_context=code_contexts.get(finding.path),
+        )
+        fingerprints_by_finding[i] = fp
+        # >>> CRITICAL SAFETY RAIL — DO NOT MOVE, DO NOT GATE, DO NOT WEAKEN.
+        # docs/ITERATION_AWARENESS.md § 7.1 pins this behavior. Every
+        # convergence policy in Tasks 6/7 relies on this branch being
+        # here and being unconditional.
+        if finding.severity == SEVERITY_CRITICAL:
+            surfaced.append(finding)
+            continue
+        # <<< end critical safety rail.
+        if fp in known_open:
+            silenced.append(
+                SilencedFinding(
+                    finding=finding,
+                    reason=(
+                        f"already reported in gen "
+                        f"{prior_state.generation}, unresolved"
+                    ),
+                )
+            )
+            continue
+        # `known_resolved` matches surface (regression signal); the
+        # caller may attach a "previously resolved" annotation. For the
+        # dedup engine itself, resolved-then-reappeared → surface.
+        surfaced.append(finding)
+    return DedupResult(
+        surfaced=surfaced,
+        silenced=silenced,
+        fingerprints_by_finding=fingerprints_by_finding,
+    )
+
+
+def resolve_finding_status(
+    *,
+    prior_open_fingerprints: list[str],
+    current_fps: dict[int, str],
+) -> tuple[list[str], list[str]]:
+    """Given the prior generation's open fingerprints and the current
+    run's fingerprints (indexed by finding), return
+    `(still_open, newly_resolved)` fingerprint lists.
+
+    A fingerprint is:
+    - `still_open` if the current run produced a matching one → the
+      finding is still present.
+    - `newly_resolved` if the prior fingerprint has no match in the
+      current run → the finding was fixed OR the code around it changed
+      enough that the fingerprint no longer matches. Either way, it is
+      no longer reported and moves to `resolved_fingerprints`.
+
+    Deterministic ordering — sorts both lists so the marker embed step
+    produces byte-identical output for byte-identical inputs.
+    """
+    current_fp_set: set[str] = set(current_fps.values())
+    still_open: list[str] = sorted(
+        fp for fp in prior_open_fingerprints if fp in current_fp_set
+    )
+    newly_resolved: list[str] = sorted(
+        fp
+        for fp in prior_open_fingerprints
+        if fp not in current_fp_set
+    )
+    return still_open, newly_resolved
 
 
 # ---------------------------------------------------------------------------
