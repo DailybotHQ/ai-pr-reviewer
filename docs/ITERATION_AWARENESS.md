@@ -86,7 +86,7 @@ All three would fail CI. This is by design.
 | `iteration-round` | integer string | Round number within the current generation. `1` on first review, resets to `1` on generation change. Empty string if the IAR pipeline crashed. |
 | `iteration-generation` | integer string | Generation counter. Increments on new commits or rebase. Empty string if the IAR pipeline crashed. |
 | `iteration-policy-applied` | string | Which policy actually fired this run. Usually matches `convergence-policy`; the 30% safety net overrides it to `safety-net-forced-first-pass-exhaustive`, and the escape label overrides it to `escape-label-forced-full-review`. Consumers should key on the full override string (grep `policy=\`safety-net-forced-` / `policy=\`escape-label-forced-`), not the short policy name. Empty string if the IAR pipeline crashed. |
-| `iteration-tokens-used` | integer string | Sum of input+output LLM tokens for this run. Cost telemetry. Empty string if the IAR pipeline crashed. |
+| `iteration-tokens-used` | integer string | Cost-telemetry placeholder. Always emits `"0"` today — the runtime does not yet capture per-provider usage metadata into `RunTelemetry.tokens_used`; see § 13.2 for the follow-up plan. Stable enough to surface on dashboards without gating on the value. Empty string ONLY if the IAR pipeline crashed. |
 | `iteration-cost-vs-baseline-estimate` | string | Coarse cost-delta heuristic derived from cap expansion (`effective_cap / base_cap`) plus a small prompt-addendum flag. Always non-negative today: `"0%"` when no cap expansion fires; `"+N%"` when round 1 of `first-pass-exhaustive` or the safety net raises the cap. Silenced-finding savings are not yet modelled (see § 9.5); the promised `"-N%"` / `"unknown"` values do NOT ship in this cost function today — do not gate CI steps on them. Empty string if the IAR pipeline crashed. |
 
 ### 3.3 Environment variable mapping
@@ -472,7 +472,7 @@ The bit becomes `False` only when NONE of these hold — i.e., the reviewer has 
 ### 9.1 Design principles
 
 - **DON'T #9 compliance:** IAR does NOT modify `max_tokens` or `MAX_TURNS` defaults. The `exhaustive-first-pass-cap-multiplier` raises `max-inline-comments` (the tool-call ceiling), which affects output token DEMAND but does not change the per-call `max_tokens` budget.
-- **Cost telemetry is free (zero LLM tokens).** The `iteration-tokens-used` and `iteration-cost-vs-baseline-estimate` outputs are populated from response metadata and local computations. They add no LLM cost.
+- **Cost telemetry is free (zero LLM tokens).** `iteration-cost-vs-baseline-estimate` is derived locally from cap expansion + a small addendum flag. `iteration-tokens-used` is a stable placeholder that always emits `"0"` today — the metadata-capture path from provider responses is not yet wired (see § 13.2). Neither output adds LLM cost.
 
 ### 9.2 Lifetime cost matrix (theoretical — validated by dogfooding)
 
@@ -514,11 +514,11 @@ For a typical PR that would converge in 5 rounds without dedup:
 Every IAR-enabled run emits a debug log line at end-of-run:
 
 ```
-IAR cost: input_tokens=8432, output_tokens=2103, git_ops_ms=1250, total_wall_clock_ms=47320, findings_surfaced=8, findings_silenced=3
+IAR cost: input_tokens=0, output_tokens=0, git_ops_ms=1250, total_wall_clock_ms=47320, findings_surfaced=8, findings_silenced=3
 ```
 
 Two outputs allow programmatic access:
-- `iteration-tokens-used` = `input_tokens + output_tokens` (per run).
+- `iteration-tokens-used` — **stable placeholder**. Always emits `"0"` today because the per-provider usage-metadata capture path into `RunTelemetry.tokens_used` is not yet wired (see § 13.2 for the follow-up plan). The debug-log `input_tokens=` / `output_tokens=` fields report the same `0` values. Consumers can safely surface this output on dashboards but MUST NOT gate CI steps on numeric thresholds until the follow-up lands.
 - `iteration-cost-vs-baseline-estimate` — a **coarse, always-non-negative** heuristic derived from cap expansion (`effective_cap / base_cap`) plus a small addendum flag (`+5%` when the IAR exhaustive prompt addendum is spliced). Today the function returns either `"0%"` (no cap expansion) or `"+N%"` (round 1 of `first-pass-exhaustive` / safety net raises the cap). **The signal savings from silenced findings and `state.history[]` averages are not yet modelled** — a future revision may extend the function to emit `"-N%"` / `"unknown"` as originally sketched, but consumers today MUST NOT gate CI steps on those values (the condition will simply never fire).
 
 Example: gate a downstream CI step on IAR cost:

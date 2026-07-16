@@ -273,6 +273,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it to `IAR_FINGERPRINT_BODY_CHARS` next to the other IAR module
   constants. Cosmetic; no behavioral impact.
 
+### Fixed (round-16 self-review: full ITERATION_AWARENESS.md sweep + defensive guard)
+
+Round-16 self-review **passed** (PR green, label stamped). 4 warnings
++ 2 infos, all doc drift the round-15 tokens_used pass missed +
+one defensive guard suggestion:
+
+- **`docs/ITERATION_AWARENESS.md` — comprehensive `iteration-tokens-
+  used` sweep.** Round-15 aligned `action.yml`, `README.md`, and
+  `skills/ai-diff-reviewer/setup/reference.md`, but left four stale
+  claims in the authoritative spec: § 3.2 (output table:
+  "Sum of input+output"), § 9.1 (design principle: "populated
+  from response metadata"), § 9.5 (definition: "= input_tokens +
+  output_tokens"), and § 9.5 debug-log example (showed
+  input_tokens=8432 / output_tokens=2103 that never emit). All
+  four rewritten to describe the stable-placeholder-emits-"0"
+  reality with a § 13.2 pointer for the follow-up.
+- **`.review/extension.md` — USER_FORCED_RESET guard alignment.**
+  The invariant block still described the guard as "All FOUR
+  conditions"; round-14 added `label_fetch_ok` as the fifth.
+  Rewritten to list all five conditions and name BOTH load-
+  bearing safety guards (reviewed_label_applied + label_fetch_ok)
+  by purpose so the reviewer's severity rules stay accurate.
+- **`scripts/reviewer.py` — defensive `if skip_review_label:`
+  guard.** `_labels_contain_ci` already returns False for an
+  empty needle (documented contract), so the previous code was
+  behaviourally correct. Added the explicit guard anyway with a
+  detailed inline comment explaining why: the "feature disabled
+  when input is empty" contract is now visible at the call site,
+  and a hypothetical future change to `_labels_contain_ci` that
+  optimizes empty-needle behaviour differently (e.g. a
+  `return True` for length-normalisation reasons) cannot
+  silently activate the skip-review short-circuit for consumers
+  who don't use the feature.
+
 ### Fixed (round-15 self-review: label_fetch_ok doc drift + tokens_used truth in labeling)
 
 Round-15 self-review **passed** (PR green, label stamped). 3 warnings,

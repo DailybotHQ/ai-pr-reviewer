@@ -374,14 +374,18 @@ both contracts across future PRs.
   risks silently ignoring the reset semantics. Add a comment showing
   the reviewer considered it, or expand the branch to include it.
 - **Always `critical`:** any change to the USER_FORCED_RESET detection
-  in `run_iar_pre_llm` that removes or weakens the
-  `prior_state.reviewed_label_applied` guard. The guard is the
-  load-bearing safety net that prevents any blocked-review re-trigger
-  (which naturally has the reviewed label absent, because blocked runs
-  never stamp it) from being misclassified as a deliberate reset and
-  wiping fingerprint memory. All FOUR conditions — configured label,
-  prior state, prior state records the label was stamped, label absent
-  now — must remain conjoined.
+  in `run_iar_pre_llm` that removes or weakens EITHER of the two
+  load-bearing safety guards: (i)
+  `prior_state.reviewed_label_applied` — prevents any blocked-review
+  re-trigger (which naturally has the reviewed label absent, because
+  blocked runs never stamp it) from being misclassified as a
+  deliberate reset — OR (ii) `label_fetch_ok` — prevents a transient
+  GitHub 5xx returning an empty label list from being misread as
+  "label absent" and silently wiping fingerprint memory on every
+  outage (round-14 F1). All FIVE conditions — configured label,
+  prior state, prior state records the label was stamped, label
+  fetch succeeded, and label absent from the returned list — must
+  remain conjoined.
 - **Always `critical`:** any change to `_fetch_latest_marker_body` that
   removes the tier-2 fallback (minimized markers with an IAR state
   block). Without tier-2, `collapse-previous: true` (the shipped

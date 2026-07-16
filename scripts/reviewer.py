@@ -6167,7 +6167,18 @@ def main() -> int:
     # SECURITY NOTE: anyone who can label a PR can bypass code review via
     # this gesture. Consumers who care must combine this input with a
     # ruleset / CODEOWNERS rule restricting who can apply the label.
-    if _labels_contain_ci(
+    #
+    # The `if skip_review_label:` guard is defensive: `_labels_contain_ci`
+    # already returns False for an empty needle (documented contract),
+    # so the behaviour is correct without it — but the explicit guard
+    # makes the "feature disabled when input is empty" contract visible
+    # at the call site rather than relying on knowledge of the helper's
+    # semantics one level down. If the helper's contract ever changes
+    # (e.g. someone adds an `if not needle: return True` optimization
+    # for a legitimate but unrelated reason), this guard prevents the
+    # skip-review short-circuit from silently activating on every
+    # trigger for consumers who don't use the feature.
+    if skip_review_label and _labels_contain_ci(
         needle=skip_review_label, haystack=current_labels
     ):
         log(
