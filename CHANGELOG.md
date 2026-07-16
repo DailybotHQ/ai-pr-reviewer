@@ -273,6 +273,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it to `IAR_FINGERPRINT_BODY_CHARS` next to the other IAR module
   constants. Cosmetic; no behavioral impact.
 
+### Fixed (round-18 self-review: walkthrough foot-gun + README IAR pipeline)
+
+Round-18 self-review **passed** (PR green after Cursor API recovered).
+2 warnings + 3 infos — all doc/test polish:
+
+- **`docs/ITERATION_AWARENESS.md § 10.1`** still paired
+  `max-review-rounds: 5` with `first-pass-exhaustive` — the same
+  copy-paste foot-gun round-17 fixed in `docs/PERFORMANCE.md`.
+  Updated to the default `0` (unlimited) plus an explicit "do not
+  copy `5`" callout.
+- **`README.md § How it works`** marketplace pipeline walkthrough
+  still omitted always-on IAR. Inserted steps 6 (pre-LLM) and 8
+  (post-LLM) between fetch and submit; renumbered the rest.
+- **Schema / § 9.6 examples** still showed `tokens_used: 24580`
+  after the truth-in-labelling sweep. Both now show `0` with a
+  note pointing at § 13.2.
+- **`tests/test_iar_observability.py`** assertion message still
+  said "four-condition guard"; updated to five-condition + the
+  three-signal OR arming path.
+- File-size overflow (~6830 LOC) already catalogued in § 13.4 —
+  no change (info only).
+
 ### Fixed (round-17 self-review: PERFORMANCE.md tokens_used + max-review-rounds foot-gun)
 
 Round-17 self-review **passed** (PR green, label stamped). 3 warnings

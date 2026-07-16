@@ -1351,7 +1351,9 @@ class ComputeReviewedLabelAppliedTests(unittest.TestCase):
             got,
             msg="Blocked run with prior arming bit=True MUST preserve "
                 "True so the reset gesture stays armed. "
-                "Regression against docs § 8.5 four-condition guard.",
+                "Regression against docs § 8.5 five-condition "
+                "USER_FORCED_RESET guard (arming bit preserved via "
+                "compute_reviewed_label_applied three-signal OR).",
         )
 
     def test_all_signals_false_returns_false(self) -> None:

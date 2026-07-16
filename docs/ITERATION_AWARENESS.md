@@ -539,10 +539,12 @@ Each generation's cost is stored in `state.history[]`:
   "range_hash": "abc123",
   "rounds_ran": 3,
   "converged": true,
-  "tokens_used": 24580,
+  "tokens_used": 0,
   "wall_clock_ms": 128000
 }
 ```
+
+> `tokens_used` is always `0` today — the per-provider usage-metadata capture path is not yet wired (see § 13.2). Examples keep the field so the schema shape is copyable; do not treat non-zero values as shipping behaviour.
 
 Trends are inspectable across runs by reading the marker's embedded state block.
 
@@ -552,7 +554,9 @@ Trends are inspectable across runs by reading the marker's embedded state block.
 
 ### 10.1 "10-round loop → 3-round convergence" (the primary win)
 
-**Configuration:** `convergence-policy: first-pass-exhaustive`, `max-review-rounds: 5`, `cap-multiplier: 3`.
+**Configuration:** `convergence-policy: first-pass-exhaustive`, `max-review-rounds: 0` (default — unlimited; ignored under `first-pass-exhaustive`), `cap-multiplier: 3`.
+
+> Do **not** copy `max-review-rounds: 5` into this profile. That value is ignored under `first-pass-exhaustive`, so it looks harmless — but if you later switch to `round-capped`, it silently caps every PR at 5 rounds and silences non-critical findings past that point. Keep the default `0` unless you deliberately want the cap.
 
 | Event | State transition | User-visible outcome |
 |---|---|---|
@@ -664,7 +668,7 @@ Embedded in the tracking marker comment as an HTML-comment block:
       "range_hash": "abc1234567890abc",
       "rounds_ran": 3,
       "converged": true,
-      "tokens_used": 24580,
+      "tokens_used": 0,
       "wall_clock_ms": 128000
     }
   ],
@@ -674,6 +678,8 @@ Embedded in the tracking marker comment as an HTML-comment block:
 }
 -->
 ```
+
+> `tokens_used: 0` in the example matches shipping behaviour today (§ 13.2). Do not invent non-zero values in dashboards until the provider-hook follow-up lands.
 
 ### 12.1 Field definitions
 

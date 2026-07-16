@@ -599,12 +599,14 @@ The Action's runtime (the local skill mirrors these steps in your coding agent):
 3. **Collapse previous** — marks prior bot reviews/comments as `OUTDATED` via GraphQL.
 4. **Tracking comment** — posts a `Working…` comment with a stable marker.
 5. **Fetch PR** — pulls metadata, file list, and `git diff origin/<base>...HEAD`.
-6. **Agentic loop** — runs the model with five tools: `read_file`, `grep`, `glob`, `post_inline_comment`, `submit_review`. Inline comments are queued in memory and posted atomically with the final review. Conversation history is pruned in pairs to bound token cost.
-7. **Submit** — `POST /pulls/{n}/reviews` with the summary and queued inline comments. On HTTP 422 (one bad anchor line in any comment ⇒ entire request rejected), the action retries summary-only and reports the dropped count in the tracking comment.
-8. **Apply label** — applies `applied-label` if set and the strictness gate didn't block.
-9. **Strictness gate** — exits 2 if blocked, 0 otherwise.
+6. **IAR pre-LLM** — reads prior iteration state from the marker, detects generation transitions (including `USER_FORCED_RESET`), shapes the effective cap + exhaustive prompt addendum, and checks the escape label / safety net. See [docs/ITERATION_AWARENESS.md](docs/ITERATION_AWARENESS.md).
+7. **Agentic loop** — runs the model with five tools: `read_file`, `grep`, `glob`, `post_inline_comment`, `submit_review`. Inline comments are queued in memory and posted atomically with the final review. Conversation history is pruned in pairs to bound token cost.
+8. **IAR post-LLM** — dedupes findings against prior fingerprints (criticals always surface), advances generation/round state, embeds the state block in the tracking marker, and writes the five IAR action outputs.
+9. **Submit** — `POST /pulls/{n}/reviews` with the summary and queued inline comments. On HTTP 422 (one bad anchor line in any comment ⇒ entire request rejected), the action retries summary-only and reports the dropped count in the tracking comment.
+10. **Apply label** — applies `applied-label` if set and the strictness gate didn't block.
+11. **Strictness gate** — exits 2 if blocked, 0 otherwise.
 
-The local skill diverges only at the boundary: instead of posting inline comments to GitHub (step 6), it collects them in-memory and prints the review as a Markdown table in your agent's terminal. Same tools, same prompt, same output shape.
+The local skill diverges only at the boundary: instead of posting inline comments to GitHub (step 7), it collects them in-memory and prints the review as a Markdown table in your agent's terminal. Same tools, same prompt, same output shape. IAR pre/post steps still apply locally when the companion skill runs a review against an open PR.
 
 For the full design, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/PROVIDERS.md](docs/PROVIDERS.md), [docs/PROMPTS.md](docs/PROMPTS.md), [docs/STRICTNESS.md](docs/STRICTNESS.md).
 
