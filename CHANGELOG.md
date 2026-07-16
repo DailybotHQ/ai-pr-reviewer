@@ -273,6 +273,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it to `IAR_FINGERPRINT_BODY_CHARS` next to the other IAR module
   constants. Cosmetic; no behavioral impact.
 
+### Fixed (round-17 self-review: PERFORMANCE.md tokens_used + max-review-rounds foot-gun)
+
+Round-17 self-review **passed** (PR green, label stamped). 3 warnings
+(F3 declined on user-directive grounds; see below) + 1 info (documented
+known-limitation):
+
+- **`docs/PERFORMANCE.md § "Outputs — cost + latency telemetry"`** —
+  `iteration-tokens-used` description tightened to match the
+  authoritative contract in `action.yml` / `README.md` / skill
+  reference. Previously said "Best-effort token count — populated by
+  a future provider-hook PR"; now says "Cost-telemetry placeholder.
+  Always emits `"0"` today [...] MUST NOT be gated on numeric
+  thresholds until the follow-up lands." Aligns the last surface
+  that was still describing this as aspirational rather than
+  stable-placeholder.
+- **`docs/PERFORMANCE.md § "Balanced (recommended default)" profile**
+  — was suggesting `max-review-rounds: 5` (non-default) with the
+  same "ignored by first-pass-exhaustive" comment that round-12
+  fixed in `examples/iteration-aware.yml`. The foot-gun is that
+  `max-review-rounds` is honoured under `round-capped`, so anyone
+  who copy-pastes the profile and later switches policy silently
+  gets a 5-round cap. Fixed to use the default `0` (unlimited)
+  plus an explicit "do NOT copy `max-review-rounds: 5`" callout
+  explaining the foot-gun.
+- **F3 declined (CHANGELOG `### Removed` migration callout).** The
+  reviewer suggested adding a `### Removed` entry for the
+  `iteration-awareness-enabled` input, framed as a migration
+  callout for consumers who opted out on the previous unpublished
+  intermediate state. The user directive was to treat this as the
+  first public version — no version-transition narrative, no
+  migration hints from an unreleased state. IAR ships as
+  always-on infrastructure and no consumer has ever seen an
+  opt-out input on a published tag, so there is no cohort to
+  guide.
+- F4 (agent-runner cap overflow fingerprinting) is a pre-existing
+  documented known limitation (§ 13.1); pattern-noted, no change.
+
 ### Fixed (round-16 self-review: full ITERATION_AWARENESS.md sweep + defensive guard)
 
 Round-16 self-review **passed** (PR green, label stamped). 4 warnings

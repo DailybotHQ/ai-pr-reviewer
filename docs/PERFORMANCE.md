@@ -208,9 +208,18 @@ max-review-rounds: 0                       # unused by iterative
 ```yaml
 convergence-policy: first-pass-exhaustive
 exhaustive-first-pass-cap-multiplier: 3    # round 1 gets 30 max instead of 10
-max-review-rounds: 5                       # unused by first-pass-exhaustive
+max-review-rounds: 0                       # DEFAULT (0 = unlimited); ignored under first-pass-exhaustive
 iteration-escape-label: full-review-please
 ```
+
+> **Do NOT copy `max-review-rounds: 5` into this profile** (a
+> non-default value the reviewer previously suggested here). It is
+> ignored under `first-pass-exhaustive` so the setting looks
+> harmless — but if you later switch `convergence-policy` to
+> `round-capped`, `max-review-rounds: 5` silently caps every PR at
+> 5 rounds without you realising, silencing all non-critical
+> findings past that point. Keep the default `0` (unlimited) unless
+> you deliberately want the cap.
 
 **Quality-sensitive (biggest first-pass net, silence noise later):**
 ```yaml
@@ -244,7 +253,7 @@ Every run writes five outputs (empty strings only if the IAR pipeline crashed):
 | `iteration-round` | Round number in the current generation (1, 2, …). | `if: steps.review.outputs.iteration-round == '1'` for round-1-only steps. |
 | `iteration-generation` | Monotonic generation counter across the PR's lifetime. | Track how many force-pushes / rebases the PR has seen. |
 | `iteration-policy-applied` | The policy actually applied (may differ from configured — safety net or escape label can override). | Detect when the safety net fired. |
-| `iteration-tokens-used` | Best-effort token count for this run. Currently `0` — populated by a future provider-hook PR. Ship the schema now so consumers can wire dashboards. |
+| `iteration-tokens-used` | Cost-telemetry placeholder. Always emits `"0"` today because the per-provider usage-metadata capture path into `RunTelemetry.tokens_used` is not yet wired (see [`docs/ITERATION_AWARENESS.md § 13.2`](ITERATION_AWARENESS.md)). Safe to surface on dashboards; MUST NOT be gated on numeric thresholds until the follow-up lands. |
 | `iteration-cost-vs-baseline-estimate` | Coarse cost-delta heuristic derived from cap expansion + a small prompt-addendum flag. Always `"0%"` or `"+N%"` today — silenced-finding savings are not yet modelled, so a `"-N%"` value never appears (see [`docs/ITERATION_AWARENESS.md § 13.3`](ITERATION_AWARENESS.md)). Never gate CI on `== '-N%'`. |
 
 Example CI dashboard snippet — surface cost telemetry as a workflow annotation:
