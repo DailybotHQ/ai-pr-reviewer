@@ -24,13 +24,13 @@
 | [`pr-description-autocomplete.yml`](pr-description-autocomplete.yml) | Let the reviewer AI write a first-draft PR body when the current body is missing/vague. Idempotent — never overwrites edits. |
 | [`pr-description-block.yml`](pr-description-block.yml) | Fail the check when the PR body is empty or under a length threshold. Definition-of-Ready enforcement. |
 | [`complexity-labeling.yml`](complexity-labeling.yml) | Ask the reviewer to apply `complexity:low\|medium\|high` labels based on cognitive load, files touched, and security surface — not line count. |
-| [`full-featured.yml`](full-featured.yml) | Everything on: label-once trigger + description autocomplete + complexity labeling + extension prompt + block-on-warning. The showcase example. |
+| [`full-featured.yml`](full-featured.yml) | Showcase: label-once + description autocomplete + complexity labels + extension prompt + block-on-warning + explicit IAR knobs (defaults shown) + optional `skip-review-label` (commented). |
 
 Each file is self-contained and ready to drop into `.github/workflows/` in a downstream project.
 
 ## Convention
 
-- Every example uses `DailybotHQ/ai-diff-reviewer@v1` — pinned to the moving major tag so consumers pick up patch/minor updates automatically. Consumers who want strict pinning replace `@v1` with `@vX.Y.Z`.
+- Every example uses `DailybotHQ/ai-diff-reviewer@v2` — pinned to the moving major tag so consumers pick up patch/minor updates automatically. Consumers who want strict pinning replace `@v2` with `@vX.Y.Z`.
 - Every example includes `fetch-depth: 0` on `actions/checkout` (required — the runtime does `git diff origin/<base>...HEAD` and a shallow clone won't have the base ref).
 - Every example sets the minimum permissions (`contents: read`, `pull-requests: write`).
 - Every example includes a workflow-level `timeout-minutes: 15` (the recommended safety net — see [`../docs/PERFORMANCE.md`](../docs/PERFORMANCE.md)).
@@ -46,6 +46,7 @@ Add a row to the table above in the same PR.
 - [`../README.md`](../README.md) — the marketplace-facing readme; the "Recipes" section links back to specific files here.
 - [`../docs/STRICTNESS.md`](../docs/STRICTNESS.md) — full explanation of the four strictness modes referenced by `strict.yml`.
 - [`../docs/PROMPTS.md`](../docs/PROMPTS.md) — writing the custom prompt that `custom-prompt.yml` points at, and layering extensions used by `custom-prompt-per-stack.yml`.
-- [`../docs/TRIGGER_MODES.md`](../docs/TRIGGER_MODES.md) — how `trigger-mode` decides when to run.
+- [`../docs/TRIGGER_MODES.md`](../docs/TRIGGER_MODES.md) — how `trigger-mode` decides when to run, plus § Emergency-bypass label.
+- [`../docs/ITERATION_AWARENESS.md`](../docs/ITERATION_AWARENESS.md) — IAR policies, escape label, USER_FORCED_RESET, outputs.
 - [`../docs/PR_METADATA_CHECKS.md`](../docs/PR_METADATA_CHECKS.md) — how `pr-description-mode` and `complexity-labels-enabled` work.
 - [`prompts/`](prompts/) — starter extension prompts + the meta-prompt for AI-generated custom prompts.

@@ -4,8 +4,8 @@ name: Auto Release
 #   1. Derive the bump (major/minor/patch) from the Conventional Commits
 #      since the last tag.
 #   2. Create and push the new `vX.Y.Z` tag.
-#   3. Move the major-version alias tag (e.g. `v1`) to the new release so
-#      consumers pinning `@v1` pick it up — the standard Marketplace pattern.
+#   3. Move the major-version alias tag (e.g. `v2`) to the new release so
+#      consumers pinning `@v2` pick it up — the standard Marketplace pattern.
 #   4. Publish a GitHub Release with auto-generated notes.
 #
 # Mirrors the DailyBot `auto-release` convention (see the agent-skill repo),
@@ -53,10 +53,10 @@ jobs:
           set -euo pipefail
           # Use the highest SemVer RELEASE tag (vX.Y.Z), NOT
           # `git describe --tags --abbrev=0`. `describe` walks by ancestry and
-          # returns the most recent reachable tag — which, once the moving `v1`
+          # returns the most recent reachable tag — which, once the moving `v2`
           # major-alias tag is force-moved onto the latest release commit, is
-          # `v1` itself. That parses as MAJOR=1, MINOR="" (→0) and a minor bump
-          # produces the already-existing `v1.1.0` (fatal: tag already exists).
+          # `v2` itself. That parses as MAJOR=2, MINOR="" (→0) and a minor bump
+          # produces the already-existing `v2.1.0` (fatal: tag already exists).
           # Filtering to exact `vMAJOR.MINOR.PATCH` and version-sorting ignores
           # the `v1`/`v2` aliases and any pre-release/suffix tags.
           LATEST_TAG=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname \
@@ -182,16 +182,16 @@ jobs:
           fi
 
           # Move the major alias tag — `--force` is correct: it's a moving
-          # pointer by design so `@v1` tracks the latest v1.x.y. Tag-only
+          # pointer by design so `@v2` tracks the latest v2.x.y. Tag-only
           # push; not subject to branch protection.
           #
           # The `${NEW_VERSION}^{}` peel is load-bearing: without it,
           # `git tag -f $MAJOR_TAG $NEW_VERSION` creates a nested annotated
           # tag pointing at the $NEW_VERSION tag object (which then points
           # at the commit). Nested tags work but confuse tooling — a
-          # consumer running `git checkout v1` gets a detached HEAD at the
+          # consumer running `git checkout v2` gets a detached HEAD at the
           # tag object rather than the commit, and comparing tag-object
-          # SHAs from `gh api …/git/refs/tags/v1` to commit SHAs never
+          # SHAs from `gh api …/git/refs/tags/v2` to commit SHAs never
           # matches. Peeling to `^{}` makes MAJOR_TAG a lightweight tag
           # directly at the commit. See docs/RELEASE_RECOVERY.md § "Move
           # the major alias tag" for the reasoning.

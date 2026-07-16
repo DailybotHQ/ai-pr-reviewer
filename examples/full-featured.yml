@@ -1,6 +1,7 @@
 # Everything on: label-once trigger + PR description autocomplete +
 # complexity labeling + custom extension prompt + block-on-warning
-# strictness. The showcase example.
+# strictness + explicit IAR knobs (+ optional skip-review-label,
+# commented). The showcase example.
 
 name: PR review (full-featured)
 on:
@@ -25,7 +26,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: DailybotHQ/ai-diff-reviewer@v1
+      - uses: DailybotHQ/ai-diff-reviewer@v2
         with:
           provider: anthropic
           api-key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -56,3 +57,17 @@ jobs:
           applied-label: reviewed
           collapse-previous: true
           tracking-comment: true
+
+          # 7. Iteration-Aware Review — the defaults shown below match
+          #    action.yml. Omit them and you get the same behavior; kept
+          #    explicit here as documentation. See
+          #    docs/ITERATION_AWARENESS.md and examples/iteration-aware.yml.
+          convergence-policy: first-pass-exhaustive          # DEFAULT
+          max-review-rounds: 0                               # DEFAULT (unused unless policy=round-capped)
+          exhaustive-first-pass-cap-multiplier: 3            # DEFAULT
+          iteration-escape-label: full-review-please         # DEFAULT
+
+          # 8. Optional emergency bypass (DISABLED by default — uncomment
+          #    only if you also protect the label with a ruleset /
+          #    CODEOWNERS rule). See examples/skip-review-label.yml.
+          # skip-review-label: skip-ai-review

@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+> **Shipping as v2.0.0.** Merge of this line cuts a SemVer major via
+> `auto-release.yml` (`feat!:` commit). **`@v2` is the default consumer
+> pin** going forward (skill `version: "2.0.0"`).
+
+### v2 pin surface
+
+Full guide: [`docs/MIGRATION_v2.md`](docs/MIGRATION_v2.md).
+
+- **Default pin:** `uses: DailybotHQ/ai-diff-reviewer@v2` and
+  `npx skills add DailybotHQ/ai-diff-reviewer@v2 --skill ai-diff-reviewer`.
+- **`action.yml` contract:** no inputs renamed or removed.
+- **Platform behaviour:** Iteration-Aware Review on every CI review;
+  local skill reviews stay a full pass. Escape / reset /
+  emergency-bypass: [`docs/ITERATION_AWARENESS.md`](docs/ITERATION_AWARENESS.md),
+  [`docs/TRIGGER_MODES.md`](docs/TRIGGER_MODES.md).
+
+### Changed
+- **Docs + skill + examples sync for IAR / `skip-review-label`, plus
+  v2 pin surface.** Discoverability pass so Marketplace consumers and
+  the companion skill see the same story as `action.yml`, and consumer
+  copy-paste pins move to `@v2`:
+  - `skills/ai-diff-reviewer/SKILL.md` — CI-only surfaces section
+    (IAR + emergency bypass; local review stays a full pass); softened
+    local↔CI parity claims (same methodology/severity; CI may dedupe
+    on round 2+); skill `version: "2.0.0"`.
+  - `setup/SKILL.md` Step 4 — "Next steps:" lead-in + defaults note;
+    `setup/reference.md` — `skipped` output + related-docs links;
+    `apply-review/SKILL.md` — ignore embedded IterationState when
+    collecting findings.
+  - `README.md` / `examples/**` / docs tree (`ARCHITECTURE`,
+    `PRODUCT_SPEC`, `PROMPTS`, `PROVIDERS`, `SECURITY`, `STANDARDS`,
+    root `SECURITY.md`, `prompts/README.md`, `CONTRIBUTING.md`, …) —
+    `@v2` moving major; Features emergency-bypass bullet;
+    `ITERATION_AWARENESS.md` in the docs index; corrected local-skill
+    wording (no local IAR dedup).
+  - `examples/full-featured.yml` + `examples/README.md` — explicit
+    IAR knobs + commented skip-review-label.
+  - `docs/ARCHITECTURE.md` topology + `main()` Components prose
+    (skip + IAR pre/post); `PRODUCT_SPEC.md` emergency-bypass;
+    `docs/README.md` purpose one-liners.
+
 ### Added
 - **Iteration-Aware Review (IAR) — convergence subsystem.** Every
   review now runs the IAR pipeline: dedupes findings against prior
@@ -1696,7 +1737,7 @@ Initial public release.
 - Self-review workflow dogfooding the action on its own PRs.
 - Repo hygiene: issue/PR templates and Dependabot for GitHub Actions.
 
-[Unreleased]: https://github.com/DailybotHQ/ai-diff-reviewer/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/DailybotHQ/ai-diff-reviewer/compare/v1.8.0...HEAD
 [1.6.0]: https://github.com/DailybotHQ/ai-diff-reviewer/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/DailybotHQ/ai-diff-reviewer/compare/v1.4.2...v1.5.0
 [1.4.2]: https://github.com/DailybotHQ/ai-pr-reviewer/compare/v1.4.1...v1.4.2

@@ -47,7 +47,8 @@ It is **not** a replacement for human code review. It's an additional reviewer t
 | Configurable gating | Four strictness modes (`lenient`, `block-on-critical`, `block-on-warning`, `block-on-any`) translate severity into the GitHub check status. |
 | Trigger control | Four `trigger-mode` values (`always`, `label-required`, `label-once`, `label-added-only`) for cost control and review-on-demand patterns. |
 | Label gate | Optionally only run when a PR has a specific label (e.g. `ready`). |
-| Applied label | Optionally label a PR after a successful review (e.g. `pr-reviewed`) so downstream automation can require it. |
+| Applied label | Optionally label a PR after a successful review (e.g. `pr-reviewed`) so downstream automation can require it. Removing that label before the next trigger can force an IAR state reset (fresh generation) when the prior run had stamped the label — five-condition guard; see [`ITERATION_AWARENESS.md` § 8.5](ITERATION_AWARENESS.md). |
+| Emergency-bypass label | Opt-in `skip-review-label` short-circuits to success (no LLM call, no findings, no IAR state mutation) when the label is present — hotfixes / rollbacks. Disabled by default; consumers must restrict who can apply the label. See [`TRIGGER_MODES.md` § Emergency-bypass label](TRIGGER_MODES.md). |
 | Auto-collapse | Previous bot reviews are marked `OUTDATED` on every new push so only the latest is visually active. Per-provider marker so multiple providers can co-exist on one PR. |
 | Tracking comment | A spinner comment with a stable `<!-- ai-pr-reviewer-marker -->` marker transitions in-place from `Working…` to `View review →`. |
 | Self-healing on 422 | If GitHub rejects the review because one comment anchored outside the diff, the action retries summary-only instead of losing every comment. |
@@ -80,9 +81,9 @@ It is **not** a replacement for human code review. It's an additional reviewer t
 ### GitHub Action
 
 - **License:** MIT.
-- **Channel:** GitHub Marketplace (publicly searchable at [`marketplace/actions/ai-diff-reviewer`](https://github.com/marketplace/actions/ai-diff-reviewer)) + direct repo URL for `uses: DailybotHQ/ai-diff-reviewer@v1`.
-- **Repo path:** `DailybotHQ/ai-diff-reviewer` (renamed 2026-07-14 from `DailybotHQ/ai-pr-reviewer`; the old path still resolves via GitHub's permanent 301 redirect, so existing `@v1` pins keep working).
-- **Versioning:** SemVer. The moving major tag (`v1`) auto-points to the latest `v1.x.y` so consumers pinning `@v1` get patches and minor features automatically.
+- **Channel:** GitHub Marketplace (publicly searchable at [`marketplace/actions/ai-diff-reviewer`](https://github.com/marketplace/actions/ai-diff-reviewer)) + direct repo URL for `uses: DailybotHQ/ai-diff-reviewer@v2`.
+- **Repo path:** `DailybotHQ/ai-diff-reviewer`.
+- **Versioning:** SemVer. Default pin is the moving major `@v2` (tracks latest `v2.x.y`).
 - **Provider parity:** as of `v1.1.0` the action ships with **four** providers across two families:
   - Chat-completions family (this action drives the tool-use loop): `anthropic`.
   - Agent-runner family (vendor CLI drives the loop; findings return via `.aiprr/findings.json`): `claude-code`, `cursor`, `codex`.
@@ -92,7 +93,7 @@ It is **not** a replacement for human code review. It's an additional reviewer t
 
 - **License:** MIT (same repository).
 - **Channel:** [skills.sh](https://skills.sh) via `npx skills add DailybotHQ/ai-diff-reviewer --skill ai-diff-reviewer` — a one-liner that vendors the skill into `.agents/skills/ai-diff-reviewer/` and records the pinned version in `skills-lock.json`.
-- **Versioning:** the skill package's `version:` frontmatter is bumped in lockstep with the Action's tag by [`auto-release.yml`](../.github/workflows/auto-release.yml). Pinning `DailybotHQ/ai-diff-reviewer@v1.5.0` on both surfaces guarantees the exact same review methodology on both.
+- **Versioning:** the skill package's `version:` frontmatter is bumped in lockstep with the Action's tag by [`auto-release.yml`](../.github/workflows/auto-release.yml). Pinning `DailybotHQ/ai-diff-reviewer@v2.0.0` on both surfaces guarantees the exact same review methodology on both.
 - **Agent support:** any coding agent that reads the Open Agent Skills format — Cursor, Claude Code, Codex CLI, Gemini CLI, GitHub Copilot's agent mode, Cline, Windsurf, OpenClaw.
 - **Dogfooded install:** this repo also vendors its own skill copy at [`.agents/skills/ai-diff-reviewer/`](../.agents/skills/ai-diff-reviewer/) using the exact same `npx skills` install path, refreshed automatically after every release by `auto-release.yml` Step 3.5.
 
@@ -107,24 +108,18 @@ It is **not** a replacement for human code review. It's an additional reviewer t
   - **CI action:** reviews its own PRs via [`.github/workflows/self-review.yml`](../.github/workflows/self-review.yml). The direct Anthropic baseline runs on every PR/push; the CLI-provider legs run when their secret is configured. Active legs use distinct `self-reviewed:*` labels so each provider's review is separately identifiable in the PR conversation.
   - **Skill:** the vendored copy at `.agents/skills/ai-diff-reviewer/` is re-installed via `npx skills update` after every release, so a broken install flow fails the release itself.
 
-## Roadmap (not a commitment)
+## Current major + roadmap (not a commitment)
 
-The shipped versions so far:
+**Current major: v2** — pin `uses: DailybotHQ/ai-diff-reviewer@v2`. See [`MIGRATION_v2.md`](MIGRATION_v2.md).
 
 | Version | Headline |
 |---|---|
-| **v1.0.0** (2026-05-29) | Initial release — Anthropic provider, composite action, severity gating, tracking comment, 422 fallback. |
-| **v1.1.0** (2026-07-05) | Three new agent-runner providers (`claude-code`, `cursor`, `codex`) alongside the incumbent `anthropic` — zero migration for `@v1` consumers. |
-| **v1.2.x** (2026-07-11 → 2026-07-14) | Cost-scoped dogfooding, per-provider `collapse-previous`, provider-side bug fixes making `claude-code` + `codex` actually usable end-to-end. |
-| **v1.3.x** (2026-07-14) | Marketplace listing published; `author-association` gate for public-repo abuse defense; Claude Code accepts subscription OAuth tokens as `api-key`. |
-| **v1.4.x** (2026-07-14) | Full four-leg self-review matrix on every ready-labeled PR (removed the critical-surface filter); vendored `dailybot` skill dogfood; strictness dogfood at `block-on-critical`. |
-| **v1.5.0** (2026-07-14) | Coordinated rename to **AI Diff Reviewer** (unblocked the Marketplace publish) + **the local companion `ai-diff-reviewer` skill** with the `generate-extension` and `setup` sub-skills + the `.review/extension.md` convention as a single source of truth. |
-| **v1.6.0** (in flight — PR #29) | New `open-pr` sub-skill authoring well-structured PR titles + bodies from the current branch's diff (Conventional-Commits inference, structured body, PR-template merge, `gh pr create`/`edit`). |
+| **v2.0.0** (shipping) | IAR platform major — unconditional Iteration-Aware Review, user-forced reset, `skip-review-label` emergency bypass, full companion skill pack (`setup` / `generate-extension` / `open-pr` / `apply-review`). Default pin `@v2` / skill `2.0.0`. No `action.yml` inputs renamed or removed. |
 
-The upcoming work — no commitment on ordering, all `v1.x` unless flagged:
+Upcoming work — no commitment on ordering; ships on the **v2.x** line unless flagged as a new major:
 
-- **Raw chat-completions providers** (`openai`, `gemini`, `bedrock`) — for teams who want to use those models without installing the corresponding vendor CLI. Bedrock is pending a stdlib-only SigV4 design discussion.
+- **Raw chat-completions providers** (`openai`, `gemini`, `bedrock`) — for teams who want those models without installing the corresponding vendor CLI. Bedrock is pending a stdlib-only SigV4 design discussion.
 - **Community-curated prompt library** at `prompts/community/<stack>.md` — Rails, Django, Next.js, Go services, etc. Curated extension files consumers can reference from `prompt-extension-file:`.
-- **`.aiprr/findings.json` v2 schema** — optional `suggestions` field for line-range code snippets, backwards-compatible via forward-compat parser.
+- **`.aiprr/findings.json` schema extensions** — optional `suggestions` field for line-range code snippets, backwards-compatible via forward-compat parser.
 - **More local sub-skills** as the pattern proves out — likely candidates: a `triage` sub-skill for filing follow-up issues from remaining findings, a `changelog` sub-skill for authoring `CHANGELOG.md` entries in the same shape as the commits.
-- **v2.0** — only if a breaking change to the public input/output contract of `action.yml` is unavoidable. There's no such change on the horizon; the abstraction has held across six minor versions.
+- **v3.0** — only if a breaking change to the public input/output contract of `action.yml` is unavoidable. There's no such change on the horizon.

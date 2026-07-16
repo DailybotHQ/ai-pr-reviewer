@@ -1,8 +1,8 @@
 name: Release
 
-# Auto-update the moving major-version tag (e.g. `v1`) when a new
-# `vX.Y.Z` release is published. Consumers pinning `@v1` then pick up
-# patches and minor features automatically; consumers pinning `@v1.0.0`
+# Auto-update the moving major-version tag (e.g. `v2`) when a new
+# `vX.Y.Z` release is published. Consumers pinning `@v2` then pick up
+# patches and minor features automatically; consumers pinning `@v2.0.0`
 # stay frozen. Standard pattern for Marketplace-published actions.
 
 on:

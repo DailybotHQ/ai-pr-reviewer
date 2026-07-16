@@ -62,7 +62,7 @@ Keep branch names short. Long branches show up in `gh pr view` and break termina
 - **Default prompt:** `prompts/default.md`. Keep one. Don't fork into multiple defaults.
 - **User-facing docs:** `docs/STRICTNESS.md`, `docs/PROMPTS.md`, `docs/PROVIDERS.md`. Each ~300–500 lines max; split if longer.
 - **Contributor docs:** `docs/ARCHITECTURE.md`, `docs/SECURITY.md`, etc.
-- **Examples:** `examples/<scenario>.yml`. One file per scenario, with comments explaining the intent. Keep them runnable as-is — they pin `DailybotHQ/ai-diff-reviewer@v1`.
+- **Examples:** `examples/<scenario>.yml`. One file per scenario, with comments explaining the intent. Keep them runnable as-is — they pin `DailybotHQ/ai-diff-reviewer@v2`.
 - **AI-agent config:** `.agents/`. Edit there, never at `.claude/...`. The `.claude` symlink is for back-compat only.
 
 ## English only
@@ -124,7 +124,7 @@ See [DOCUMENTATION_GUIDE.md](DOCUMENTATION_GUIDE.md). The summary:
 
 ## Versioning
 
-SemVer. Tags `vX.Y.Z`. The moving major tag (`v1`) auto-updates on every `v1.x.y` publish via `release.yml`. Don't delete published tags.
+SemVer. Tags `vX.Y.Z`. The moving major tag for the current line (`v2`) auto-updates on every `v2.x.y` publish via `release.yml`. Don't delete published tags.
 
 ## License
 

@@ -6,10 +6,10 @@ A high-level walk-through of how AI Diff Reviewer is put together. For input/out
 
 The product ships on **two disjoint surfaces from the same repository**:
 
-1. **The GitHub Action** — `action.yml` + `scripts/reviewer.py`, invoked by a consumer's workflow via `uses: DailybotHQ/ai-diff-reviewer@v1`. This is the CI-time reviewer.
+1. **The GitHub Action** — `action.yml` + `scripts/reviewer.py`, invoked by a consumer's workflow via `uses: DailybotHQ/ai-diff-reviewer@v2`. This is the CI-time reviewer.
 2. **The local companion skill** — [`skills/ai-diff-reviewer/`](../skills/ai-diff-reviewer/SKILL.md), installed into a consumer repo via `npx skills add DailybotHQ/ai-diff-reviewer --skill ai-diff-reviewer`. This is the pre-push local reviewer that runs inside the developer's coding agent.
 
-Both surfaces share the same [`prompts/default.md`](../prompts/default.md) as the review methodology and the same [`.review/extension.md`](../.review/extension.md) convention for repo-specific overrides. **Two CI invariants keep the parity real**: (a) the `Skills — prompt-sync invariant` job in [`code_check.yml`](../.github/workflows/code_check.yml) fails PRs where the skill's `prompt.md` byte-copy has drifted from `prompts/default.md`; (b) [`auto-release.yml`](../.github/workflows/auto-release.yml) re-syncs the copy AND bumps the skill's frontmatter `version:` field on every release cut so `@v1.5.0` on both surfaces ships the same review methodology.
+Both surfaces share the same [`prompts/default.md`](../prompts/default.md) as the review methodology and the same [`.review/extension.md`](../.review/extension.md) convention for repo-specific overrides. **Two CI invariants keep the parity real**: (a) the `Skills — prompt-sync invariant` job in [`code_check.yml`](../.github/workflows/code_check.yml) fails PRs where the skill's `prompt.md` byte-copy has drifted from `prompts/default.md`; (b) [`auto-release.yml`](../.github/workflows/auto-release.yml) re-syncs the copy AND bumps the skill's frontmatter `version:` field on every release cut so `@v2.0.0` on both surfaces ships the same review methodology.
 
 ## Topology
 
@@ -21,7 +21,7 @@ Both surfaces share the same [`prompts/default.md`](../prompts/default.md) as th
 │  ┌────────────────────────────────────────────────────────────┐  │
 │  │  jobs.review.steps:                                         │  │
 │  │    - actions/checkout (fetch-depth: 0)                      │  │
-│  │    - DailybotHQ/ai-diff-reviewer@v1                         │  │
+│  │    - DailybotHQ/ai-diff-reviewer@v2                         │  │
 │  └─────────────────────┬───────────────────────────────────────┘  │
 └────────────────────────┼─────────────────────────────────────────┘
                          │
@@ -38,15 +38,18 @@ Both surfaces share the same [`prompts/default.md`](../prompts/default.md) as th
 ┌────────────────────────▼─────────────────────────────────────────┐
 │  scripts/reviewer.py  (stdlib only)                              │
 │                                                                  │
-│   1. Label gate          ── exit 0 if missing                    │
-│   2. Author-association  ── skip fork PRs from drive-bys          │
-│   3. Collapse previous   ── GraphQL minimizeComment (per-provider)│
-│   4. Tracking comment    ── post spinner with marker             │
-│   5. Fetch PR context    ── REST + git diff                      │
-│   6. Agentic loop        ── provider.complete() + tools (or CLI) │
-│   7. Submit review       ── REST POST /pulls/N/reviews + 422 retry│
-│   8. Apply label         ── if not blocked                       │
-│   9. Strictness gate     ── exit 0 / 2                           │
+│   1. Access/trigger gates ── author / label-gate / trigger-mode  │
+│   2. skip-review-label    ── exit 0 + skipped tracking comment   │
+│      (opt-in emergency bypass; IAR state not mutated)            │
+│   3. Collapse previous    ── GraphQL minimizeComment (per-prov.) │
+│   4. Tracking comment     ── post spinner with marker            │
+│   5. Fetch PR context     ── REST + git diff                     │
+│   6. IAR pre-LLM          ── state, generation, cap, escape/net  │
+│   7. Agentic loop         ── provider.complete() + tools / CLI   │
+│   8. IAR post-LLM         ── dedupe, embed state, IAR outputs    │
+│   9. Submit review        ── POST /pulls/N/reviews + 422 retry   │
+│  10. Apply label          ── if not blocked                      │
+│  11. Strictness gate      ── exit 0 / 2                          │
 │                                                                  │
 │   Providers: AnthropicProvider (chat-completions),               │
 │              ClaudeCodeProvider, CursorProvider, CodexProvider   │
@@ -122,7 +125,7 @@ The entire runtime in one file (~4000 LOC, fully type-hinted, stdlib-only). Sect
 7. **Severity / strictness** — `overall_severity()` aggregates the per-comment severities; `evaluate_strictness()` maps `(severity, strictness)` to a blocking decision.
 8. **Agentic loop** — `drive_review()`. Drives `provider.complete()` in a loop, executes any tools the model calls, prunes conversation history in pairs to bound token cost, terminates when the model calls `submit_review` or hits the turn cap.
 9. **Tracking comment renderers** — `render_tracking_body_working/done/failed`. Pure functions; emit the marker.
-10. **`main()`** — orchestrates the lifecycle: load env, label gate, collapse, tracking, prompt resolution, agentic loop (wrapped in failure-update guards), review submission, label application, strictness gate, action outputs.
+10. **`main()`** — orchestrates the lifecycle: load env, author/trigger gates, `skip-review-label` emergency bypass (short-circuit before LLM), collapse, tracking, prompt resolution, IAR pre-LLM, agentic loop (wrapped in failure-update guards), IAR post-LLM, review submission, label application, strictness gate, action outputs.
 
 ### `prompts/default.md`
 
@@ -150,7 +153,7 @@ Sibling deliverable to the GitHub Action. Installed into a consumer repo via `np
 1. **Zero LLM calls of its own.** Every LLM interaction happens inside the developer's coding agent. This is what makes the skill zero-cost to install (no API key round-trip) and provider-agnostic.
 2. **Read-only by default.** The parent review flow only reads. Every sub-skill that writes files asks for explicit consent first.
 3. **Non-blocking on failure.** If the skill can't run (missing `gh` CLI, no git remote, corrupted diff), it prints a clear error and exits — the developer's primary work is never blocked.
-4. **Symmetric with the Action.** Same base prompt, same severity model, same `.review/extension.md` extension convention, same output format. Pinning the same version on both surfaces guarantees identical review behaviour.
+4. **Symmetric with the Action.** Same base prompt, same severity model, same `.review/extension.md` extension convention, same output format. Pinning the same version on both surfaces guarantees the same methodology and severity model (CI may additionally dedupe on round 2+ via IAR; local reviews stay a full pass).
 
 **Dogfooding contract:** this repo vendors its own skill copy at [`.agents/skills/ai-diff-reviewer/`](../.agents/skills/ai-diff-reviewer/), refreshed automatically by [`auto-release.yml`](../.github/workflows/auto-release.yml) Step 3.5 after every release. A skill change that ships broken `npx skills add` compatibility fails Step 3.5 of the very release that publishes it.
 
@@ -234,6 +237,8 @@ Each install step:
 ### 10. Iteration-Aware Review — a cross-cutting subsystem
 
 Iteration-Aware Review (IAR) is a subsystem that wraps the reviewer's main loop with a state layer, a generation-tracking layer, a content-anchored deduplication engine, and four convergence policies. It runs on every review with `convergence-policy: first-pass-exhaustive` as the default. The IAR pipeline is wrapped in `try/except` at every `main()` touchpoint so any IAR-specific failure degrades gracefully to the baseline review path — the reviewer never crashes on IAR bugs. The safety contract is locked by [`tests/test_iar_failure_fallback.py`](../tests/test_iar_failure_fallback.py).
+
+**Ordering note.** The opt-in `skip-review-label` emergency bypass (topology step 2) short-circuits **before** IAR pre-LLM — no LLM call, no IAR state mutation, check exits 0. See [`TRIGGER_MODES.md` § Emergency-bypass label](TRIGGER_MODES.md).
 
 **Read/write flow per review run:**
 
