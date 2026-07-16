@@ -159,6 +159,16 @@ If you're adding a new self-contained component (a new tool, a new severity-eval
 
 If your test would require mocking the entire Anthropic API surface or the entire GitHub API surface, the test isn't pulling its weight — write a smoke test on a real PR instead.
 
+## Failure-fallback regression suites for cross-cutting subsystems (repo convention)
+
+When you add a **cross-cutting subsystem** whose failure mode must NOT crash the runtime (e.g. Iteration-Aware Review, which runs on every review but is wrapped in `try/except` at each `main()` call site), pair it with a dedicated `tests/test_<feature>_failure_fallback.py` file that asserts the runtime **still produces a review** when the subsystem crashes mid-flight. This convention exists because:
+
+- The stdlib-only, single-file runtime cannot afford a cross-cutting subsystem to silently take down every review.
+- A dedicated file lets a reviewer see, at a glance, exactly which invariants the subsystem's safety contract protects (parser leniency, output-writer completeness on every exit path, no new subprocess when the subsystem faults).
+- The file becomes the failing test that any future refactor of the subsystem must first update — a deliberate friction point.
+
+Existing example: [`tests/test_iar_failure_fallback.py`](../tests/test_iar_failure_fallback.py) locks the IAR safety contract — parser can't crash on garbage env vars, `write_iar_outputs_empty()` always writes exactly 5 empty outputs, and `write_all_outputs()` on every exit path (skip, success, block) always includes the 5 IAR outputs so downstream steps never read an undefined value. Copy that structure when adding a new cross-cutting subsystem.
+
 ## Releasing
 
 Releases are cut by [`.github/workflows/auto-release.yml`](../.github/workflows/auto-release.yml) on push to `main`. It parses the Conventional-Commits history since the last tag, picks a SemVer bump (`major`/`minor`/`patch`), updates `CHANGELOG.md`, tags, and pushes. Then [`.github/workflows/release.yml`](../.github/workflows/release.yml) moves the major-version alias (`v1`, `v2`) on publish.

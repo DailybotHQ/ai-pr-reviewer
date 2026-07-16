@@ -98,6 +98,31 @@ Run through this in order:
 - `action.yml` parses (`python3 -c "import yaml; yaml.safe_load(open('action.yml'))"`).
 - The `self-review.yml` workflow ran successfully on the PR.
 
+### 11. Iteration-Aware Review (IAR) contract
+
+The IAR subsystem runs on every review (`convergence-policy: first-pass-exhaustive` is the default). Any code touching it must preserve the try/except safety contract at every `main()` touchpoint — an IAR failure MUST degrade gracefully to the baseline review path with the 5 IAR outputs left empty (locked by `tests/test_iar_failure_fallback.py`). Specific checks for PRs that touch IAR code paths:
+
+- `IARConfig` is `@dataclass(frozen=True)`; construction ALWAYS goes through `build_iar_config(dict(os.environ))` — never `IARConfig(...)` directly (that would bypass validation and clamping).
+- Unknown `convergence-policy` values MUST fall back to `first-pass-exhaustive` (not crash) — see `IAR_VALID_POLICIES` whitelist.
+- The critical-always-surfaces safety rail in `dedupe_findings_against_prior` is load-bearing — any PR that touches that function must preserve the unconditional `if finding.severity == SEVERITY_CRITICAL: continue` branch. Any accidental change here is a shipping-blocker.
+- `_parse_state_from_marker_body` treats every field as untrusted; new fields must be wrapped in `int()` / `str()` / `list()` and the parser must catch every failure path (never raise).
+- Any new IAR subprocess call joins the existing 5 sites (`git diff`, `git show`, `git rev-parse`) — argv-list form, no `shell=True`, path arg through `safe_repo_path`.
+- Any new prompt splicing MUST use a hardcoded module-scope constant like `IAR_EXHAUSTIVE_PROMPT_ADDENDUM` — never interpolate `iar_config.*` fields into the system prompt.
+- The 5 IAR outputs (`iteration-round`, `iteration-generation`, `iteration-policy-applied`, `iteration-tokens-used`, `iteration-cost-vs-baseline-estimate`) must be defined empty by `write_iar_outputs_empty()` on every exit path (the safety-net writer; overwritten by `write_iar_outputs_populated()` on the successful IAR path via last-write-wins) — verified by `test_iar_failure_fallback.py`.
+- `GenerationTransition` has five values (`FIRST_REVIEW`, `SAME_GENERATION`, `NEW_COMMITS`, `REBASED`, `USER_FORCED_RESET`). `USER_FORCED_RESET` is applied as an override at the end of `run_iar_pre_llm` when the reviewed `applied-label` is absent from the PR while prior state exists — it overwrites both `transition` AND `prior_state` (setting the latter to `None`) so all downstream logic sees a fresh-start run. Any code that adds a downstream check on `transition` MUST treat `USER_FORCED_RESET` identically to `FIRST_REVIEW` (or accept the fact that `prior_state is None` cascades correctly through the existing branches).
+- Any new IAR test file should follow the naming convention `test_iar_<component>.py` and cover both the successful pipeline and the try/except fallback path.
+
+### 12. `skip-review-label` short-circuit contract
+
+An opt-in emergency-bypass hatch (`skip-review-label`, empty default → feature OFF) short-circuits the reviewer to success when the configured label is on the PR. Any code touching the skip path (`scripts/reviewer.py` around the `Skip-review-label short-circuit` block in `main()`) must preserve these invariants:
+
+- The short-circuit runs BEFORE `collapse-previous`, BEFORE the tracking-comment spinner, BEFORE `read_prior_iteration_state`, BEFORE `run_iar_pre_llm` — no side effects other than the terminal skip tracking comment.
+- The `applied-label` is NEVER stamped on the skip path (would misrepresent an unreviewed PR as reviewed).
+- The IAR state on the marker comment is NEVER read or mutated (next non-skip run resumes exactly where the pipeline last left off).
+- `write_all_outputs(skipped=True)` is called on the exit path so all 11 outputs (6 core + 5 IAR) are populated as documented — the safety-net writer.
+- The skip tracking comment MUST include `REVIEW_MARKER` (so `collapse-previous` on the next real run recognises it) and, when set, the per-provider marker (so provider-scoped collapse works in multi-provider matrices). Locked by `tests/test_reviewer.py` `TrackingRenderTests.test_skipped_by_label_body_*`.
+- The tracking-comment `POST` is wrapped in a broad `except` because the skip must still succeed even if audit-comment posting fails (network hiccup, permissions revoked mid-run). The `# noqa: BLE001` + comment is required to make the intent explicit.
+
 ## Output format
 
 After reviewing, produce a Markdown report with:

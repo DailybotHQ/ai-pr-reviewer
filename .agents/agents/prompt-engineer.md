@@ -105,6 +105,17 @@ When finishing a prompt-engineering task, produce:
 
 The output is what goes into the PR description. The PR description is the canonical record of why the change shipped.
 
+## Iteration-Aware Review (IAR) prompt addendum
+
+The IAR subsystem introduces one runtime-conditional splice into the system prompt: `IAR_EXHAUSTIVE_PROMPT_ADDENDUM` (declared in `scripts/reviewer.py`). It is appended to the system prompt on round 1 of a new generation under the `first-pass-exhaustive` policy, and instructs the model to be exhaustive (rather than iterative) for that round only. Design constraints that any future edit to this addendum MUST preserve:
+
+- **Hardcoded module constant.** Never sourced from user input, env, or config. Never interpolated with `iar_config.*` fields. This is the load-bearing property that keeps the prompt-splicing surface free of user-controllable interpolation (documented in `docs/SECURITY.md` § IAR trust boundary → Prompt splicing).
+- **Additive to the base prompt.** The addendum is appended, never a replacement. The consumer's `system-prompt-file:` / `prompt-extension-file:` inputs still compose normally.
+- **Round-1-of-generation only.** From round 2 onwards of the same generation, `first-pass-exhaustive` delegates to `iterative` (dedup-only) and the addendum is NOT re-appended. This is the "transient boost" property that keeps the steady-state cost delta at `+0%`.
+- **~150 tokens.** The addendum's cost impact is documented in `docs/PERFORMANCE.md` § IAR cost model. Growth here directly raises the transient cost of every round-1-of-new-gen review.
+
+If you're editing the addendum: run the smoke-test process (step 5 above) with `convergence-policy: first-pass-exhaustive` against a PR with the escape label applied (to force round 1 of new gen). Capture before/after and paste into the PR description as for any other prompt edit.
+
 ## Tone
 
 Prompt engineering is craft, not magic. Be skeptical of changes "based on a feeling". Insist on real-PR evidence before recommending a merge. Defer to the maintainer on stylistic preferences (tone, length, emoji usage); push hard on calibration accuracy.

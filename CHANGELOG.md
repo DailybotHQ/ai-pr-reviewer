@@ -8,6 +8,909 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Iteration-Aware Review (IAR) — convergence subsystem.** Every
+  review now runs the IAR pipeline: dedupes findings against prior
+  reports using content-anchored fingerprints (hash of the finding +
+  ~20 lines of surrounding code), tracks generations (new commits or
+  rebase reset the round counter), and applies one of four convergence
+  policies (`iterative`, `first-pass-exhaustive` **— shipped default**,
+  `round-capped`, `critical-gate`). **Critical severity findings ALWAYS
+  surface unconditionally** — hardcoded safety rail, non-configurable.
+  Human escape hatch via a `full-review-please` label that forces a
+  full review without mutating persisted state. Full spec in
+  [docs/ITERATION_AWARENESS.md](docs/ITERATION_AWARENESS.md).
+
+### Public surface
+- 4 new tunable inputs (all optional): `convergence-policy`
+  (`first-pass-exhaustive`), `max-review-rounds` (`0`),
+  `exhaustive-first-pass-cap-multiplier` (`3`),
+  `iteration-escape-label` (`full-review-please`).
+- 5 new outputs, populated on every successful IAR pipeline run and
+  written as empty strings by the safety-net writer if the pipeline
+  crashes — downstream steps always see a defined value:
+  `iteration-round`, `iteration-generation`, `iteration-policy-applied`,
+  `iteration-tokens-used`, `iteration-cost-vs-baseline-estimate`.
+
+### Convergence policies
+- **`first-pass-exhaustive`** (shipped default): round 1 of each
+  generation runs with an expanded `max-inline-comments` cap (via
+  `exhaustive-first-pass-cap-multiplier`, default `3×`) and a ~150-token
+  prompt addendum telling the model to prefer completeness over
+  conciseness. Round 2+ of the same generation delegate to `iterative`
+  (dedup only). Directly solves the "same warnings on every re-run"
+  symptom by front-loading the exhaustive pass.
+- **`iterative`** (cost-neutral alternative): dedup only, no cap boost.
+  Steady-state LLM cost is the no-dedup baseline; the reviewer just
+  posts *deltas*. Recommended for push-heavy workflows where round 1
+  of each new generation would fire frequently.
+- **`round-capped`** (`max-review-rounds: N`): behaves like `iterative`
+  for the first N rounds of a generation; from round N+1 onward,
+  non-critical findings are silenced. Criticals still surface (safety
+  rail). Warning: composing this with `strictness: block-on-warning`
+  can silence a warning that would otherwise block — documented in
+  [docs/STRICTNESS.md § Strictness × Iteration-Aware Review](docs/STRICTNESS.md).
+- **`critical-gate`** (strict cross-generation dedup): silences
+  fingerprints in `resolved_fingerprints` across generations, so a
+  non-critical finding the developer previously fixed does not
+  resurface even after new commits. Criticals still surface.
+
+### Safety net + escape hatches
+- **30% new-lines safety net**: when a `NEW_COMMITS` or `REBASED`
+  transition adds ≥ 30% new lines to the current diff, the dispatcher
+  forces `first-pass-exhaustive` for that run regardless of configured
+  policy. Prevents accidental silencing on large pushes.
+- **Escape label** (default `full-review-please`): a human applying
+  this label to a PR bypasses dedup for the next run only. Persisted
+  state is preserved so the following normal run resumes the dedup
+  timeline from before the escape.
+- **User-forced reset via reviewed-label removal**: on a PR that already
+  has an IAR state block and a reviewed label (whatever the consumer
+  set as `applied-label`, e.g. `ai-reviewed`), removing the reviewed
+  label before the next review triggers a full IAR reset. The next
+  run is classified as `USER_FORCED_RESET` — prior state is discarded,
+  the generation counter restarts at 1, `resolved_fingerprints` and
+  `open_fingerprints_this_gen` reset to empty, and round-1 exhaustive
+  fires on a clean slate under the default policy. Reuses the labels
+  the workflow already has — no new inputs, no new outputs. Distinct
+  from the escape label (which is one-shot with state preserved):
+  removing the reviewed label is the "start clean" gesture, applying
+  the escape label is the "see everything this once" gesture. Full
+  spec in [docs/ITERATION_AWARENESS.md § 8.5](docs/ITERATION_AWARENESS.md).
+
+### Observability + cost telemetry
+- IAR emits five populated action outputs (`iteration-round`,
+  `iteration-generation`, `iteration-policy-applied`,
+  `iteration-tokens-used`, `iteration-cost-vs-baseline-estimate`) on
+  every successful run. Written as empty strings by
+  `write_iar_outputs_empty()` on every exit path first, then overwritten
+  on the successful path via last-write-wins on `$GITHUB_OUTPUT`.
+- The tracking-marker comment gains a one-line human-readable
+  annotation (gen, round, policy, transition, surfaced/silenced
+  counts) plus an embedded JSON state block the next run parses.
+- Cost model documented in [docs/PERFORMANCE.md § Iteration-Aware
+  Review](docs/PERFORMANCE.md) with a lifetime cost matrix per policy,
+  per-round wall-clock breakdown, and three recommended
+  cost/quality/balanced tuning profiles.
+
+### Failure semantics
+- IAR wraps its pre-LLM and post-LLM steps in `try/except` at the
+  `main()` call site. On any IAR failure the reviewer logs the
+  exception and falls back to the baseline review path — the CI
+  check still gets a review, IAR just skips that specific run.
+  Consumers never experience an IAR bug as "no review at all".
+
+### Emergency-bypass label (`skip-review-label`)
+- **New optional input `skip-review-label`.** Opt-in emergency-bypass
+  hatch for hotfixes, rollbacks, and trivially-safe changes where an
+  LLM review would burn tokens for no incremental value. When BOTH the
+  workflow trigger fires AND the configured label is on the PR, the
+  reviewer short-circuits BEFORE the LLM call: no findings, no state
+  mutation, GitHub check reports success (exit 0) so the merge can
+  proceed. A `⏭️ skipped` tracking comment records the skip and names
+  the label so the audit trail stays intact.
+- **Zero side effects on skip.** The `applied-label` is NOT stamped
+  (applying it would misrepresent an unreviewed PR as reviewed); IAR
+  state is NOT mutated (the next non-skip run resumes exactly where
+  the pipeline left off); `collapse-previous` is NOT run (prior
+  reviews stay visible so the human still has context before merging).
+- **Empty default = feature disabled.** Consumers must consciously
+  configure a label name to activate the bypass — no accidental
+  bypass paths.
+- **Security.** Anyone who can label a PR can bypass code review via
+  this gesture. Consumers who care must combine the input with a
+  ruleset / CODEOWNERS rule restricting who can apply the label —
+  the runtime does not police that. Full contract + security notes
+  in [docs/TRIGGER_MODES.md § Emergency-bypass label](docs/TRIGGER_MODES.md).
+
+### Documentation + examples
+- New authoritative spec at [docs/ITERATION_AWARENESS.md](docs/ITERATION_AWARENESS.md).
+- New example workflow at [examples/iteration-aware.yml](examples/iteration-aware.yml).
+- IAR sections added to [docs/STRICTNESS.md](docs/STRICTNESS.md),
+  [docs/PROMPTS.md](docs/PROMPTS.md),
+  [docs/PERFORMANCE.md](docs/PERFORMANCE.md),
+  [docs/PRODUCT_SPEC.md](docs/PRODUCT_SPEC.md),
+  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+- README gains a feature callout in "What you get out of the box" and
+  the inputs/outputs tables list all 4 new inputs + 5 new outputs.
+
+### Safety contract
+- New test suite `tests/test_iar_failure_fallback.py` locks the
+  try/except safety invariant: garbled env vars still produce a valid
+  `IARConfig`, `write_iar_outputs_empty()` always writes exactly 5
+  empty outputs, and `write_all_outputs()` on every exit path
+  (skip, success, block) always includes the 5 IAR outputs. CI fails
+  any PR where this suite regresses.
+- 200+ additional unit tests across
+  `test_iar_state_layer.py`, `test_iar_generation_tracking.py`,
+  `test_iar_dedup.py`, `test_iar_policies.py`, `test_iar_dispatch.py`,
+  and `test_iar_observability.py` cover the pure IAR helpers. Total
+  suite currently: **480 tests** (all passing). Updated across
+  round-11..round-13 self-review fixes; the running counter is
+  intentional — a slowly climbing total signals that every new
+  behaviour lands with regression coverage.
+
+### Fixed
+- **IAR × `collapse-previous` ordering bug.** Before this fix, on the
+  shipped default (`collapse-previous: true`), the tracking marker
+  from the previous run was minimized BEFORE `run_iar_pre_llm()` read
+  the embedded state block — and the marker fetcher explicitly skipped
+  minimized comments, so IAR always saw `transition=first_review` and
+  never dedup'd. Every consumer on defaults burned through round-1
+  exhaustive on every run and never converged. Fix: teach
+  `_fetch_latest_marker_body` to fall back to the latest **minimized**
+  marker that carries an IAR state block when no visible marker does
+  (three-tier priority: visible-with-state → minimized-with-state →
+  any-marker). IAR state now persists across the collapse boundary;
+  dedup + generation tracking engage on every default run. New tests
+  in `test_iar_state_layer.py::FetchLatestMarkerTests` lock the
+  three-tier ordering.
+- **USER_FORCED_RESET false-positive after blocked runs.** Before this
+  fix, USER_FORCED_RESET fired whenever the reviewed label was absent
+  and prior state existed — but blocked runs (`block-on-critical` +
+  critical finding) never stamp the reviewed label in the first place,
+  so the natural re-trigger after a blocked run looked identical to a
+  deliberate reset gesture and wiped fingerprint memory. Fix: persist
+  a new `reviewed_label_applied: bool` bit inside `IterationState`
+  (set to `True` only when the reviewer successfully stamps the label
+  at the end of a non-blocked run), and gate USER_FORCED_RESET on that
+  bit being `True` in the prior state. Reset now fires only when the
+  reviewer previously stamped the label AND that label has since been
+  removed — a genuinely deliberate developer gesture. Field is
+  optional in the state schema (defaults to `False`) so state written
+  before this fix parses cleanly and safely suppresses the gesture
+  until the reviewer completes one successful run. New tests in
+  `test_iar_observability.py::RunIarPreLlmTests` and
+  `test_iar_state_layer.py::IterationStateRoundTripTests` lock the
+  parse + gate contract.
+- **USER_FORCED_RESET × escape-label precedence.** Before this fix,
+  the `iteration-escape-label` short-circuit in `dispatch_policy` ran
+  before the USER_FORCED_RESET check, so if a user applied BOTH
+  gestures (removed the reviewed label AND added `full-review-please`)
+  the escape label won — but escape preserves prior state whereas
+  reset discards it, contradicting the "reset is the stronger
+  gesture" contract documented in `docs/ITERATION_AWARENESS.md § 8.5`.
+  Fix: reorder `dispatch_policy` to skip the escape-label
+  short-circuit when `transition == USER_FORCED_RESET`, deferring to
+  the configured policy's exhaustive first-pass path with prior state
+  already cleared. New test in
+  `test_iar_dispatch.py::DispatchPolicyPrecedenceTests` locks the
+  precedence contract.
+- **Round-1 exhaustive truncate could drop critical findings past the
+  cap.** In `apply_first_pass_exhaustive_policy` and the agent-runner
+  cap-enforce path, a naive `findings[:effective_cap]` was applied
+  when the model overshot the cap. If the LLM emitted a critical
+  finding at position 31 (or beyond) with `effective_cap=30`, the tail
+  truncation silently dropped it — bypassing the hardcoded
+  critical-always-surfaces safety rail
+  (docs/ITERATION_AWARENESS.md § 7.1). Fix: introduce
+  `_sort_findings_criticals_first` and call it BEFORE every truncation
+  site, so criticals move to the front regardless of the model's
+  emission order and the tail only sheds warnings/infos. New test
+  `test_iar_policies.py::test_round_1_truncation_preserves_criticals_over_the_cap`
+  locks the invariant.
+- **`reviewed_label_applied=True` recorded before `gh_apply_label`
+  succeeded.** Previously the IAR marker embed set
+  `reviewed_label_applied` from `bool(applied_label and not blocked)`
+  BEFORE attempting the label stamp. If the stamp then failed
+  (network hiccup, revoked permissions, deleted-label race), the
+  marker asserted the label was applied when in reality it was not
+  — the next run then saw "reviewed label absent + state claims it
+  was applied" and wrongly fired USER_FORCED_RESET, wiping dedup
+  memory. Fix: attempt the label stamp FIRST inside a try/except,
+  capture the OBSERVED outcome in a local `label_stamped: bool`,
+  and only THEN embed that value into the state block. A stamp
+  failure logs a non-fatal warning and records `False`, keeping the
+  reset gesture honest across transient GH API failures.
+- **Stale `docs/ITERATION_AWARENESS.md § 13` references in
+  `scripts/reviewer.py`.** The schema section was renumbered to § 12
+  when the "Migration guide" was removed, but four inline comments
+  still pointed at § 13. Updated in-place — no behavior change.
+- **`compute_generation_range_hash` used two-dot diff instead of
+  three-dot.** `git diff base_sha..head_sha` compares the two SHAs
+  directly, so any upstream advance of `origin/<base>` (a normal
+  base-branch merge that doesn't touch the PR) would change the hash
+  and trigger a false `NEW_COMMITS` / `REBASED` transition — burning
+  a full exhaustive pass and re-surfacing already-open warnings on
+  any label-gated re-review after the base branch moved. Fixed by
+  switching to `base_sha...head_sha` (three-dot), which pins the
+  comparison to the merge base — matching `fetch_pr_context`'s
+  `origin/<base>...HEAD` payload contract. Same three-dot fix applied
+  to `compute_new_lines_pct`'s `total` diff so the safety-net
+  denominator stays proportional to what the LLM actually reviewed.
+  Docs § 4.3 code sample updated in lockstep.
+- **`reviewed_label_applied` overwritten to `False` on blocked
+  follow-up runs, silently disarming USER_FORCED_RESET.** The prior
+  logic (`= label_stamped`) rewrote the bit from the current run's
+  stamp outcome alone. A blocked run (`block-on-critical` fired) does
+  not remove the label from the PR but wrote `reviewed_label_applied=False`
+  anyway; when the developer then removed the label expecting a
+  reset, the four-way guard failed on condition (c) and the reset
+  silently no-op'd. Fixed by writing the bit as a three-signal OR:
+  `label_stamped OR label_currently_on_pr OR prior_bit`. The bit
+  is now `True` whenever the label is (or would be) present on the
+  PR at the end of this run; blocked runs preserve the prior arming
+  signal instead of clearing it. Docs § 8.5 and § 4.2 rewritten to
+  match the new semantics.
+- **Docs § 4.2 omitted the fourth USER_FORCED_RESET condition.** The
+  paragraph listed three conditions and stopped, contradicting the
+  authoritative § 8.5 spec and the runtime guard. Now enumerates all
+  four (label configured, label absent, prior state exists, prior
+  `reviewed_label_applied=True`) with an explicit note on why the
+  fourth is load-bearing (blocked-run false-positive prevention).
+
+### Known limitations (documented, not yet fixed)
+
+- **Agent-runner overflow findings are not fingerprinted** (§ 13.1).
+  Only surfaces when a CLI provider (Claude Code / Cursor / Codex)
+  emits more findings than `effective-max-inline-comments` — the
+  overflow is dropped after the criticals-first sort but before
+  `run_iar_post_llm`, so it can re-surface in the next round.
+  Tail-risk edge case; does not affect the chat-completions Provider
+  path (Anthropic / OpenAI / Gemini) which fingerprints the full
+  result set before the pipeline caps it.
+- **`finding.body[:200]` fingerprint slice is a magic constant**
+  (§ 13.2). Value is stable and documented; a follow-up will promote
+  it to `IAR_FINGERPRINT_BODY_CHARS` next to the other IAR module
+  constants. Cosmetic; no behavioral impact.
+
+### Fixed (round-19 self-review: renumber drift + docstring polish)
+
+Round-19 self-review **passed**. 1 warning + 4 infos:
+
+- **`README.md`** local-skill divergence sentence still pointed at
+  "step 7" after the round-18 IAR renumber (Submit is step 9).
+- **`SilencedFinding` docstring** still said "Task 8 will surface…"
+  — observability already ships; present-tense rewrite.
+- **`apply_round_capped_policy` docstring** claimed post-cap routes
+  through the dedup engine; the implementation filters criticals
+  directly. Docstring now matches the code.
+- **`docs/ITERATION_AWARENESS.md` TOC** was missing § 13 Known
+  limitations (cross-linked from README / action.yml).
+- Dropped the internal `PLAN_iteration_aware_review` Task 10
+  reference from § 9.2 in favour of a PERFORMANCE.md pointer.
+
+### Fixed (round-18 self-review: walkthrough foot-gun + README IAR pipeline)
+
+Round-18 self-review **passed** (PR green after Cursor API recovered).
+2 warnings + 3 infos — all doc/test polish:
+
+- **`docs/ITERATION_AWARENESS.md § 10.1`** still paired
+  `max-review-rounds: 5` with `first-pass-exhaustive` — the same
+  copy-paste foot-gun round-17 fixed in `docs/PERFORMANCE.md`.
+  Updated to the default `0` (unlimited) plus an explicit "do not
+  copy `5`" callout.
+- **`README.md § How it works`** marketplace pipeline walkthrough
+  still omitted always-on IAR. Inserted steps 6 (pre-LLM) and 8
+  (post-LLM) between fetch and submit; renumbered the rest.
+- **Schema / § 9.6 examples** still showed `tokens_used: 24580`
+  after the truth-in-labelling sweep. Both now show `0` with a
+  note pointing at § 13.2.
+- **`tests/test_iar_observability.py`** assertion message still
+  said "four-condition guard"; updated to five-condition + the
+  three-signal OR arming path.
+- File-size overflow (~6830 LOC) already catalogued in § 13.4 —
+  no change (info only).
+
+### Fixed (round-17 self-review: PERFORMANCE.md tokens_used + max-review-rounds foot-gun)
+
+Round-17 self-review **passed** (PR green, label stamped). 3 warnings
+(F3 declined on user-directive grounds; see below) + 1 info (documented
+known-limitation):
+
+- **`docs/PERFORMANCE.md § "Outputs — cost + latency telemetry"`** —
+  `iteration-tokens-used` description tightened to match the
+  authoritative contract in `action.yml` / `README.md` / skill
+  reference. Previously said "Best-effort token count — populated by
+  a future provider-hook PR"; now says "Cost-telemetry placeholder.
+  Always emits `"0"` today [...] MUST NOT be gated on numeric
+  thresholds until the follow-up lands." Aligns the last surface
+  that was still describing this as aspirational rather than
+  stable-placeholder.
+- **`docs/PERFORMANCE.md § "Balanced (recommended default)" profile**
+  — was suggesting `max-review-rounds: 5` (non-default) with the
+  same "ignored by first-pass-exhaustive" comment that round-12
+  fixed in `examples/iteration-aware.yml`. The foot-gun is that
+  `max-review-rounds` is honoured under `round-capped`, so anyone
+  who copy-pastes the profile and later switches policy silently
+  gets a 5-round cap. Fixed to use the default `0` (unlimited)
+  plus an explicit "do NOT copy `max-review-rounds: 5`" callout
+  explaining the foot-gun.
+- **F3 declined (CHANGELOG `### Removed` migration callout).** The
+  reviewer suggested adding a `### Removed` entry for the
+  `iteration-awareness-enabled` input, framed as a migration
+  callout for consumers who opted out on the previous unpublished
+  intermediate state. The user directive was to treat this as the
+  first public version — no version-transition narrative, no
+  migration hints from an unreleased state. IAR ships as
+  always-on infrastructure and no consumer has ever seen an
+  opt-out input on a published tag, so there is no cohort to
+  guide.
+- F4 (agent-runner cap overflow fingerprinting) is a pre-existing
+  documented known limitation (§ 13.1); pattern-noted, no change.
+
+### Fixed (round-16 self-review: full ITERATION_AWARENESS.md sweep + defensive guard)
+
+Round-16 self-review **passed** (PR green, label stamped). 4 warnings
++ 2 infos, all doc drift the round-15 tokens_used pass missed +
+one defensive guard suggestion:
+
+- **`docs/ITERATION_AWARENESS.md` — comprehensive `iteration-tokens-
+  used` sweep.** Round-15 aligned `action.yml`, `README.md`, and
+  `skills/ai-diff-reviewer/setup/reference.md`, but left four stale
+  claims in the authoritative spec: § 3.2 (output table:
+  "Sum of input+output"), § 9.1 (design principle: "populated
+  from response metadata"), § 9.5 (definition: "= input_tokens +
+  output_tokens"), and § 9.5 debug-log example (showed
+  input_tokens=8432 / output_tokens=2103 that never emit). All
+  four rewritten to describe the stable-placeholder-emits-"0"
+  reality with a § 13.2 pointer for the follow-up.
+- **`.review/extension.md` — USER_FORCED_RESET guard alignment.**
+  The invariant block still described the guard as "All FOUR
+  conditions"; round-14 added `label_fetch_ok` as the fifth.
+  Rewritten to list all five conditions and name BOTH load-
+  bearing safety guards (reviewed_label_applied + label_fetch_ok)
+  by purpose so the reviewer's severity rules stay accurate.
+- **`scripts/reviewer.py` — defensive `if skip_review_label:`
+  guard.** `_labels_contain_ci` already returns False for an
+  empty needle (documented contract), so the previous code was
+  behaviourally correct. Added the explicit guard anyway with a
+  detailed inline comment explaining why: the "feature disabled
+  when input is empty" contract is now visible at the call site,
+  and a hypothetical future change to `_labels_contain_ci` that
+  optimizes empty-needle behaviour differently (e.g. a
+  `return True` for length-normalisation reasons) cannot
+  silently activate the skip-review short-circuit for consumers
+  who don't use the feature.
+
+### Fixed (round-15 self-review: label_fetch_ok doc drift + tokens_used truth in labeling)
+
+Round-15 self-review **passed** (PR green, label stamped). 3 warnings,
+all pure doc drift — no runtime changes:
+
+- **`iteration-tokens-used` documentation aligned with reality.**
+  `action.yml`, `README.md`, and
+  `skills/ai-diff-reviewer/setup/reference.md` all claimed the
+  output was "Total input + output tokens consumed by the LLM in
+  this run", but `RunTelemetry.tokens_used` is never populated from
+  provider usage metadata — successful IAR runs always emit `"0"`.
+  Consumers building cost dashboards on the output were being lied
+  to. Updated all three surfaces to describe it as a stable
+  placeholder that emits `"0"` today and cross-reference
+  `docs/ITERATION_AWARENESS.md § 13.2` for the follow-up plan.
+- **`.github/workflows/self-review.yml`** smoke-test comment for
+  the USER_FORCED_RESET verification procedure still described a
+  "four-condition" guard and (a)–(d). Round-14 added the fifth
+  guard (`label_fetch_ok`); comment now lists all five with
+  their round-14 semantics, plus a new NO-OP case for the
+  transient-fetch-failure deferral.
+- **`docs/ITERATION_AWARENESS.md` § 4.2** trailing paragraph
+  attributed blocked-run prevention to "the fourth condition" —
+  correct in the pre-round-14 numbering (when
+  `reviewed_label_applied` was condition 4), but stale after
+  round-14 inserted `label_fetch_ok` as condition 4 and pushed
+  `reviewed_label_applied` back to condition 3. Reworded to name
+  BOTH load-bearing safety guards by condition number and
+  purpose, so a future reader can't miss either.
+- `docs/ITERATION_AWARENESS.md § 13.2` (per-generation telemetry
+  known-limitation) expanded to describe the coordinated two-piece
+  follow-up: capture per-provider usage metadata AT the LLM-response
+  boundary (currently missing) + accumulate telemetry across a
+  generation's rounds (currently mis-attributes on `advance_
+  generation`). Both matter most when cost dashboards get built
+  on the outputs.
+
+### Fixed (round-14 self-review: label-fetch failure guard for USER_FORCED_RESET)
+
+Round-14 self-review **passed** (PR green, label stamped). One warning
+was a real security bug worth calling out on its own:
+
+- **`_fetch_pr_labels` now returns `(labels, ok)`.** Previous shape
+  `list[str]` collapsed two distinct outcomes into the same value:
+  "the API said the PR has no labels" and "the API failed, we don't
+  know". The escape-label check on the `SAME_GENERATION` path
+  could safely coalesce them ("no escape label" is a REVERSIBLE
+  "don't take the escape hatch on THIS run only" decision). But
+  the USER_FORCED_RESET branch is IRREVERSIBLE — it wipes
+  fingerprint memory + resets the generation counter — and the
+  same `[]` was silently being read as "reviewed label absent"
+  every time a GitHub 5xx returned an empty list from the labels
+  fetch. Under the shipped default `block-on-critical` strictness,
+  a transient outage would silently wipe a converged PR's dedup
+  state on the next run — the exact "infinite loop" symptom IAR
+  is designed to prevent, but triggered by API instability
+  instead of convergence pressure.
+- **`run_iar_pre_llm` USER_FORCED_RESET check gated on
+  `label_fetch_ok`** — the fifth condition alongside the round-7
+  `reviewed_label_applied` guard. Both distinguish "we know the
+  developer removed the label" from a superficially-identical
+  false-positive; both are non-blocking (a transient failure
+  simply delays the reset gesture until the next successful fetch).
+- Docstrings for `GenerationTransition.USER_FORCED_RESET`,
+  `run_iar_pre_llm`, and `_fetch_pr_labels` all rewritten to
+  describe the "know vs don't-know" distinction and why the ok
+  bit is load-bearing.
+- `docs/ITERATION_AWARENESS.md` § 4.2, § 8.5, and § 15 (changelog)
+  updated to describe the five-condition guard (was four in
+  round-7) and cross-reference the `label_fetch_ok` bit.
+- 3 new regression tests: `FetchPrLabelsTests.
+  test_pr_with_no_labels_returns_empty_and_ok` (locks the
+  operational-empty case), `test_api_failure_returns_empty_and_not_ok`
+  (locks the failure case). `RunIarPreLlmTests.
+  test_user_forced_reset_no_op_when_label_fetch_failed` (locks
+  the new guard) and `test_user_forced_reset_fires_only_when_
+  fetch_ok_and_label_absent` (contrast test proving `ok` is the
+  ONLY difference between the two branches). All 8 pre-existing
+  `_fetch_pr_labels` patch sites updated from `return_value=[...]`
+  to `return_value=([...], True)`.
+- CHANGELOG stale test count `468` bumped to `480` (round-14 adds
+  3 tests; the running counter continues to climb).
+
+### Fixed (round-13 self-review: skip-label collision guard + test coverage)
+
+Round-13 self-review **passed** (PR green, label stamped). 3 warnings +
+2 infos, all real but small — the load-bearing one is the new
+skip-label collision guard:
+
+- **`detect_skip_label_collisions()` — new misconfiguration guard.**
+  `skip-review-label` is an emergency-bypass hatch (silently skips
+  the review). If a user accidentally sets it to the same value as
+  `label-gate`, `applied-label`, or `iteration-escape-label`, every
+  normal trigger silently becomes a skip — the exact opposite of
+  what the developer typed. The three failure modes were previously
+  undocumented and undetected. New pure helper detects all three
+  collisions, `main()` aborts at startup with an exit-1
+  `CONFIGURATION ERROR:` log naming the colliding label. Comparison
+  is case-insensitive (matches `_labels_contain_ci` at the check
+  sites) and whitespace-trimmed. 9 new regression tests in
+  `SkipLabelCollisionGuardTests`.
+- **Hoisted `bot_login` lookup got a proper `# noqa: BLE001` WHY
+  comment** — the round-11 hoist landed with the noqa but no
+  explanation of the "best-effort GH API call" pattern documented
+  in `docs/DEVELOPMENT_GUIDELINES.md` / `.review/extension.md`.
+- **CHANGELOG test count updated** from stale `456` to current
+  `477` (rising counter is now called out as intentional so
+  future readers see it climb with each self-review round rather
+  than assume it's drift).
+- **`stable_sort_by_severity` comment drift** in
+  `apply_first_pass_exhaustive_policy` — the helper was renamed
+  to `_sort_findings_criticals_first` in round-3; the
+  round-3-adjacent comment still referenced the old name.
+- **`action.yml` + `README.md` + `skills/ai-diff-reviewer/setup/
+  reference.md`** updated to document the new misconfig-guard
+  behaviour so consumers know why the reviewer would exit-1
+  loudly on a colliding label config.
+
+### Fixed (round-12 self-review: doc-drift sweep + magic-number promotion)
+
+Round-12 self-review **passed the strictness gate** (highest severity =
+warning, `self-reviewed:cursor` label stamped, PR green) and flagged
+4 warnings + 1 info — all doc/polish, no runtime bugs:
+
+- **Two more case-sensitive-label doc drift sites** (round-11 fixed
+  the `IAR — User-controllable inputs` section but the follow-on
+  reviewer caught two other spots): `docs/SECURITY.md § API surface
+  delta` for skip-review-label still said `skip_review_label in
+  current_labels`, and `compute_reviewed_label_applied`'s docstring
+  (signal 2) said `applied_label in current_labels`. Both updated
+  to `_labels_contain_ci` and cross-referenced with `label-gate`,
+  escape-label, and skip-review-label as the four consumers of
+  the same helper.
+- **`examples/iteration-aware.yml` comment** claimed "every input
+  below matches the shipped default" but `max-review-rounds: 5`
+  is non-default (default is `0 = unlimited`). Copy-paste
+  consumers who kept the value would silently be running under a
+  `round-capped: 5` semantics if they later switched policies.
+  Rewrote the comment to explicitly mark `max-review-rounds` as
+  `NON-DEFAULT (demo)` and split the DEFAULT vs demo inputs.
+- **`finding.body[:200]` magic number** in `finding_fingerprint`
+  promoted to module-level `IAR_FINGERPRINT_BODY_PREFIX_CHARS: int
+  = 200` next to `IAR_CONTEXT_HASH_RADIUS`. Removed the "known
+  limitation" § 13.2 entry (no longer a limitation); § 13.3/13.4
+  renumbered. Doc code-block in ITERATION_AWARENESS.md § 5.2 also
+  updated to reference the constant.
+- **File-size overflow note.** `scripts/reviewer.py` grew past the
+  ~4500-line soft ceiling in `docs/STANDARDS.md` due to the IAR
+  landing. Added a new § 13.4 "Known limitation" documenting the
+  overflow, the two considered refactor paths (submodule vs
+  orchestrator-step split), and the deferral rationale — both
+  paths trade the file-size ceiling against the load-bearing
+  "single-file stdlib runtime" invariant, so the refactor
+  deserves its own PR to be reviewed on its own.
+
+### Fixed (round-11 self-review: bot_login hoist + doc alignment)
+
+Round-11 self-review **passed the strictness gate** (highest severity =
+warning, `self-reviewed:cursor` label stamped, PR green) but flagged 3
+warnings around defensive edge cases and doc drift:
+
+- **`bot_login` was scoped inside `if collapse_previous:`,** so
+  consumers with `collapse-previous: false` (or any run where
+  `gh_get_authenticated_login` raised) hit `UnboundLocalError` at
+  the `run_iar_pre_llm(bot_login=bot_login, …)` call site — falling
+  through the IAR try/except into baseline mode with the round-10
+  author filter effectively disabled. Hoisted the resolution to
+  ALWAYS run (with a `""` fallback that mirrors the pre-round-10
+  behaviour on failure). Both consumers — `gh_collapse_previous_reviews`
+  and the IAR author filter — now see the same resolved identity
+  regardless of `collapse_previous` setting.
+- **`docs/SECURITY.md § IAR — User-controllable inputs`** still
+  described escape-label matching as `in pr_labels` (case-sensitive
+  membership) after round-8's `_labels_contain_ci` fix. Updated to
+  reflect the case-insensitive helper and explicitly call out the
+  three consumers (escape label, skip-review-label, and
+  reviewed-label reset) that share the normalisation.
+- **`IterationState.reviewed_label_applied` field comment** described
+  the pre-round-7 semantics ("True only when the review posted AND
+  was NOT blocked"). Round-7 replaced that with the three-signal OR
+  in `compute_reviewed_label_applied` — updated the comment to
+  match, listing all three signals and the load-bearing rationale
+  ("otherwise a blocked follow-up would silently clear the arming
+  bit").
+
+### Fixed (round-10 self-review: marker author filter + parser trust boundary)
+
+- **Marker fetch now filters by comment author (SECURITY, critical).**
+  `_fetch_latest_marker_body` accepts an optional `bot_login: str`
+  and drops every marker whose `author.login` doesn't match — using
+  the same `[bot]` / no-suffix normalisation
+  `gh_collapse_previous_reviews` uses. Without this filter, any PR
+  participant who could comment on the PR could forge a marker
+  carrying fabricated `open_fingerprints_this_gen` values, and —
+  under the shipped default `collapse-previous: true` — the real
+  bot marker is minimized while the attacker's fresh forgery is
+  visible, winning tier 1 and silencing genuine non-critical
+  findings on the next run. (The critical-always-surfaces rail
+  would still surface `critical` findings, but warnings and infos
+  could be suppressed.) `main()` resolves `bot_login` via
+  `gh_get_authenticated_login` (as it already does for
+  `gh_collapse_previous_reviews`) and threads it through
+  `run_iar_pre_llm` → `read_prior_iteration_state` →
+  `_fetch_latest_marker_body`. Regression tests:
+  `test_author_filter_rejects_non_bot_forged_marker`,
+  `test_author_filter_normalizes_bot_suffix`,
+  `test_author_filter_disabled_when_no_bot_login`.
+- **`reviewed_label_applied` now only accepts JSON `true`/`false`
+  (or `0`/`1`).** Naive `bool()` on a JSON string is a foot-gun
+  (`bool("false") is True`), so a poisoned marker with
+  `"reviewed_label_applied": "false"` would spuriously arm
+  `USER_FORCED_RESET`. Non-boolean values fall back to `False`
+  (safe default — reset stays disarmed). Regression tests:
+  `test_reviewed_label_applied_rejects_string_false`,
+  `test_reviewed_label_applied_accepts_json_true`.
+- **Fingerprint lists are now element-coerced at parse time.**
+  Without this, a poisoned marker with
+  `"resolved_fingerprints": [{"x": 1}]` would parse fine but crash
+  `dedupe_findings_against_prior`'s `set(...)` with
+  `TypeError: unhashable type: 'dict'`. Since IAR runs on every
+  round, this would trigger the `try/except` fallback on every
+  subsequent run — a sticky DoS on convergence until the poisoned
+  marker aged out of the fetch window. Non-string elements are
+  now dropped silently at parse time (over-review is the safe
+  direction). Same coercion applied to `history` (list of dicts
+  only; scalars would blow up the `history[-1]` mutation in
+  `run_iar_post_llm`). Regression tests:
+  `test_fingerprint_list_drops_non_string_elements`,
+  `test_history_drops_non_dict_elements`.
+- **`docs/SECURITY.md § IAR — Marker-embedded state block`
+  restructured** to describe both controls (source authenticity
+  via author filter + field-level trust boundary in parser) with
+  concrete failure modes for each. Round-10 F4 caught the drift
+  before the code fix landed — updated in the same commit.
+- **`docs/ITERATION_AWARENESS.md § 12` schema example** now
+  includes `head_sha` and `reviewed_label_applied` fields so
+  the copyable JSON matches what the runtime actually embeds
+  via `asdict(IterationState)`.
+
+### Fixed (round-9 self-review: multi-provider IAR state isolation + enum docstring)
+
+- **`_fetch_latest_marker_body` / `read_prior_iteration_state` now
+  optionally filter marker chains by `provider_id`.** Multi-provider
+  setups — e.g. this repo's own self-review matrix if it grew a second
+  provider — were reading each other's IAR state, cross-poisoning
+  fingerprint memory, generation hashes, and round counters
+  (round-9 F1 critical). The filter matches markers carrying the
+  exact `<!-- ai-pr-reviewer-provider: <id> -->` tag; untagged legacy
+  markers (posted before the provider marker was introduced) match
+  every provider, preserving back-compat for upgrades. `main()` now
+  passes the current run's `provider_id` through the IAR pre-LLM
+  pipeline. Three new regression tests in
+  `tests/test_iar_state_layer.py` cover the three cases: isolated
+  reads, legacy-untagged back-compat, and empty-`provider_id`
+  filter-disabled semantics.
+- **`GenerationTransition.USER_FORCED_RESET` enum docstring** now
+  lists all four gating conditions (including the load-bearing
+  `reviewed_label_applied` guard) so the enum-level documentation
+  matches the runtime + `docs/ITERATION_AWARENESS.md § 8.5`.
+  Round-9 F2 caught the drift; contract itself was already correct.
+
+### Fixed (round-8 self-review: pagination revert + escape-label output + label case-insensitivity)
+
+Round-8 found the **regression I introduced in round-7 (F1 critical)**
+plus two more polish items and completed the round-7 escape-label
+observability fix I only did halfway:
+
+- **`_fetch_latest_marker_body` GraphQL `last: 250` was invalid — the
+  hard cap on `pullRequest.comments` is 100.** Reverted to
+  `last: 100`; server was raising `EXCESSIVE_PAGINATION` on every
+  call, so IAR classified every run as `first_review` and burned
+  round-1 exhaustive forever, which is exactly the symptom the
+  round-7 patch was supposed to prevent. Updated
+  `docs/ITERATION_AWARENESS.md § 7.3` to honestly document the
+  100-comment ceiling (still safe failure mode; the cursor-pagination
+  follow-up is unchanged).
+- **`iteration-policy-applied` action output was reading
+  `state.policy_applied` instead of `policy_result.policy_applied`
+  — the exact bug pattern round-7 fixed for the marker footer,
+  but only fixed one of the two consumers.** On an escape-label run
+  the output would report the preserved-state's prior policy
+  (e.g. `first-pass-exhaustive`) instead of the current run's
+  effective policy (`escape-label-forced-full-review`), silently
+  defeating workflow greps / dashboards keying on the output. Fixed
+  by rendering `policy_result.policy_applied`; new regression test
+  `test_iteration_policy_applied_reads_from_policy_result_not_state`.
+- **Case-sensitive label matching was inconsistent with `label-gate`
+  (which is case-insensitive).** `check_escape_label`, the skip-review
+  short-circuit, and USER_FORCED_RESET detection were all using exact
+  `in` membership, so a casing mismatch could either silently fail to
+  fire (escape / skip) or — worst case — falsely register "reviewed
+  label removed" and wipe fingerprint memory (USER_FORCED_RESET).
+  Fixed by introducing `_labels_contain_ci` (whitespace-trimmed,
+  case-insensitive membership) and routing all three sensitive
+  comparisons through it. `compute_reviewed_label_applied` also uses
+  the helper for the "label currently on PR" signal.
+- **`action.yml` / README / `setup/reference.md` /
+  `docs/ITERATION_AWARENESS.md § 3.2` `iteration-policy-applied`
+  descriptions all claimed the safety-net override string was
+  `first-pass-exhaustive`.** The runtime actually emits
+  `safety-net-forced-first-pass-exhaustive` (via
+  `IAR_POLICY_SAFETY_NET_FORCED`), so operators grepping for the
+  short name miss every safety-net firing. Aligned all four surfaces
+  with the shipping string and added a "grep this to audit" note.
+
+### Fixed (round-7 self-review: escape-label footer bug + observability polish)
+
+Round-7 caught a **real runtime bug** on the escape-label observability
+path plus 3 doc-drift stragglers and 1 comment miscalibration:
+
+- **Escape-label marker footer bug (runtime).**
+  `_render_iar_marker_annotation` was rendering `state.policy_applied`,
+  but on an escape-label run `run_iar_post_llm` returns the *prior*
+  state unchanged (that is the contract — no mutation) while the
+  current run's effective policy lives in `policy_result.policy_applied`
+  (set to `escape-label-forced-full-review` by `dispatch_policy`).
+  The footer therefore showed the PREVIOUS policy (e.g.
+  `first-pass-exhaustive`), silently defeating the audit greps
+  documented in `docs/ITERATION_AWARENESS.md § 8.5` (operators
+  greping for `policy=\`escape-label-forced-` would find zero
+  matches even when the escape label was used every single review).
+  Fixed by rendering `policy_result.policy_applied` — this also
+  keeps the safety-net override (`safety-net-forced-…`) visible
+  because that override is also set on `policy_result`, not on the
+  preserved-state. New regression test
+  `test_renders_policy_result_not_state_policy` locks the invariant.
+- **`docs/PERFORMANCE.md` cost-telemetry table** — round-6 narrowed
+  the `iteration-cost-vs-baseline-estimate` contract to `"0%"` /
+  `"+N%"` across four surfaces but missed this one, which still
+  listed `-5%` as an example. Fixed; added a "never gate CI on
+  `== '-N%'`" warning matching the other four surfaces.
+- **`_estimate_cost_vs_baseline` docstring** — still advertised
+  `"-10%"` as a typical return value. Rewrote to match the shipping
+  contract (`"0%"` / `"+N%"`), pointed at § 13.4 for the follow-up
+  extension, and clarified that `silenced_count` / `surfaced_count`
+  parameters are accepted-but-not-yet-consumed (stable signature for
+  the future silence-savings model).
+- **Marker-fetch pagination ceiling** — `_fetch_latest_marker_body`
+  was requesting `comments(last: 100)`. On very long-lived PRs where
+  100+ human/bot comments accumulate after the last state-bearing
+  marker was minimized, that marker would fall out of the window and
+  IAR would re-classify the run as `first_review` and re-burn round-1
+  exhaustive. Raised the window to `last: 250` (the practical
+  single-page ceiling for `pullRequest.comments` on the v4 GraphQL
+  endpoint) and documented the ceiling + safe failure mode
+  (over-review, never under-surface) + the follow-up cursor
+  pagination path in `docs/ITERATION_AWARENESS.md § 7.3`.
+- **Comment miscalibration** — `IAR_EXHAUSTIVE_PROMPT_ADDENDUM`
+  comment claimed `≈40 tokens`. The actual addendum is ~70 words
+  (~90-150 tokens) and `docs/PROMPTS.md` / `docs/PERFORMANCE.md`
+  already budget it at ~150. Aligned the comment.
+
+### Fixed (round-6 self-review doc + telemetry-contract sweep)
+
+Round-6 self-review flagged 3 doc warnings + 2 comment infos. Runtime
+was again signed off as merge-ready (*"Runtime invariants look correct
+and are locked by 456 passing tests. Remaining issues are operator-
+facing doc/telemetry drift."*). All 5 items fixed:
+
+- **`docs/ITERATION_AWARENESS.md § 4.5`** — removed the residual
+  `(safety_net_new_lines_pct)` reference in the transition-slot
+  audit paragraph (missed by the round-5 sweep, which only fixed
+  § 7.2 / § 10.2). The paragraph now correctly lists the five
+  natural transition values and points policy-override audits at
+  `policy=\`safety-net-forced-` / `policy=\`escape-label-forced-`.
+- **`docs/ITERATION_AWARENESS.md § 8.5`** — the "how the two are
+  distinguished" paragraph claimed escape shows as `(escape_label)`
+  in the transition slot. It doesn't — `dispatch_policy` renames
+  the `policy_applied` slot to `escape-label-forced-full-review`
+  and leaves the natural transition untouched. Rewrote to describe
+  the actual footer shape for both gestures and gave programmatic
+  audit greps.
+- **`scripts/reviewer.py:6051`** — replaced the stale "When IAR is
+  enabled" comment with the correct "on round 1 of a new generation
+  under `first-pass-exhaustive` (or when the safety net fires)"
+  wording. IAR is unconditional now; the effective-cap raise fires
+  under specific policy conditions, not an on/off switch.
+- **`docs/ITERATION_AWARENESS.md § 2`** — the safety-contract text
+  claimed `main()` wraps IAR in `try/except BaseException`, but both
+  call sites use `except Exception`. `Exception` is the correct
+  choice (avoids swallowing `SystemExit` / `KeyboardInterrupt`);
+  updated the spec to match the code and explained why.
+- **Cost-vs-baseline heuristic contract narrowed to what
+  `_estimate_cost_vs_baseline` actually returns.** The function
+  today only combines cap expansion + a flat `+5%` addendum flag —
+  it can emit `"0%"` or `"+N%"` but never `"-N%"` / `"unknown"`.
+  The four documentation surfaces (`action.yml`, `README.md`,
+  `docs/ITERATION_AWARENESS.md § 3.2 / § 9.5`,
+  `skills/ai-diff-reviewer/setup/reference.md`) were advertising
+  the fuller `-30%` / `"unknown"` values from the original spec.
+  Rewrote each to describe only the shipping return values and
+  added an explicit warning that consumers MUST NOT gate CI on
+  `iteration-cost-vs-baseline-estimate == '-30%'` (the condition
+  will never fire). New `docs/ITERATION_AWARENESS.md § 13.4`
+  catalogues this as a known limitation with the follow-up work
+  needed to restore the fuller heuristic.
+
+### Fixed (round-5 self-review doc-drift sweep)
+
+Round-5 self-review found 5 doc/example drift items and 1 already-tracked
+info. Runtime was independently signed off as merge-ready by the reviewer
+(*"Runtime invariants look correct and are well locked by tests (456 passing).
+A few documentation mismatches will mislead operators auditing markers or
+copying the 'quality-sensitive' profile."*). All five drift items fixed:
+
+- **`docs/ITERATION_AWARENESS.md § 8.2` "delete the marker to reset"
+  advice was false under shipped defaults.** With
+  `collapse-previous: true` (the default), `_fetch_latest_marker_body`'s
+  tier-2 fallback (§ 7.3) reads the latest **minimized** marker that
+  still carries IAR state, so deleting the visible marker leaves prior
+  state accessible and the next run continues the generation instead
+  of becoming `first_review`. Rewrote the paragraph to point at the
+  real reset gesture (§ 8.5 reviewed-label removal), and noted that a
+  delete-based reset would require removing **every** marker in the
+  conversation with `<!-- ai-pr-reviewer-iteration-state`.
+- **`docs/ITERATION_AWARENESS.md § 7.2` safety-net marker example
+  invented a `(safety_net_new_lines_pct)` transition token that the
+  runtime never emits.** The runtime prefixes the `policy_applied`
+  slot with `safety-net-forced-` and keeps the `transition` value at
+  the natural `new_commits` / `rebased`. Rewrote the example to show
+  the actual output (`policy=`safety-net-forced-first-pass-exhaustive`
+  (new_commits)`) and added a "grep this to audit safety-net firings"
+  callout. Same drift fixed in § 10.2's walkthrough table.
+- **`docs/ITERATION_AWARENESS.md § 8.1` + § 10.3 escape-label examples
+  used the same aspirational H3 shape** (`### AI review for abc123 —
+  done · escape-label forced full review (state preserved) · ...`)
+  that the runtime never emits. Rewrote both to the shipping shape
+  (short H3 + italic footer with `policy=`escape-label-forced-full-review`).
+- **`docs/PERFORMANCE.md` "quality-sensitive" recommended profile was
+  factually wrong.** It combined `convergence-policy: round-capped`
+  with `exhaustive-first-pass-cap-multiplier: 5`, but `round-capped`
+  ignores the multiplier entirely (`action.yml`'s input description is
+  explicit: "Ignored by other policies"). Consumers copying this
+  block would have expected a 50-finding round-1 net and got baseline
+  10-cap iterative behaviour. Fixed to `first-pass-exhaustive` (the
+  only policy that amplifies round 1), and added a separate
+  "round-cap discipline" profile for consumers who genuinely want a
+  hard round cap without amplification. Explanatory blockquote now
+  makes the policy-vs-multiplier composition rule explicit.
+- **`docs/ARCHITECTURE.md § Iteration-Aware Review` + new
+  `docs/ITERATION_AWARENESS.md § 3.4`** now document the load-bearing
+  dependency on `tracking-comment: true`. If a consumer disables the
+  tracking comment (`tracking-comment: false`), `gh_update_issue_comment`
+  no-ops (`comment_id <= 0`) and IAR never persists a state block.
+  Every subsequent run then classifies as `first_review` and re-burns
+  round-1 exhaustive under the default policy — a silent convergence
+  killer. Both docs now call this out explicitly.
+- **`examples/README.md`** now lists the new `iteration-aware.yml`
+  in the contents table (repo convention + AGENTS.md Rule #7:
+  "Add a row to the table above in the same PR"). Description
+  points readers at the IAR spec for context.
+
+### Fixed (round-4 self-review sweep)
+
+Final polish pass driven by the self-review of the doc-sweep commit
+— five doc/comment stragglers + one real runtime attribution bug:
+
+- **`run_iar_post_llm` was backfilling the closed prior generation's
+  `history[-1]` entry with the CURRENT run's telemetry** on
+  `NEW_COMMITS` / `REBASED` transitions. But the current run is round
+  1 of the NEW generation, so its `tokens_used` + `wall_clock_ms`
+  belong to the new gen — attributing them backward misreported
+  per-generation cost history and (once token accounting lands)
+  would poison the cost-vs-baseline estimate. Fixed by removing the
+  backfill; the closed entry retains its `(0, 0)` placeholders.
+  Proper per-generation accumulation is documented as follow-up in
+  `docs/ITERATION_AWARENESS.md § 13.3`. Regression locked by
+  `test_iar_observability.py::test_new_commits_does_not_backfill_current_run_telemetry_into_prior_gen`.
+- **`docs/ITERATION_AWARENESS.md § 4.5` marker-title example was
+  aspirational** — described an H3 like `Gen 2 round 1 (new commits
+  since …)` that the runtime never emits. `render_tracking_body_done`
+  ships a short `### AI review for <sha> — <status>` and IAR appends
+  a quiet italic footer via `_render_iar_marker_annotation`
+  (`gen 2, round 1, policy=... (transition)`). Rewrote the example
+  to match the shipping output and updated the audit grep pattern
+  from `Gen \d+ round \d+` → `gen \d+, round \d+`.
+- **`docs/ITERATION_AWARENESS.md § 7.2` safety-net formula was wrong.**
+  Said `git diff --stat` + `(added + removed + context)` denominator;
+  the runtime is `git diff --numstat` + `(added + removed)` on the
+  three-dot range (numstat doesn't emit context lines). Rewrote the
+  paragraph to match the code, including the two-vs-three-dot
+  reasoning for the `new_added` numerator vs `total` denominator.
+- **`compute_new_lines_pct` docstring said two-dot** for the `total`
+  diff even though the implementation now correctly uses three-dot.
+  Docstring updated to match, with an explicit two-dot-on-purpose
+  note for the `new_added` numerator (both head SHAs → no merge-base
+  semantics apply).
+- **`.github/workflows/self-review.yml` comment claimed
+  `max-review-rounds: 5` dogfooded the `round-capped` composition**
+  path, but under `convergence-policy: first-pass-exhaustive` (this
+  workflow's shipped-default policy), the runtime does not invoke
+  `apply_round_capped_policy` at all — `max-review-rounds` is a
+  no-op. Reset the input to the shipped default `0` and rewrote the
+  surrounding comment to note that a future matrix leg pinned to
+  `round-capped` would be where the value becomes meaningful.
+- **`.github/workflows/self-review.yml` USER_FORCED_RESET smoke-test
+  procedure omitted the four-condition guard.** Explicitly enumerated
+  all four checks the runtime performs (`applied-label` configured,
+  label absent, prior state exists, `prior_state.reviewed_label_applied
+  == True`) and documented the NO-OP CASES (blocked prior run,
+  first-ever review of the PR) so a developer running the smoke test
+  on a blocked PR does not misdiagnose the silent no-op as a
+  regression.
+
+### Fixed (doc-sweep after three-dot landing)
+
+Self-review of the three-dot generation-hash fix surfaced doc /
+docstring stragglers that still described the old two-dot behaviour,
+plus a copy-paste example missing `github-token`. All are content-only
+changes; no runtime code touched:
+
+- `examples/iteration-aware.yml` now passes `github-token: ${{ secrets.GITHUB_TOKEN }}`
+  and updates the `fetch-depth` comment to reference three-dot diffs.
+- `docs/ITERATION_AWARENESS.md § 12.1` schema cell for
+  `generation_range_hash` now shows three-dot and links back to § 4.3.
+  Same section's `reviewed_label_applied` cell rewritten to describe
+  the three-signal OR write logic (was still describing the pre-fix
+  intent-only bit).
+- `docs/SECURITY.md` IAR subprocess-boundary section now enumerates
+  three-dot for both `git diff` call sites (generation hash + safety
+  net `--numstat`), matching the runtime.
+- `scripts/reviewer.py` — `IterationState.generation_range_hash`
+  docstring rewritten to say "three-dot" explicitly and reference
+  § 4.3; stale "when IAR is off" wording in the chat-completions
+  tools-schema comment reframed for the unconditional runtime.
+- `tests/test_iar_state_layer.py` module docstring reframed for the
+  unconditional runtime (was still describing IAR as opt-in via a
+  "master switch").
+
 - **New "Security audit alignment" section in `.review/extension.md`.**
   Codifies the review rules that keep the two external security
   surfaces at 100% pass — (1) [skills.sh badges](https://www.skills.sh/dailybothq/ai-diff-reviewer/ai-diff-reviewer)

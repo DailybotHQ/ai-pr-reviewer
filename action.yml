@@ -82,6 +82,10 @@ inputs:
     description: 'If non-empty, this label is applied to the PR after a successful, non-blocked review (e.g. `pr-reviewed`). Empty = no label is applied.'
     required: false
     default: ''
+  skip-review-label:
+    description: 'Optional emergency-bypass label (e.g. `skip-ai-review`). When BOTH the workflow trigger fires AND this label is present on the PR, the reviewer short-circuits: no LLM call, no findings, no state mutation — the GitHub check reports success (exit 0) so the merge can proceed. A tracking comment is posted explaining WHY the review was skipped so the audit trail stays intact. Intended for hotfixes / rollbacks / trivially safe changes where an LLM review would burn tokens for no incremental value. SECURITY: anyone who can label a PR can bypass code review — combine with a CODEOWNERS/ruleset rule that restricts who can apply this label. MISCONFIG GUARD: the reviewer aborts loudly at startup if this label equals `label-gate`, `applied-label`, or `iteration-escape-label` (each collision would silently convert every normal review trigger into a skip). Empty (default) = feature disabled; opt-in.'
+    required: false
+    default: ''
 
   collapse-previous:
     description: 'On every new run, mark previous bot reviews/comments as `OUTDATED` via GraphQL `minimizeComment` so only the latest review is visually active.'
@@ -153,6 +157,26 @@ inputs:
     required: false
     default: ''
 
+  # ---------------- Iteration-Aware Review (IAR) — tunable knobs ----------------
+  # IAR runs on every review. The four inputs below shape the pipeline.
+  # See docs/ITERATION_AWARENESS.md.
+  convergence-policy:
+    description: 'Which IAR convergence policy to apply. Defaults to `first-pass-exhaustive`: exhaustive prompt + higher cap on round 1 of each generation, dedup on rounds 2+ — solves the "10 loops of trickled warnings" pain. Alternatives: `iterative` (dedup only, no cap boost; cost-neutral; recommended for push-heavy workflows), `round-capped` (dedup pre-cap, only critical severity surfaces post-cap; requires `max-review-rounds > 0`), `critical-gate` (strict cross-generation dedup — prior-resolved fingerprints stay silenced unless critical). Critical severity findings ALWAYS surface unconditionally under every policy — hardcoded safety rail.'
+    required: false
+    default: 'first-pass-exhaustive'
+  max-review-rounds:
+    description: 'Hard cap for the `round-capped` convergence policy. `0` (default) = unlimited (behaves like `iterative` for that policy). After N rounds, only critical severity findings surface — warnings and infos are silenced with a "cap reached" annotation. Ignored by other policies.'
+    required: false
+    default: '0'
+  exhaustive-first-pass-cap-multiplier:
+    description: 'Multiplier applied to `max-inline-comments` on round 1 of each generation when `convergence-policy` is `first-pass-exhaustive`. Default `3` means round 1 can post up to 3× the normal cap; rounds 2+ use the base cap. Set to `1` to disable the amplification while keeping the exhaustive prompt splicing. Ignored by other policies. See docs/ITERATION_AWARENESS.md § 6.2.'
+    required: false
+    default: '3'
+  iteration-escape-label:
+    description: 'Label name a human can apply to a PR to force a full review regardless of IAR state — dedup is skipped for that run only, persisted state is NOT mutated. Default `full-review-please`. When the label is removed, subsequent reviews resume normal IAR behavior. See docs/ITERATION_AWARENESS.md § 8.'
+    required: false
+    default: 'full-review-please'
+
 outputs:
   review-url:
     description: 'URL of the posted PR review (empty when the run was skipped).'
@@ -170,8 +194,28 @@ outputs:
     description: 'Whether the strictness gate decided to fail the check (`true`/`false`). When `true`, the action exits with code 2 so the GitHub check turns red.'
     value: ${{ steps.review.outputs.blocked }}
   skipped:
-    description: 'Whether the run was skipped by the label gate (`true`/`false`).'
+    description: 'Whether the run was skipped without invoking the LLM (`true`/`false`). Set to `true` when EITHER (a) the label gate suppressed the run (missing `label-gate` label, `author-association` filter, `trigger-mode: label-once` already reviewed this label toggle, etc.) OR (b) the configured `skip-review-label` was present on the PR at trigger time (the emergency-bypass short-circuit).'
     value: ${{ steps.review.outputs.skipped }}
+
+  # ---------------- Iteration-Aware Review (IAR) outputs ----------------
+  # Populated on every run. If the IAR pipeline crashes mid-flight
+  # (caught by main()'s try/except), all five outputs stay as empty
+  # strings so downstream steps reading them always see a defined value.
+  iteration-round:
+    description: 'IAR round number within the current generation (`1` on first review, resets when a new generation begins). Empty string if the IAR pipeline crashed before populating outputs.'
+    value: ${{ steps.review.outputs.iteration-round }}
+  iteration-generation:
+    description: 'IAR generation counter. Increments when new commits or a rebase are detected via the range hash. Empty string if the IAR pipeline crashed before populating outputs.'
+    value: ${{ steps.review.outputs.iteration-generation }}
+  iteration-policy-applied:
+    description: 'Which IAR policy actually fired this run. Usually matches `convergence-policy`, but the 30% new-lines safety net overrides it to `safety-net-forced-first-pass-exhaustive`, and the escape label overrides to `escape-label-forced-full-review`. Grep marker chains for `policy=\`safety-net-forced-` / `policy=\`escape-label-forced-` to audit either override. Empty string if the IAR pipeline crashed before populating outputs.'
+    value: ${{ steps.review.outputs.iteration-policy-applied }}
+  iteration-tokens-used:
+    description: 'Cost-telemetry counter. Always emits `"0"` today — the runtime does not yet capture per-provider usage metadata from LLM responses into `RunTelemetry.tokens_used`, so the output is a stable placeholder that consumers can safely surface without gating on it. See `docs/ITERATION_AWARENESS.md § 13.2` for the follow-up plan. Empty string ONLY when the IAR pipeline crashed before populating outputs.'
+    value: ${{ steps.review.outputs.iteration-tokens-used }}
+  iteration-cost-vs-baseline-estimate:
+    description: 'Coarse heuristic estimate of this run''s LLM-call cost vs a projected no-dedup baseline, derived from cap expansion (`effective_cap / base_cap`) plus a small addendum-overhead flag. Always non-negative: `"0%"` when no cap expansion fires, `"+N%"` when round 1 of first-pass-exhaustive or the safety net raises the cap. Silenced-finding savings are not yet modelled (see docs/ITERATION_AWARENESS.md § 9.5). Empty string if the IAR pipeline crashed before populating outputs.'
+    value: ${{ steps.review.outputs.iteration-cost-vs-baseline-estimate }}
 
 runs:
   using: 'composite'
@@ -269,6 +313,7 @@ runs:
         AIPRR_LABEL_GATE: ${{ inputs.label-gate }}
         AIPRR_TRIGGER_MODE: ${{ inputs.trigger-mode }}
         AIPRR_APPLIED_LABEL: ${{ inputs.applied-label }}
+        AIPRR_SKIP_REVIEW_LABEL: ${{ inputs.skip-review-label }}
         AIPRR_COLLAPSE_PREVIOUS: ${{ inputs.collapse-previous }}
         AIPRR_TRACKING_COMMENT: ${{ inputs.tracking-comment }}
         AIPRR_STRICTNESS: ${{ inputs.strictness }}
@@ -288,6 +333,13 @@ runs:
         AIPRR_CLAUDE_CODE_VERSION: ${{ inputs.claude-code-version }}
         AIPRR_CURSOR_VERSION: ${{ inputs.cursor-version }}
         AIPRR_CODEX_VERSION: ${{ inputs.codex-version }}
+
+        # Iteration-Aware Review (IAR). The four env vars below shape
+        # the pipeline. See docs/ITERATION_AWARENESS.md.
+        AIPRR_CONVERGENCE_POLICY: ${{ inputs.convergence-policy }}
+        AIPRR_MAX_REVIEW_ROUNDS: ${{ inputs.max-review-rounds }}
+        AIPRR_EXHAUSTIVE_FIRST_PASS_CAP_MULTIPLIER: ${{ inputs.exhaustive-first-pass-cap-multiplier }}
+        AIPRR_ITERATION_ESCAPE_LABEL: ${{ inputs.iteration-escape-label }}
 
         # Repo / PR context — pulled from the consumer's `pull_request` event.
         AIPRR_REPO: ${{ github.repository }}

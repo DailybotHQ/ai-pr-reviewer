@@ -1,0 +1,77 @@
+# Iteration-Aware Review (IAR) — explicit configuration example.
+#
+# IAR runs on every review with `convergence-policy: first-pass-exhaustive`
+# as the default. Consumers who don't set any of the four `iteration-*`
+# / `convergence-*` inputs get exactly the config shown below automatically —
+# you do NOT need to copy this file. It's kept here as a reference for
+# consumers who want to tune the knobs (e.g. lower the cap multiplier,
+# add a round cap, or rename the escape label) or for documentation.
+#
+# Solves the multi-round "infinite loop" symptom (new warnings on every
+# re-run) by running an extended first pass, then deduplicating against
+# prior findings so subsequent rounds surface only deltas. IAR adds
+# ~500-800 ms of ambient overhead + a one-time cap-expanded first pass
+# per generation (see docs/PERFORMANCE.md § Iteration-Aware Review for
+# the full cost matrix).
+#
+# See docs/ITERATION_AWARENESS.md for the authoritative spec.
+
+name: AI Diff Review (with IAR)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history is required so IAR's generation-tracking can
+          # `git diff base...head` correctly across force-pushes and rebases.
+          fetch-depth: 0
+
+      - id: review
+        uses: DailybotHQ/ai-diff-reviewer@v1
+        with:
+          provider: anthropic
+          api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          strictness: block-on-critical
+
+          # Iteration-Aware Review tuning knobs — inputs marked DEFAULT
+          # can be omitted entirely and you'll get the same behavior;
+          # `max-review-rounds` is a NON-default demonstration of the
+          # input shape. Kept explicit here as documentation.
+          convergence-policy: first-pass-exhaustive        # DEFAULT
+          # Round 1 of a new generation gets 3x the baseline cap so the
+          # LLM can surface a comprehensive initial pass.
+          exhaustive-first-pass-cap-multiplier: 3          # DEFAULT
+          # NOT the default (default is 0 = unlimited). Only used by
+          # the `round-capped` policy — harmless under
+          # `first-pass-exhaustive` above. Shown here to illustrate
+          # the input shape; delete it if you're not switching to
+          # `round-capped`.
+          max-review-rounds: 5                             # NON-DEFAULT (demo)
+          # Add this label to any PR to force a full (un-deduped) review
+          # for that specific run. Persisted state is preserved so the
+          # next normal run resumes the dedup timeline.
+          iteration-escape-label: full-review-please       # DEFAULT
+
+      # OPTIONAL — surface IAR telemetry as workflow annotations for
+      # dashboards. Non-blocking; safe to remove.
+      - name: IAR cost telemetry
+        if: always() && steps.review.outputs.iteration-round != ''
+        run: |
+          echo "::notice title=IAR::gen=${{ steps.review.outputs.iteration-generation }} \
+          round=${{ steps.review.outputs.iteration-round }} \
+          policy=${{ steps.review.outputs.iteration-policy-applied }} \
+          cost=${{ steps.review.outputs.iteration-cost-vs-baseline-estimate }}"

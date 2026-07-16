@@ -316,6 +316,168 @@ extend the security posture to the whole surface consumers touch.
   knows about; a workflow it doesn't see silently rots and its
   third-party actions stay unpatched.
 
+## Iteration-Aware Review (IAR) conventions
+
+The IAR subsystem runs on every review and is load-bearing: every
+consumer inherits the exact behavior contracts documented in
+[`docs/ITERATION_AWARENESS.md`](../docs/ITERATION_AWARENESS.md). The
+pipeline is wrapped in `try/except` at each `main()` touchpoint so an
+IAR failure degrades to the baseline review path — the safety contract
+is locked by `tests/test_iar_failure_fallback.py`. These rules protect
+both contracts across future PRs.
+
+- **Always `critical`:** removal or rename of any of the 4 IAR inputs
+  (`convergence-policy`, `max-review-rounds`,
+  `exhaustive-first-pass-cap-multiplier`, `iteration-escape-label`) or
+  any of the 5 IAR outputs (`iteration-round`, `iteration-generation`,
+  `iteration-policy-applied`, `iteration-tokens-used`,
+  `iteration-cost-vs-baseline-estimate`). Public contract — same rule
+  as Rule #4 applies (v2.0.0 required).
+- **Always `critical`:** moving, weakening, or making configurable the
+  hardcoded critical-always-surfaces branch in
+  `dedupe_findings_against_prior()` (`scripts/reviewer.py`,
+  docs/ITERATION_AWARENESS.md § 7.1). Every convergence policy funnels
+  through this function precisely so the rail cannot be bypassed. A
+  code review that lets a `severity == critical` finding be silenced
+  by any policy or configuration is a correctness bug, not a
+  refactor.
+- **Always `critical`:** raising the default of `max_tokens` or
+  `MAX_TURNS` under the banner of "IAR tuning". IAR's only cap knob
+  is `max-inline-comments` and only on round 1 of a new generation.
+  Per AGENTS.md DON'T #9, other budget defaults require a documented
+  cost-per-review impact analysis first.
+- **Always `warning`:** removing or weakening the `try/except` safety
+  wrap around either `run_iar_pre_llm()` or `run_iar_post_llm()` in
+  `main()`. The regression suite `tests/test_iar_failure_fallback.py`
+  guards the invariant that an IAR failure MUST NOT crash the run;
+  any change that regresses it must be explicitly justified in the
+  PR body.
+- **Always `warning`:** a new IAR helper that reads or writes network
+  I/O outside `try/except` at the `main()` call site. IAR must NEVER
+  crash the reviewer — every IAR failure path in `run_iar_pre_llm` /
+  `run_iar_post_llm` falls back to the baseline review with empty
+  IAR outputs.
+- **Always `warning`:** a change to `IterationState` schema fields
+  without a corresponding backward-compat parse test in
+  `tests/test_iar_state_layer.py`. Older markers written by prior
+  IAR versions must continue to parse — new fields default to
+  `""` / `[]` / `0` as appropriate. Version-bump the
+  `IAR_STATE_SCHEMA_VERSION` constant only for genuinely
+  breaking changes (never in a `v1.x` release).
+- **Always `warning`:** adding a new branch on `GenerationTransition`
+  values (e.g. `if transition == GenerationTransition.NEW_COMMITS`)
+  that does NOT explicitly consider `USER_FORCED_RESET`. The reset
+  override sets `prior_state = None` AND changes the transition value,
+  so most downstream code paths handle it correctly via the
+  `prior_state is None` short-circuit — but any new code that dispatches
+  on the transition enum without acknowledging `USER_FORCED_RESET`
+  risks silently ignoring the reset semantics. Add a comment showing
+  the reviewer considered it, or expand the branch to include it.
+- **Always `critical`:** any change to the USER_FORCED_RESET detection
+  in `run_iar_pre_llm` that removes or weakens EITHER of the two
+  load-bearing safety guards: (i)
+  `prior_state.reviewed_label_applied` — prevents any blocked-review
+  re-trigger (which naturally has the reviewed label absent, because
+  blocked runs never stamp it) from being misclassified as a
+  deliberate reset — OR (ii) `label_fetch_ok` — prevents a transient
+  GitHub 5xx returning an empty label list from being misread as
+  "label absent" and silently wiping fingerprint memory on every
+  outage (round-14 F1). All FIVE conditions — configured label,
+  prior state, prior state records the label was stamped, label
+  fetch succeeded, and label absent from the returned list — must
+  remain conjoined.
+- **Always `critical`:** any change to `_fetch_latest_marker_body` that
+  removes the tier-2 fallback (minimized markers with an IAR state
+  block). Without tier-2, `collapse-previous: true` (the shipped
+  default) causes IAR to lose state on every run and treat every
+  review as `first_review`. Any refactor MUST preserve the three-tier
+  priority — see `docs/ITERATION_AWARENESS.md § 7.3`.
+- **Always `warning`:** any change to `dispatch_policy` that runs the
+  escape-label short-circuit when `transition == USER_FORCED_RESET`.
+  Reset is the stronger of the two exhaustive-triggering gestures
+  (DISCARDS state vs. state-preserved for escape); when both are
+  active the user's intent is "start clean" and the escape short-circuit
+  MUST be skipped so the configured policy's exhaustive first-pass path
+  fires. See `docs/ITERATION_AWARENESS.md § 8.5` precedence rules.
+- **Always `critical`:** setting `IterationState.reviewed_label_applied`
+  from anything other than the OBSERVED outcome of `gh_apply_label`
+  (i.e., a local `label_stamped: bool` set to `True` only inside the
+  try-block after the API call succeeds, `False` otherwise), OR
+  omitting the assignment entirely, OR embedding the state block
+  BEFORE the label-stamp attempt. The bit is the sole signal the
+  next run has to distinguish "developer removed the reviewed label
+  deliberately" from "reviewer never stamped it because the run was
+  blocked or the stamp failed" — anything else races the label-stamp
+  outcome against the state write and can silently wipe dedup memory
+  on a network hiccup.
+- **Always `critical`:** any change that truncates a `list[Finding]`
+  against `effective_max_inline_comments` (or any cap) via a naive
+  `findings[:cap]` without first sorting criticals-to-the-front via
+  `_sort_findings_criticals_first`. The critical-always-surfaces
+  safety rail (docs § 7.1) is hardcoded and non-configurable — a
+  cap-drop that sheds a critical silently bypasses it. Both round-1
+  exhaustive AND the agent-runner cap-enforce path currently obey
+  this invariant; any new truncation site must too.
+- **Always `warning`:** any change to `compute_generation_range_hash`
+  or `compute_new_lines_pct` that swaps their three-dot diff spec
+  (`base_sha...head_sha`) back to two-dot (`base_sha..head_sha`).
+  Three-dot pins the comparison to the merge base — matching the
+  PR-visible diff `fetch_pr_context` sends to the LLM. Two-dot
+  recomputes the hash / percentage whenever `origin/<base>` moves
+  upstream even though the PR content is unchanged, producing false
+  `NEW_COMMITS` / `REBASED` transitions and inflating the
+  safety-net denominator. See docs/ITERATION_AWARENESS.md § 4.3.
+- **Always `warning`:** any refactor of `compute_reviewed_label_applied`
+  that reduces the three-signal OR (`label_stamped OR
+  label_currently_on_pr OR prior_bit`) to fewer inputs — or that
+  changes the write site in `main()` to bypass this helper and set
+  `iar_state_final.reviewed_label_applied` from a subset of the
+  signals. Each signal is load-bearing per docs § 8.5: dropping
+  `label_currently_on_pr` breaks the blocked-follow-up preservation
+  case; dropping `prior_bit` breaks the escape-label path; dropping
+  `label_stamped` breaks first-review arming. The helper is the
+  single source of truth — the write site must call it.
+- **Always `info`:** using the term "silence" for a finding IAR
+  chose not to submit. The correct term is "dedup" or "silence"
+  depending on the reason (dedup = the finding matches a prior
+  fingerprint; silence = the policy chose to hide it). The
+  `SilencedFinding.reason` field carries this distinction.
+
+## Skip-review-label conventions
+
+The `skip-review-label` input is an opt-in emergency-bypass hatch — when
+BOTH the workflow trigger fires AND the configured label is on the PR,
+`main()` short-circuits to success without invoking the LLM. It is a
+security-sensitive surface (anyone who can label a PR can bypass code
+review) so the rules below protect its invariants.
+
+- **Always `critical`:** removal or rename of the `skip-review-label`
+  input from `action.yml`, or of `AIPRR_SKIP_REVIEW_LABEL` from the
+  env-var wire-up. Public contract — same rule as Rule #4 applies
+  (v2.0.0 required).
+- **Always `critical`:** any change that lets the skip path stamp the
+  `applied-label` (the "reviewed" label). Applying it would
+  misrepresent an unreviewed PR as reviewed and lie to every
+  dashboard, ruleset, and reviewer downstream. The rule is unconditional.
+- **Always `warning`:** any change that lets the skip path read or
+  mutate IAR persisted state (marker parse, `read_prior_iteration_state`,
+  `write_iteration_state`, `advance_generation`, etc.). The skip must
+  leave IAR exactly as it was — the next non-skip run resumes from
+  where the pipeline last left off.
+- **Always `warning`:** any change that moves the skip short-circuit
+  AFTER a network-side-effecting step (collapse-previous, tracking
+  spinner post, PR context fetch, LLM invocation). The skip is meant
+  to be minimal — anything the reviewer did BEFORE the short-circuit
+  fires becomes a broken invariant.
+- **Always `warning`:** removing the `REVIEW_MARKER` (or the
+  per-provider marker) from `render_tracking_body_skipped_by_label`.
+  Both are needed for `collapse-previous` on the next real run to
+  recognise the skip comment as a prior bot artefact and minimise it.
+- **Always `info`:** using the word "blocked" or "failed" in
+  documentation for what a skip does. The correct terms are
+  "skipped", "bypassed", or "short-circuited" — the skip is a success
+  path from GitHub's perspective, not a failure or block.
+
 ## PR hygiene
 
 - PR title in Conventional Commits format (matches the squash-merge

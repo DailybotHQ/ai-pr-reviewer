@@ -1,0 +1,59 @@
+# Emergency-bypass label — opt-in escape from the LLM review
+#
+# When BOTH the workflow trigger fires AND the `skip-ai-review` label is on
+# the PR, the reviewer short-circuits: no LLM call, no findings, no state
+# mutation, the GitHub check reports success (exit 0) so the merge can
+# proceed. A tracking comment (⏭️ skipped) is posted for audit trail.
+#
+# When to use this pattern:
+#   - Hotfix — a one-line production fix the on-call engineer already
+#     reviewed manually; you don't want to wait for the LLM.
+#   - Rollback — reverting a previous merge; the diff is a mechanical
+#     `git revert` and an LLM review would produce noise.
+#   - Trivially-safe commit — version bump, dependency lockfile
+#     regeneration, changelog housekeeping.
+#
+# When NOT to use this pattern:
+#   - "The LLM keeps flagging things I disagree with" — that's what the
+#     `iteration-escape-label` (default `full-review-please`) is for, not
+#     this. Skip completely bypasses the review; the escape label just
+#     bypasses IAR's dedup for one run.
+#
+# SECURITY — anyone who can label a PR can bypass code review via this
+# gesture. If the AI review is part of your merge gate, protect the label
+# with a repository ruleset that restricts who can apply it. See
+# docs/TRIGGER_MODES.md § "Emergency-bypass label" for a worked example.
+
+name: PR review (label-gated + emergency-bypass)
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, labeled]
+
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: DailybotHQ/ai-diff-reviewer@v1
+        with:
+          api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          label-gate: ready
+          applied-label: pr-reviewed
+          # NEW — the emergency-bypass hatch. Empty (default) means the
+          # feature is OFF; setting it turns it ON with the given label
+          # name. Consumers must configure a label consciously — no
+          # accidental bypass paths.
+          skip-review-label: skip-ai-review

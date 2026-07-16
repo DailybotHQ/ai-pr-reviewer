@@ -194,6 +194,59 @@ A simpler `if: always() && contains(github.event.pull_request.labels.*.name, 're
 
 Trade-off: since GitHub treats a Skipped required check as *passing*, marking this gate `Required` under the opt-in variant means a PR without `ready` becomes mergeable **without a review**. Pair it with a separate rule that enforces the `ready` label (a lightweight labeler action or a repository ruleset) if you want to force `ready` on every PR. This repo's own [`.github/workflows/self-review.yml`](../.github/workflows/self-review.yml) uses this opt-in variant with the `empty_reason` check.
 
+## Emergency-bypass label (`skip-review-label`) — hotfix / rollback hatch
+
+An orthogonal opt-in escape from the LLM review, distinct from `trigger-mode` and `label-gate`. When configured, applying the label to a PR causes the reviewer to short-circuit to **success** without invoking the LLM — for cases where an AI review would burn tokens for no incremental value (a one-line rollback, a version-bump commit, a documented emergency hotfix that the on-call engineer has already reviewed manually).
+
+### How to enable
+
+```yaml
+- uses: DailybotHQ/ai-diff-reviewer@v1
+  with:
+    api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+    label-gate: ready              # your usual trigger
+    applied-label: pr-reviewed     # your usual "reviewed" label
+    skip-review-label: skip-ai-review   # NEW — opt-in emergency bypass
+```
+
+Empty (the default) means the feature is off — no consumer opts into the bypass by accident.
+
+### How it fires
+
+The reviewer's normal flow is: (1) trigger-mode decides whether to run at all → (2) if `skip-review-label` is configured AND that label is on the PR, short-circuit to success → (3) otherwise, normal LLM review.
+
+So the bypass only fires when the workflow ALREADY decided to run. Concretely, on a PR with `ready` + `skip-ai-review` both applied: the `labeled` event fires, `trigger-mode: label-required` accepts, then step (2) sees `skip-ai-review` and returns success.
+
+### What happens on skip
+
+| Aspect | Behaviour |
+|---|---|
+| LLM call | Not made. Zero tokens burnt. |
+| Findings | None posted. |
+| GitHub check | Success (exit 0). Merge proceeds if no other required check blocks. |
+| `applied-label` (e.g. `pr-reviewed`) | **NOT** stamped. Applying it would lie — the PR was never reviewed. Downstream dashboards keying on that label see the truth. |
+| `collapse-previous` | Not run. Prior real reviews stay visible so the human has context before merging. |
+| IAR state | Not touched. Persisted state, generation counter, and fingerprints are all left as-is. The next non-skip run resumes exactly where the pipeline was. |
+| Tracking comment | Posted (subject to `tracking-comment: true`) with a `⏭️ skipped` header and the label name so the audit trail records WHY the review was skipped. |
+| Outputs | `skipped=true`, `severity=none`, `blocked=false`, `review-url=""`. IAR outputs remain empty. |
+
+### Security
+
+Anyone who can label a PR can bypass code review via this gesture. If the review is part of your merge gate, protect the label:
+
+- **GitHub ruleset** (org-level or repo-level): restrict `labels` write to a specific role.
+- **CODEOWNERS**: not directly applicable to labels — see the ruleset path.
+- **Combine with a lightweight audit workflow**: any workflow that fires on `pull_request.types: [labeled]` and posts a Slack alert when the `skip-ai-review` label is applied gives the team human visibility into every bypass.
+
+The runtime does NOT restrict who can apply the label — that's a repository-policy question the consumer owns. Pair the input with the appropriate ruleset and you get a professional emergency-bypass hatch.
+
+### Test coverage
+
+- Renderer contract: [`tests/test_reviewer.py`](../tests/test_reviewer.py) `TrackingRenderTests.test_skipped_by_label_body_*` (marker embed, label surfacing, provider scoping, contract statement).
+- Dogfooded live in [`.github/workflows/self-review.yml`](../.github/workflows/self-review.yml) — see the manual smoke-test procedure documented in the workflow's IAR section.
+
+---
+
 ## Interaction with `on:` and `concurrency`
 
 - The workflow's `on:` block is the outer gate — GitHub only fires the runner when the subscribed event matches.

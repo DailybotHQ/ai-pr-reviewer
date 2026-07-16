@@ -313,6 +313,41 @@ Once `open-pr` has posted the PR and the CI action has reviewed it, the **`apply
 
 ---
 
+## The Iteration-Aware Review exhaustive addendum
+
+When [Iteration-Aware Review](ITERATION_AWARENESS.md) fires the `first-pass-exhaustive` policy (either configured explicitly or forced by the 30% new-lines safety net), the reviewer appends a small, deterministic addendum to your custom prompt for **round 1 of that generation only**. The addendum tells the model that this pass gets a wider net and should prefer completeness over conciseness.
+
+The exact text (from `IAR_EXHAUSTIVE_PROMPT_ADDENDUM` in `scripts/reviewer.py` — this is the source of truth):
+
+```
+[Iteration-Aware Review — exhaustive first-pass mode active]
+This is round 1 of a fresh review generation. Prioritize exhaustive
+coverage over conciseness: surface every relevant finding you can
+identify in this diff, up to the increased inline-comments ceiling.
+Subsequent rounds will dedupe against these findings, so it is
+preferable to report a superset now than to trickle findings across
+future rounds. Focus areas, severity model, and output shape are
+unchanged.
+```
+
+**When it fires:**
+
+| Trigger | Fires? |
+|---|---|
+| `convergence-policy: iterative` | Never |
+| `convergence-policy: first-pass-exhaustive` (default), round 1 of new generation | Yes |
+| `convergence-policy: first-pass-exhaustive`, round 2+ of same generation | No (dedup-only) |
+| `convergence-policy: round-capped`, any round | No |
+| `convergence-policy: critical-gate`, any round | No |
+| Safety net triggered (≥ 30% new-lines-pct) | Yes (forces `first-pass-exhaustive` for that round) |
+| Escape label applied | No (escape bypasses dedup, no addendum) |
+
+The addendum is spliced with the same `---` separator used for user overrides ([compose_system_prompt](../scripts/reviewer.py) at the top of the file) so the model treats it as an unambiguous late-binding note — your project-specific severity overrides and house rules still take precedence.
+
+**Cost impact:** ~150 tokens per round-1-of-generation run. Included in the total accounted for by the [`docs/PERFORMANCE.md § Iteration-Aware Review`](PERFORMANCE.md#iteration-aware-review-iar--cost-and-latency-model) cost matrix.
+
+---
+
 ## Sharing prompts
 
 If your team writes a prompt that works really well, consider opening a PR to add it to `prompts/community/` in this repo. Curated, tested prompts for common stacks (Rails, Django, Next.js, Go services) are the kind of contribution that compounds across users.

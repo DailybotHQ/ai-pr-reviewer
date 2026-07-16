@@ -121,3 +121,19 @@ The `severity` and `blocked` outputs are available to subsequent steps in the sa
 - **Branch protection didn't pick up the check name.** GitHub only lists checks in the dropdown after they've run *at least once* on a PR. Open a throwaway PR, let the action run, then add the check to your protection rule.
 - **"It blocked but I think the finding is wrong."** The model's severity assignment is editable: tell the bot to downgrade in a follow-up comment, or push a fix and let the next run reassess. Don't disable the gate just because one finding was wrong; tighten the prompt instead.
 - **"It didn't block but I think it should have."** Either (a) the model called the issue `info` when your team would call it `critical` — fix in the prompt — or (b) the model didn't catch the issue at all. The reviewer is not a substitute for human review; pair `block-on-critical` with required human approval, not as a replacement for it.
+
+## Strictness × Iteration-Aware Review (IAR)
+
+[Iteration-Aware Review](ITERATION_AWARENESS.md) runs on every review. The strictness gate reads `overall_severity` **after** IAR has filtered the LLM's findings — so a silenced (deduplicated) finding no longer contributes to the gate decision. This is deliberate: the gate reflects what the reviewer surfaces to the user, not what the LLM privately observed.
+
+**One rule survives every policy:** findings with `severity == critical` **always** surface, regardless of dedup or configured policy. This is the hardcoded safety rail in `dedupe_findings_against_prior()` (docs/ITERATION_AWARENESS.md § 7.1). The `block-on-critical` gate therefore behaves identically with IAR on or off — you never accidentally silence a blocking finding.
+
+**One combination deserves a warning box:**
+
+> ⚠️ `convergence-policy: round-capped` + `strictness: block-on-warning` (or `block-on-any`).
+>
+> After `max-review-rounds` is hit, non-critical findings are silenced by the `round-capped` policy — including warnings that would normally block. In `block-on-warning` strictness, this can let a PR merge that a fresh baseline review would have blocked (with the same warnings that were silenced).
+>
+> **Options:** (a) use `first-pass-exhaustive` instead — never silences by round count; (b) use `critical-gate` — silences resolved non-criticals across generations but still surfaces new ones each round; (c) if you keep `round-capped`, use `block-on-critical` strictness (criticals still surface via the safety rail).
+
+Every other policy composition is compatible with every strictness mode — including `iterative` (dedup only, no round-count silencing) and `first-pass-exhaustive` (widens the first-round net; never silences anything on later rounds beyond dedup).

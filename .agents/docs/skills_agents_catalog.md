@@ -55,6 +55,17 @@ Common workflows:
 
 The four remaining entries (`release`, `prompt-test`, `add-provider`, and the agent personas) are authored directly in this repo and **not** tracked by the lockfile — modifying them just means editing files under `.agents/`.
 
+### Iteration-Aware Review (IAR) coverage across the catalog
+
+The IAR subsystem did **not** warrant a new dedicated skill or agent — the design patterns it introduced (content-anchored fingerprinting, HTML-comment embedded state, prompt-splicing addenda) are all domain-specific to the reviewer. Instead, IAR coverage is layered onto the existing catalog as follows:
+
+- **`reviewer` agent** — "Iteration-Aware Review (IAR) contract" checklist item (Section 11 in the agent's review checklist) so any PR touching IAR code paths is reviewed against the load-bearing invariants (critical-always-surfaces rail, whitelist-fallback for policy, argv-list subprocess, `_parse_state_from_marker_body` failure discipline, try/except safety wrap around every IAR call site).
+- **`prompt-engineer` agent** — "Iteration-Aware Review (IAR) prompt addendum" section codifying the design constraints of `IAR_EXHAUSTIVE_PROMPT_ADDENDUM` (hardcoded module constant, additive to base prompt, round-1-of-generation only, ~150 tokens).
+- **`docs/TESTING_GUIDE.md`** — "Failure-fallback regression suites for cross-cutting subsystems (repo convention)" section promotes the `test_<feature>_failure_fallback.py` file naming convention as a repo standard for any cross-cutting subsystem whose failure mode must NOT crash the runtime. IAR's own file at `tests/test_iar_failure_fallback.py` is the reference implementation.
+- **`.review/extension.md`** — "Iteration-Aware Review (IAR) conventions" section that codifies IAR-specific rules the CI reviewer enforces on every PR.
+
+Future opportunity: a general-purpose `stateful-review-loop` skill that abstracts the IAR patterns (fingerprint / dedup / policy / generation) for other AI-driven CI tools. Not shipped because the IAR patterns are still evolving and would benefit from more empirical dogfood evidence before abstraction. Track as `CATALOG-FOLLOWUP-1`.
+
 ## Slash commands
 
 The full reference lives in [COMMANDS_REFERENCE.md](COMMANDS_REFERENCE.md). Quick map:

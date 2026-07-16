@@ -271,6 +271,77 @@ If you want to reduce the action's blast radius further:
 - **Provider data retention.** Anthropic's policy applies to anything the action sends. As of this writing, Anthropic does not train on Messages API data, but you should verify against the provider's current Terms of Service for your specific compliance needs.
 - **The `severity` field is model-asserted, not verified.** A model that systematically under-tags severity will under-block. The bundled default prompt explicitly defines severity levels to mitigate this; calibrate via a custom prompt if your team needs stricter assignments.
 
+## Iteration-Aware Review (IAR) trust boundary
+
+The IAR subsystem (see [`ITERATION_AWARENESS.md`](ITERATION_AWARENESS.md)) adds three surfaces worth calling out explicitly. IAR runs on every review; the pipeline is wrapped in `try/except` at every `main()` touchpoint so an IAR failure degrades to the baseline review path — the reviewer never fails because of IAR.
+
+### New subprocess boundary — `git diff` / `git show` / `git rev-parse`
+
+IAR shells out to `git` (never `shell=True`, always argv-list) for four purposes: computing a deterministic hash of `git diff base...head` (three-dot, generation detection — see `docs/ITERATION_AWARENESS.md` § 4.3), reading file content at a specific SHA (`git show <sha>:<path>` for finding-fingerprint code context), computing new-line percentages for the safety net (`git diff --numstat base...head`, also three-dot), and resolving `origin/<base>` to a SHA (`git rev-parse`). SHA arguments come from trusted sources (git HEAD, the GitHub webhook payload, or the runner's own checkout — never from PR body / description / label text). The `<path>` argument to `git show` routes through `safe_repo_path()` (same helper the model-facing `read_file` uses), so path traversal on the git surface is impossible for the same reasons it's impossible on the tool surface.
+
+### Prompt splicing — `IAR_EXHAUSTIVE_PROMPT_ADDENDUM`
+
+On round 1 of a new generation under `first-pass-exhaustive`, IAR appends a **hardcoded** string constant to the system prompt to instruct the model to be exhaustive. The constant lives at module scope in `scripts/reviewer.py` and is never sourced from user input, env, or config. No `iar_config.*` field is interpolated into the prompt. There is no user-controllable prompt-splicing surface.
+
+### Marker-embedded state block — untrusted JSON, bot-only source
+
+IAR persists per-PR iteration state as a JSON block inside the tracking marker comment (embedded between HTML comment markers). Two independent controls make this safe:
+
+**Source authenticity (author filter).** `_fetch_latest_marker_body` resolves the reviewer's own GitHub identity via `gh_get_authenticated_login` (falling back through `/user` → `/app` → marker-scan → `github-actions[bot]`) and drops every comment whose `author.login` does not match — using the same `[bot]` / no-suffix normalisation `gh_collapse_previous_reviews` uses. Without this filter, any PR participant who can comment could forge a marker carrying fabricated `open_fingerprints_this_gen` values, and — under the shipped default `collapse-previous: true` — the real bot marker is minimized while the attacker's fresh forgery is visible, winning tier 1 and silencing genuine non-critical findings on the next run. Author filtering closes that trust-boundary hole. (`critical` findings would still surface via the § 7.1 always-surfaces rail even without the filter, but warnings and infos could be suppressed. Author filtering makes the suppression path unavailable to non-bot commenters too.)
+
+**Field-level trust boundary (parser).** Because a compromised bot account or a workflow re-run editing the same comment could still change the block, `_parse_state_from_marker_body` treats every field as untrusted:
+
+- Validates `data["version"] == IAR_STATE_SCHEMA_VERSION` **before** reading any other field. Unknown versions log + return `None` (which is handled downstream as "first review").
+- Wraps all numeric fields in `int()` and all string fields in `str()` so type-confusion attacks (e.g. `"generation": [1, 2, 3]`) fail with a caught `TypeError`/`ValueError` rather than propagating.
+- Fingerprint lists (`resolved_fingerprints`, `open_fingerprints_this_gen`) are coerced element-by-element via a predicate that keeps only `str` entries — anything else (dict, list, int, null) is dropped silently. Without this, a poisoned marker containing `[{"x": 1}]` would crash `dedupe_findings_against_prior`'s `set(...)` conversion with `TypeError: unhashable type: 'dict'`, taking IAR into baseline mode on every subsequent run until the marker ages out — a sticky DoS on convergence.
+- `history` is likewise coerced to a list of dicts only; scalars would blow up the `state.history[-1]` write path in `run_iar_post_llm`.
+- `reviewed_label_applied` is only trusted when it parses as an actual JSON `true`/`false` (or `0`/`1`). Non-empty strings like `"false"` / `"no"` / `"0"` fall back to `False` (the safe default — missing bit disarms `USER_FORCED_RESET` rather than firing it spuriously). Without this, `bool("false") is True` in Python would falsely arm the reset guard.
+- Catches `JSONDecodeError`, `ValueError`, `TypeError`, and the internal `IterationStateParseError` — never raises. On any failure, the run degrades to a fresh first review (safe default).
+- Fingerprint strings are used only in `==` and `in` comparisons against newly-computed fingerprints — never as subprocess args, HTTP URLs, path components, or shell strings.
+- Convergence policy strings pulled from the block are used only to populate `state.policy_applied` (rendered in the marker annotation); the policy that governs the current run's behavior always comes from `iar_config.policy` (via `build_iar_config` with a whitelist), not from the parsed state.
+
+### User-controllable inputs
+
+Two new inputs accept user text: `convergence-policy` and `iteration-escape-label`. Both are validated at parse time — the policy is compared against a whitelist and falls back to `first-pass-exhaustive` (the shipped default) on any unknown value; the escape label is compared via the `_labels_contain_ci` helper (whitespace-trimmed, case-insensitive membership over strings pulled from the GitHub REST `labels` field). Same helper is used for `skip-review-label` and the reviewed-label-based USER_FORCED_RESET check — aligning with `resolve_trigger_action`'s case-insensitive `label-gate` handling so a casing mismatch between the configured label and the GitHub-returned name can never silently disable a gesture (or, worse, look like "reviewed label removed" and falsely wipe fingerprint memory). Neither input is ever passed to a subprocess, HTTP URL, or shell string.
+
+### API surface delta
+
+Zero new endpoints beyond the reviewer's baseline set. The one HTTP call the IAR pipeline adds (`_fetch_pr_labels`) reuses the existing `gh_request` helper against `GET /repos/{owner}/{repo}/pulls/{pr}`, which requires no additional token scope beyond the `pull-requests: read` the reviewer already needs. The marker-comment read + write path uses the same `gh_request` GraphQL/REST helpers as the rest of the runtime. No token elevation required.
+
+### Cost telemetry
+
+`RunTelemetry` records `start_time_monotonic: float`, `tokens_used: int`, and `estimated_baseline_tokens: int`. All three fields are numeric — no user strings, no PII, no secrets. The five IAR action outputs surface only these numerics plus the enum-validated policy name and the round/generation counters. There is no path by which a value derived from the PR body could reach `iteration-tokens-used` or `iteration-cost-vs-baseline-estimate`.
+
+## Emergency-bypass label (`skip-review-label`) trust boundary
+
+The `skip-review-label` input is an opt-in escape hatch that lets a labeled PR merge without an AI review. It is disabled by default (empty string → the check never fires); once configured to a label name, applying that label to a PR causes the reviewer to short-circuit to success without invoking the LLM. The intent is to unblock hotfixes, rollbacks, and mechanically-safe changes where an LLM review would burn tokens for no incremental value.
+
+### Threat model
+
+**Anyone who can apply the configured label can bypass the AI review.** This is the load-bearing constraint. The reviewer performs zero mitigations of its own; the trust boundary lives entirely in GitHub's label-application permissions, which are configurable per-label via [repository rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets-for-a-repository) or [branch protection](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches).
+
+Recommended controls for consumers who make the AI review part of their merge gate:
+
+1. **Restrict the label** with a ruleset that lists an explicit allow-list of accounts/teams who can apply/remove it — the same pattern used for `hotfix`-style bypasses elsewhere.
+2. **Audit the tracking comment.** Every skip run posts a `⏭️ skipped` tracking comment with `REVIEW_MARKER` and the provider marker, so `collapse-previous` on the next real run treats it uniformly and dashboards/audit scripts can enumerate skip events.
+3. **Choose a label name that signals intent.** `skip-ai-review`, `emergency-bypass`, or `hotfix:approved` are more auditable in retrospect than a generic label like `wip`.
+4. **Do NOT reuse the label as a general workflow label.** If the same label triggers other jobs (e.g. `deploy` or `notify`), the blast radius grows — anyone who can trigger those jobs can also skip code review.
+
+### Zero-side-effect contract
+
+On a skip run the reviewer explicitly does NOT perform any of the following, so a legitimately skipped PR cannot be misclassified downstream as reviewed:
+
+- **`applied-label` is NOT stamped.** A skipped PR keeps whatever "reviewed" state it had before the skip — never gains a false "reviewed" annotation.
+- **`collapse-previous` does NOT run.** Prior real reviews on the PR stay visible so the human merger has context.
+- **IAR state is NOT touched.** The next non-skip run resumes from wherever the pipeline left off — the skip does not create ghost generations or wipe fingerprint memory.
+- **No LLM call.** The reviewer short-circuits before `run_agentic_loop`; there is no path by which the label body, name, or PR content is passed to a model on a skip run.
+
+### API surface delta
+
+Zero new endpoints. The skip check reuses the existing `gh_request` REST helper against `GET /repos/{owner}/{repo}/pulls/{pr}` (already called for the label-gate check). The one new HTTP call is `POST /repos/{owner}/{repo}/issues/{pr}/comments` for the tracking comment, which the reviewer already uses on every non-skipped run. No token elevation required.
+
+The label name flows through the `_labels_contain_ci` helper (whitespace-trimmed, case-insensitive membership over strings pulled from the GitHub REST `labels` field — same helper `label-gate`, the escape label, and the reviewed-label reset check use) and into `render_tracking_body_skipped_by_label()` where it is `str`-interpolated into a Markdown code fence — never a subprocess arg, HTTP URL path component, or shell string.
+
 ## Supply-chain audit checklist
 
 For organisations that need to audit before adopting:

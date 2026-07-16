@@ -53,6 +53,7 @@ It is **not** a replacement for human code review. It's an additional reviewer t
 | Self-healing on 422 | If GitHub rejects the review because one comment anchored outside the diff, the action retries summary-only instead of losing every comment. |
 | PR metadata checks | Optional PR description review (`pr-description-mode: warn` or `autocomplete`) and AI-driven complexity labeling (`complexity-labels-enabled`). |
 | External-contributor gate | Optional `author-association`-based skip so drive-by fork PRs don't burn LLM budget until a maintainer signs off. |
+| Iteration-Aware Review | Content-anchored fingerprinting + four convergence policies (default `first-pass-exhaustive`) + hardcoded critical-always-surfaces rail + safety net + human escape label. Solves the "same warnings re-posted on every re-run" symptom without silencing anything the reviewer should still surface. See [`ITERATION_AWARENESS.md`](ITERATION_AWARENESS.md). |
 
 ### Local skill surface only
 

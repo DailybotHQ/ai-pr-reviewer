@@ -66,8 +66,10 @@ Environment (set by the composite action's `env:` block; see action.yml):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -77,7 +79,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -276,6 +279,25 @@ SEVERITY_RANK: dict[str, int] = {
     SEVERITY_CRITICAL: 3,
 }
 
+
+def _sort_findings_criticals_first(findings: list["Finding"]) -> list["Finding"]:
+    """Return a copy of `findings` sorted so critical severity findings
+    come first, warnings second, infos third — preserving within-tier
+    order via a stable sort. Used everywhere the runtime truncates a
+    findings list against a cap, so the critical-always-surfaces
+    safety rail (docs/ITERATION_AWARENESS.md § 7.1) is preserved
+    regardless of the order the LLM (or an agent-runner CLI) emitted
+    findings in. Findings with an unknown severity string are treated
+    as SEVERITY_INFO (rank 1) so they sort behind warnings/criticals
+    but ahead of unranked entries — the safe fallback.
+    """
+    return sorted(
+        findings,
+        key=lambda f: SEVERITY_RANK.get(f.severity, SEVERITY_RANK[SEVERITY_INFO]),
+        reverse=True,
+    )
+
+
 # Marker embedded in the tracking comment so downstream automation can find
 # the most recent review unambiguously, even if other bots also comment.
 REVIEW_MARKER: str = "<!-- ai-pr-reviewer-marker -->"
@@ -306,6 +328,82 @@ ALLOWED_SIDES: tuple[str, ...] = ("LEFT", "RIGHT")
 # Timeout for a single agent-runner CLI invocation (seconds). Aligns with the
 # recommended workflow `timeout-minutes: 15` in examples/*.yml.
 CLI_INVOCATION_TIMEOUT: int = 900
+
+# ---------------------------------------------------------------------------
+# Iteration-Aware Review (IAR) — subsystem constants
+# ---------------------------------------------------------------------------
+# IAR runs on every review. Full spec in docs/ITERATION_AWARENESS.md.
+
+# Convergence policy enum values (docs/ITERATION_AWARENESS.md § 6).
+IAR_POLICY_ITERATIVE: str = "iterative"
+IAR_POLICY_FIRST_PASS_EXHAUSTIVE: str = "first-pass-exhaustive"
+IAR_POLICY_ROUND_CAPPED: str = "round-capped"
+IAR_POLICY_CRITICAL_GATE: str = "critical-gate"
+IAR_VALID_POLICIES: tuple[str, ...] = (
+    IAR_POLICY_ITERATIVE,
+    IAR_POLICY_FIRST_PASS_EXHAUSTIVE,
+    IAR_POLICY_ROUND_CAPPED,
+    IAR_POLICY_CRITICAL_GATE,
+)
+
+# Default multiplier applied to max-inline-comments on round 1 of each
+# generation when convergence-policy is first-pass-exhaustive
+# (docs/ITERATION_AWARENESS.md § 6.2).
+IAR_DEFAULT_CAP_MULTIPLIER: int = 3
+
+# Lines above + below a finding anchor included in the context hash for
+# fingerprinting (docs/ITERATION_AWARENESS.md § 5.2). 10 above + 10 below
+# = 21-line window.
+IAR_CONTEXT_HASH_RADIUS: int = 10
+
+# Prefix of the finding body included in the fingerprint payload before
+# hashing (docs/ITERATION_AWARENESS.md § 5.2). Trades fingerprint
+# stability (short prefix = more collisions across cosmetically
+# different findings) against LLM-wording-drift robustness (long prefix
+# = re-phrased-same-issue evades dedup). 200 chars covers the typical
+# "≤ 3-sentence single-issue" body without pulling in trailing
+# quote-block noise; the code-context hash carries the disambiguation
+# load for near-collisions on the prefix.
+IAR_FINGERPRINT_BODY_PREFIX_CHARS: int = 200
+
+# When a generation change (NEW_COMMITS / REBASED) brings more than this
+# percentage of new lines relative to the total diff, the safety net
+# forces first-pass-exhaustive for that round regardless of the configured
+# policy (docs/ITERATION_AWARENESS.md § 7.2).
+IAR_SAFETY_NET_NEW_LINES_PCT: int = 30
+
+# IterationState JSON schema version embedded in the marker state block
+# (docs/ITERATION_AWARENESS.md § 12). Increment when the schema breaks
+# backward-read compatibility; also extend _parse_state_from_marker_body
+# with backward-read logic before incrementing.
+IAR_STATE_SCHEMA_VERSION: int = 1
+
+# Default escape label a human can apply to force a full review
+# (docs/ITERATION_AWARENESS.md § 8). Consumers can rename via the
+# iteration-escape-label input.
+IAR_DEFAULT_ESCAPE_LABEL: str = "full-review-please"
+
+# HTML-comment tags that delimit the embedded IterationState JSON block
+# inside the tracking marker body. Nested inside REVIEW_MARKER so any
+# consumer parser looking for the tracking marker still finds it.
+IAR_STATE_TAG_OPEN: str = "<!-- ai-pr-reviewer-iteration-state"
+IAR_STATE_TAG_CLOSE: str = "-->"
+
+# Hardcoded prompt addendum spliced into the system prompt on round 1 of
+# each generation when convergence-policy is first-pass-exhaustive. NEVER
+# sourced from user input — this constant is the security surface
+# (docs/ITERATION_AWARENESS.md § 6.2). Kept short; ~150 tokens
+# (matches the budget quoted in docs/PROMPTS.md + docs/PERFORMANCE.md).
+IAR_EXHAUSTIVE_PROMPT_ADDENDUM: str = (
+    "\n\n[Iteration-Aware Review — exhaustive first-pass mode active]\n"
+    "This is round 1 of a fresh review generation. Prioritize exhaustive\n"
+    "coverage over conciseness: surface every relevant finding you can\n"
+    "identify in this diff, up to the increased inline-comments ceiling.\n"
+    "Subsequent rounds will dedupe against these findings, so it is\n"
+    "preferable to report a superset now than to trickle findings across\n"
+    "future rounds. Focus areas, severity model, and output shape are\n"
+    "unchanged.\n"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -432,12 +530,21 @@ def write_all_outputs(
     blocked: bool = False,
     review_url: str = "",
 ) -> None:
-    """Write the complete set of six action outputs in one call.
+    """Write the complete set of six core action outputs + the five IAR
+    outputs (as empty strings) in one call.
 
     Every exit path — success, skip, and hard failure — routes through here so
     downstream steps never read an empty string for an output they key on
     (e.g. `steps.review.outputs.blocked == 'false'`). Defaults describe the
     "no review produced" state used by the skip and failure paths.
+
+    The five IAR outputs (`iteration-round`, `iteration-generation`,
+    `iteration-policy-applied`, `iteration-tokens-used`,
+    `iteration-cost-vs-baseline-estimate`) are always written as empty strings
+    here as the safety-net default. When the reviewer reaches its IAR-
+    populating code path after the LLM call, that path overwrites the five
+    values with real data (`$GITHUB_OUTPUT` is append-only; last write wins).
+    See docs/ITERATION_AWARENESS.md § 3.2.
     """
     write_action_output("skipped", "true" if skipped else "false")
     write_action_output("severity", severity)
@@ -445,6 +552,7 @@ def write_all_outputs(
     write_action_output("inline-dropped", str(inline_dropped))
     write_action_output("blocked", "true" if blocked else "false")
     write_action_output("review-url", review_url)
+    write_iar_outputs_empty()
 
 
 # ---------------------------------------------------------------------------
@@ -1680,8 +1788,862 @@ def build_provider(
 
 
 # ---------------------------------------------------------------------------
+# Iteration-Aware Review (IAR) config
+# ---------------------------------------------------------------------------
+# The runtime reads the 4 IAR env vars once at the top of main() and packages
+# them into an IARConfig dataclass consumed by every IAR touchpoint. See
+# docs/ITERATION_AWARENESS.md.
+
+
+@dataclass(frozen=True)
+class IARConfig:
+    """Parsed + validated configuration for the Iteration-Aware Review
+    subsystem. Built exactly once per run via `build_iar_config()`.
+
+    IAR runs on every review; consumers tune the four knobs below
+    (policy, round cap, cap multiplier, escape label). The pipeline
+    itself is wrapped in `try/except` at each `main()` call site so an
+    IAR bug degrades to the baseline review path (empty IAR outputs,
+    tracking marker without the annotation) — the reviewer never fails
+    because of IAR.
+    """
+
+    policy: str
+    max_review_rounds: int
+    cap_multiplier: int
+    escape_label: str
+
+
+def build_iar_config(env: dict[str, str]) -> IARConfig:
+    """Read the 4 IAR env vars from `env` and return a validated IARConfig.
+
+    Defaults: `first-pass-exhaustive` policy, unlimited rounds,
+    3× cap multiplier, `full-review-please` escape label — matches the
+    shipped `action.yml` defaults, so a consumer who sets nothing gets
+    the recommended convergence profile.
+
+    Unknown policy values fall back to `first-pass-exhaustive` silently;
+    negative integers are clamped to sane values. All parsing is lenient
+    so a misconfigured input never crashes the run.
+    """
+    policy_raw: str = (
+        env.get("AIPRR_CONVERGENCE_POLICY", "").strip()
+        or IAR_POLICY_FIRST_PASS_EXHAUSTIVE
+    )
+    if policy_raw not in IAR_VALID_POLICIES:
+        # Silent fallback keeps the runtime safe even under a misconfiguration.
+        # main() emits a debug log line so the miswiring is visible in the
+        # workflow log.
+        policy: str = IAR_POLICY_FIRST_PASS_EXHAUSTIVE
+    else:
+        policy = policy_raw
+    max_review_rounds_raw: str = (
+        env.get("AIPRR_MAX_REVIEW_ROUNDS", "").strip() or "0"
+    )
+    try:
+        max_review_rounds: int = int(max_review_rounds_raw)
+    except ValueError:
+        max_review_rounds = 0
+    if max_review_rounds < 0:
+        max_review_rounds = 0
+    cap_multiplier_raw: str = (
+        env.get("AIPRR_EXHAUSTIVE_FIRST_PASS_CAP_MULTIPLIER", "").strip()
+        or str(IAR_DEFAULT_CAP_MULTIPLIER)
+    )
+    try:
+        cap_multiplier: int = int(cap_multiplier_raw)
+    except ValueError:
+        cap_multiplier = IAR_DEFAULT_CAP_MULTIPLIER
+    if cap_multiplier < 1:
+        cap_multiplier = 1
+    escape_label: str = (
+        env.get("AIPRR_ITERATION_ESCAPE_LABEL", "").strip()
+        or IAR_DEFAULT_ESCAPE_LABEL
+    )
+    return IARConfig(
+        policy=policy,
+        max_review_rounds=max_review_rounds,
+        cap_multiplier=cap_multiplier,
+        escape_label=escape_label,
+    )
+
+
+def write_iar_outputs_empty() -> None:
+    """Write empty-string values for all 5 IAR action outputs.
+
+    Called on every code path where IAR could not populate its own
+    values — the review was skipped before IAR ran, the pre-LLM or
+    post-LLM helper raised (caught by main()'s try/except), or the review
+    aborted early. Guarantees downstream steps that read
+    `steps.review.outputs.iteration-*` always see a defined string
+    (never a missing key or a null value).
+
+    `write_iar_outputs_populated()` is called after a successful IAR
+    pipeline execution and overwrites these empty strings with real
+    values — last-write-wins on `$GITHUB_OUTPUT`.
+    """
+    write_action_output("iteration-round", "")
+    write_action_output("iteration-generation", "")
+    write_action_output("iteration-policy-applied", "")
+    write_action_output("iteration-tokens-used", "")
+    write_action_output("iteration-cost-vs-baseline-estimate", "")
+
+
+# ---------------------------------------------------------------------------
+# Iteration-Aware Review (IAR) — state layer
+# ---------------------------------------------------------------------------
+# The IAR runtime persists a small JSON blob inside the existing tracking
+# marker comment (an HTML-comment block delimited by IAR_STATE_TAG_OPEN /
+# IAR_STATE_TAG_CLOSE, nested inside REVIEW_MARKER). Zero external state,
+# zero new files on disk. Every parse/read failure falls back to `None`
+# (treated as "first review, no prior state") with a debug log — the
+# subsystem must never crash the reviewer on a malformed marker.
+#
+# See docs/ITERATION_AWARENESS.md § 12 for the JSON schema (version 1).
+
+
+class IterationStateParseError(Exception):
+    """Raised inside `_parse_state_from_marker_body` when the embedded JSON
+    is malformed or its schema version is unknown. NEVER propagates outside
+    the IAR module — callers catch and fall back to `None`."""
+
+
+@dataclass
+class IterationState:
+    """Persisted IAR state (version 1). Read from the last marker, updated
+    in-memory during the run, and re-embedded into the new marker at the
+    end. See docs/ITERATION_AWARENESS.md § 12 for the schema contract.
+
+    Field notes:
+    - `version`: schema version; matches IAR_STATE_SCHEMA_VERSION.
+    - `generation`: monotonic counter; increments on new commits or rebase.
+    - `generation_range_hash`: 16-char SHA256 hex slice of the diff
+      *content* between `base_sha` and `head_sha` (i.e. the output of
+      `git diff base_sha...head_sha` — THREE-dot, matching
+      `fetch_pr_context`'s `origin/<base>...HEAD` PR payload — not
+      the commit-SHA list, and NEVER two-dot; see
+      docs/ITERATION_AWARENESS.md § 4.3 for the rationale). Two
+      commits producing byte-identical diffs produce byte-identical
+      hashes so cosmetic rebases that don't change what the reviewer
+      would see don't advance the generation. Detecting a change
+      advances the generation.
+    - `round_in_generation`: how many reviews have run in this generation.
+      Resets to 1 on generation change.
+    - `policy_applied`: which policy actually fired on the last review
+      (usually matches configured policy; safety net or escape label can
+      override).
+    - `resolved_fingerprints`: fingerprints reported in prior rounds AND
+      not present in the current round → treated as resolved.
+      `iterative` / `first-pass-exhaustive` re-surface these when they
+      reappear; `critical-gate` silences them unless critical.
+    - `open_fingerprints_this_gen`: fingerprints reported in the current
+      generation and NOT yet reported as resolved. Used by dedup engine.
+    - `history`: append-only per-generation summary rows. Bounded to the
+      last N generations (see IAR_HISTORY_MAX_ENTRIES) so the marker body
+      cannot grow unboundedly.
+    """
+
+    version: int
+    generation: int
+    generation_range_hash: str
+    round_in_generation: int
+    policy_applied: str
+    resolved_fingerprints: list[str]
+    open_fingerprints_this_gen: list[str]
+    history: list[dict[str, Any]]
+    # Optional in v1 schema — populated by Task 4 (generation tracking).
+    # An empty string means "unknown prior base" and forces `detect_generation
+    # _change` to fall back to NEW_COMMITS on any hash mismatch (safe: extra
+    # exhaustive review, never silent silencing).
+    base_sha: str = ""
+    # Optional in v1 schema — populated by Task 8 (observability). Stores
+    # the head SHA of the last review so `compute_new_lines_pct` can measure
+    # what has been added since. Empty string means "unknown prior head" →
+    # safety net degrades to no-op (compute_new_lines_pct returns 0.0), which
+    # is the safe conservative fallback (never silences a review that would
+    # have benefited from an exhaustive pass; just skips the boost).
+    head_sha: str = ""
+    # Load-bearing arming signal for USER_FORCED_RESET on the NEXT run.
+    # Computed by `compute_reviewed_label_applied` as the OR of three
+    # signals: (1) this run's `gh_apply_label` call succeeded,
+    # (2) the label is currently on the PR at trigger time (a prior
+    # run stamped it and it's still there — no one manually removed
+    # it yet), or (3) the previous run's state recorded a successful
+    # stamp AND this run took a path (blocked, escape-label, etc.)
+    # that does not remove the label. This three-signal OR is
+    # deliberately stronger than "this run stamped the label" —
+    # otherwise a blocked follow-up would silently clear the arming
+    # bit and disarm a legitimate reset gesture on the run after
+    # that. Defaults to `False` for back-compat with older marker
+    # bodies that predate this field (safe conservative fallback:
+    # users on old state must complete one successful review before
+    # the reset gesture becomes armed). Full contract in
+    # docs/ITERATION_AWARENESS.md § 8.5.
+    reviewed_label_applied: bool = False
+
+
+# Cap on `history` list length. 20 generations is plenty for the lifetime
+# of a single PR while keeping the marker body under ~10KB even in
+# pathological cases. See docs/ITERATION_AWARENESS.md § 12.
+IAR_HISTORY_MAX_ENTRIES: int = 20
+
+
+def new_iteration_state(
+    *,
+    generation: int = 1,
+    generation_range_hash: str = "",
+    round_in_generation: int = 1,
+    policy_applied: str = IAR_POLICY_ITERATIVE,
+    base_sha: str = "",
+    head_sha: str = "",
+) -> IterationState:
+    """Construct a fresh IterationState with schema version + empty lists.
+    Used on first review of a PR (no prior marker found)."""
+    return IterationState(
+        version=IAR_STATE_SCHEMA_VERSION,
+        generation=generation,
+        generation_range_hash=generation_range_hash,
+        round_in_generation=round_in_generation,
+        policy_applied=policy_applied,
+        resolved_fingerprints=[],
+        open_fingerprints_this_gen=[],
+        history=[],
+        base_sha=base_sha,
+        head_sha=head_sha,
+    )
+
+
+def _parse_state_from_marker_body(
+    marker_body: str,
+) -> IterationState | None:
+    """Extract + parse the IAR state block from a marker body string.
+
+    Returns:
+    - `IterationState` on success.
+    - `None` on any failure (no block, malformed JSON, unknown version,
+      shape mismatch). Failure is logged via `log()` with an `IAR:` prefix
+      so miswiring is visible in the workflow log.
+    """
+    if not marker_body or IAR_STATE_TAG_OPEN not in marker_body:
+        return None
+    pattern: re.Pattern[str] = re.compile(
+        re.escape(IAR_STATE_TAG_OPEN)
+        + r"(.*?)"
+        + re.escape(IAR_STATE_TAG_CLOSE),
+        re.DOTALL,
+    )
+    matches: list[str] = pattern.findall(marker_body)
+    if not matches:
+        return None
+    raw_block: str = matches[-1].strip()
+    try:
+        data: Any = json.loads(raw_block)
+        if not isinstance(data, dict):
+            raise IterationStateParseError(
+                f"expected JSON object at root, got {type(data).__name__}"
+            )
+        version: Any = data.get("version")
+        if version != IAR_STATE_SCHEMA_VERSION:
+            raise IterationStateParseError(
+                f"unknown schema version {version!r} "
+                f"(runtime supports {IAR_STATE_SCHEMA_VERSION})"
+            )
+        # Fingerprint lists MUST contain only strings — anything else
+        # crashes IAR into a sticky DoS on convergence. `set(prior_state
+        # .resolved_fingerprints)` in `dedupe_findings_against_prior`
+        # raises `TypeError: unhashable type: 'dict'` on a poisoned
+        # marker containing e.g. `[{"x": 1}]`, so `run_iar_pre_llm`
+        # crashes → `main()`'s try/except falls back to baseline →
+        # every subsequent run keeps failing until the poisoned marker
+        # ages out of the fetch window. Coerce here (drop non-string
+        # entries silently — over-review is the safe direction).
+        def _coerce_fingerprints(raw: Any) -> list[str]:
+            if not isinstance(raw, list):
+                return []
+            return [x for x in raw if isinstance(x, str)]
+
+        # `history` MUST contain only dicts — the accumulator writer
+        # in `run_iar_post_llm` mutates `state.history[-1]`, which
+        # blows up if the entry is a scalar. Coerce here too.
+        def _coerce_history(raw: Any) -> list[dict[str, Any]]:
+            if not isinstance(raw, list):
+                return []
+            return [x for x in raw if isinstance(x, dict)]
+
+        # `bool()` on JSON is a foot-gun: `bool("false") is True`,
+        # `bool("no") is True`, `bool("0") is True`. Only accept the
+        # actual JSON booleans (or, for lenient upgrades, integer 0/1);
+        # everything else falls back to `False` (the safe default —
+        # missing bit disarms USER_FORCED_RESET rather than firing it
+        # spuriously). Trust-boundary rule per docs/SECURITY.md § IAR.
+        raw_rla: Any = data.get("reviewed_label_applied", False)
+        if isinstance(raw_rla, bool):
+            reviewed_label_applied: bool = raw_rla
+        elif isinstance(raw_rla, int) and raw_rla in (0, 1):
+            reviewed_label_applied = bool(raw_rla)
+        else:
+            reviewed_label_applied = False
+
+        return IterationState(
+            version=int(version),
+            generation=int(data.get("generation", 1)),
+            generation_range_hash=str(data.get("generation_range_hash", "")),
+            round_in_generation=int(data.get("round_in_generation", 1)),
+            policy_applied=str(
+                data.get("policy_applied", IAR_POLICY_ITERATIVE)
+            ),
+            resolved_fingerprints=_coerce_fingerprints(
+                data.get("resolved_fingerprints", [])
+            ),
+            open_fingerprints_this_gen=_coerce_fingerprints(
+                data.get("open_fingerprints_this_gen", [])
+            ),
+            history=_coerce_history(data.get("history", [])),
+            base_sha=str(data.get("base_sha", "")),
+            head_sha=str(data.get("head_sha", "")),
+            reviewed_label_applied=reviewed_label_applied,
+        )
+    except IterationStateParseError as exc:
+        log(f"IAR: state parse failed: {exc}; treating as first review.")
+        return None
+    except (json.JSONDecodeError, ValueError, TypeError) as exc:
+        log(
+            f"IAR: state parse failed with {type(exc).__name__}: {exc}; "
+            "treating as first review."
+        )
+        return None
+
+
+def _fetch_latest_marker_body(
+    *,
+    repo: str,
+    pr_number: int,
+    token: str,
+    provider_id: str = "",
+    bot_login: str = "",
+) -> str | None:
+    """Fetch the most recent tracking-marker issue comment on the PR that
+    carries an embedded IAR state block, and return its body. Returns
+    `None` if no such marker is found or on any API failure.
+
+    Uses GraphQL because REST issue comments do not expose `isMinimized`,
+    which the ordering fallback below reads.
+
+    When `bot_login` is non-empty, filters markers to those authored by
+    that GitHub identity (matching the same `[bot]` / no-suffix
+    normalisation used by `gh_collapse_previous_reviews`). This is a
+    **load-bearing security control**: without the author filter, ANY
+    PR participant who can comment could forge a marker carrying
+    fabricated `open_fingerprints_this_gen` values, and — under the
+    shipped default `collapse-previous: true` — the real bot marker
+    is minimized while the attacker's fresh forgery is visible,
+    winning tier 1 and silencing genuine non-critical findings on the
+    next run. Author filtering closes that trust-boundary hole (the
+    critical-always-surfaces rail continues to make sure `critical`
+    findings surface regardless, but IAR would still lose warnings
+    and infos). When `bot_login` is empty, filtering is skipped —
+    kept as an escape hatch for tests and unusual callers, and for
+    the rare case where `gh_get_authenticated_login` fails to resolve
+    an identity at all.
+
+    When `provider_id` is non-empty, filters markers to those carrying
+    the matching `<!-- ai-pr-reviewer-provider: <provider_id> -->` tag
+    (see `PROVIDER_MARKER_PREFIX`). This is load-bearing for
+    multi-provider setups (e.g. a self-review matrix running both
+    `cursor` and `anthropic` legs on the same PR): without the filter,
+    each provider would read the OTHER provider's IAR state, cross-
+    poisoning fingerprint memory, generation hashes, and round
+    counters. Untagged legacy markers (posted before the provider
+    marker was introduced, or by callers that omit it) match every
+    provider — preserves back-compat.
+
+    Ordering rule (load-bearing — see docs/ITERATION_AWARENESS.md § 7):
+
+        1. Prefer the latest **non-minimized** marker that contains an
+           IAR state block. This is the common path: the tracking
+           comment posted at the end of the last successful review.
+        2. Fall back to the latest **minimized** marker that contains
+           an IAR state block. This is the collapse-previous case: the
+           consumer opted into `collapse-previous: true` (the shipped
+           default), so between runs the previous marker gets
+           minimized by `gh_collapse_previous_reviews` — but the state
+           block itself is still in the body. Without this fallback,
+           every collapse-previous consumer would see IAR reset to
+           `first_review` on every run and never dedup findings.
+        3. Fall back to any marker (state block or not) — matches the
+           legacy semantics used by callers other than IAR.
+
+    Tier (2) rescues state across the collapse boundary so IAR's
+    generation-tracking / dedup engine actually engages on the default
+    config. Tier (3) preserves back-compat for the non-IAR call sites
+    that just want "the last marker we posted."
+
+    Provider filtering is applied BEFORE the three-tier ordering rule,
+    so provider isolation composes cleanly with the collapse-previous
+    fallback (each provider gets its own three-tier search over its
+    own marker chain).
+    """
+    if not repo or "/" not in repo or pr_number <= 0:
+        return None
+    owner: str
+    name: str
+    owner, name = repo.split("/", 1)
+    query: str = (
+        "query($owner: String!, $name: String!, $pr: Int!) {\n"
+        "  repository(owner: $owner, name: $name) {\n"
+        "    pullRequest(number: $pr) {\n"
+        "      comments(last: 100) {\n"
+        "        nodes {\n"
+        "          body\n"
+        "          isMinimized\n"
+        "          createdAt\n"
+        "          author { login }\n"
+        "        }\n"
+        "      }\n"
+        "    }\n"
+        "  }\n"
+        "}"
+    )
+    # `last: 100` is the GraphQL v4 hard cap on the `pullRequest.comments`
+    # connection (server returns `EXCESSIVE_PAGINATION` for anything
+    # higher). On very busy PRs where 100+ human/bot comments accumulate
+    # AFTER the last state-bearing marker was minimized, IAR can fail
+    # to find a state-bearing marker in the window and treat the run
+    # as `first_review`. Failure mode is SAFE (over-review, never
+    # under-surface) — the reviewer re-fires round-1 exhaustive rather
+    # than silencing findings. See docs/ITERATION_AWARENESS.md § 7.3
+    # for the follow-up cursor-pagination path; deliberately deferred
+    # here to keep the runtime stdlib-only and the code path simple.
+    try:
+        data: Any = gh_graphql(
+            query,
+            {"owner": owner, "name": name, "pr": pr_number},
+            token=token,
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort GH API call
+        log(f"IAR: _fetch_latest_marker_body GraphQL failed: {exc!r}.")
+        return None
+    try:
+        nodes: list[dict[str, Any]] = (
+            data.get("repository", {})
+            .get("pullRequest", {})
+            .get("comments", {})
+            .get("nodes", [])
+            or []
+        )
+    except AttributeError:
+        return None
+    # Author-isolation predicate (SECURITY — see docstring).
+    # Match the same `[bot]` / no-suffix normalisation
+    # `gh_collapse_previous_reviews` applies so `github-actions[bot]`
+    # and `github-actions` both count as the same identity.
+    accepted_logins: set[str] = set()
+    if bot_login:
+        accepted_logins.add(bot_login)
+        if bot_login.endswith("[bot]"):
+            accepted_logins.add(bot_login[: -len("[bot]")])
+
+    def _author_matches(node_: dict[str, Any]) -> bool:
+        if not accepted_logins:
+            return True
+        author: Any = node_.get("author")
+        if not isinstance(author, dict):
+            # `author` is null when the commenter's GitHub account
+            # was deleted — never our bot; drop.
+            return False
+        login: str = str(author.get("login") or "")
+        return login in accepted_logins
+
+    # Provider-isolation predicate. When `provider_id` is set, only
+    # markers whose body carries the exact provider marker for that
+    # id (or has NO provider marker at all — the untagged legacy
+    # case) participate in the three-tier search. Multiple providers
+    # running the same PR (e.g. self-review matrix) therefore each
+    # read only their OWN state chain — no cross-poisoning of
+    # fingerprints, generation hashes, or round counters.
+    expected_provider_marker: str = (
+        provider_marker(provider_id) if provider_id else ""
+    )
+
+    def _provider_matches(body_: str) -> bool:
+        if not expected_provider_marker:
+            return True
+        if expected_provider_marker in body_:
+            return True
+        # Untagged legacy markers (posted before the provider marker
+        # was introduced, or by callers that omit it) match every
+        # provider — preserves back-compat.
+        return PROVIDER_MARKER_PREFIX not in body_
+
+    non_minimized_with_state: list[dict[str, Any]] = []
+    minimized_with_state: list[dict[str, Any]] = []
+    any_marker: list[dict[str, Any]] = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        body: str = str(node.get("body") or "")
+        if REVIEW_MARKER not in body:
+            continue
+        if not _author_matches(node):
+            continue
+        if not _provider_matches(body):
+            continue
+        any_marker.append(node)
+        has_state_block: bool = IAR_STATE_TAG_OPEN in body
+        is_minimized: bool = node.get("isMinimized") is True
+        if has_state_block and not is_minimized:
+            non_minimized_with_state.append(node)
+        elif has_state_block and is_minimized:
+            minimized_with_state.append(node)
+
+    def _newest(nodes_: list[dict[str, Any]]) -> dict[str, Any]:
+        return sorted(nodes_, key=lambda n: str(n.get("createdAt") or ""))[-1]
+
+    if non_minimized_with_state:
+        return str(_newest(non_minimized_with_state).get("body") or "")
+    if minimized_with_state:
+        log(
+            "IAR: no visible marker carries state; falling back to the "
+            "latest minimized marker with an embedded state block "
+            "(this is expected under `collapse-previous: true` — the "
+            "prior tracking comment was minimized between runs)."
+        )
+        return str(_newest(minimized_with_state).get("body") or "")
+    if any_marker:
+        return str(_newest(any_marker).get("body") or "")
+    return None
+
+
+def read_prior_iteration_state(
+    *,
+    repo: str,
+    pr_number: int,
+    token: str,
+    provider_id: str = "",
+    bot_login: str = "",
+) -> IterationState | None:
+    """Public entry point: fetch the last marker on the PR that carries
+    an IAR state block and extract it. Returns `None` on any failure —
+    treated by callers as "first review of this PR".
+
+    Reads MINIMIZED markers too when no visible marker carries state, so
+    IAR persistence survives `collapse-previous: true` (the shipped
+    default). See `_fetch_latest_marker_body` for the full ordering rule.
+
+    Pass `bot_login` to enforce marker-author isolation (SECURITY —
+    prevents PR participants from forging state markers that silence
+    non-critical findings by supplying fake `open_fingerprints_this_gen`
+    lists). Callers SHOULD always pass a resolved bot login;
+    `_fetch_latest_marker_body` treats empty as "filter disabled".
+
+    Pass `provider_id` in multi-provider setups (e.g. a self-review
+    matrix running `cursor` + `anthropic` legs on the same PR) so each
+    provider's IAR state chain stays isolated — otherwise the two
+    providers would cross-poison each other's fingerprint memory,
+    generation hashes, and round counters.
+    """
+    marker_body: str | None = _fetch_latest_marker_body(
+        repo=repo,
+        pr_number=pr_number,
+        token=token,
+        provider_id=provider_id,
+        bot_login=bot_login,
+    )
+    if marker_body is None:
+        log("IAR: no prior marker found; treating as first review.")
+        return None
+    return _parse_state_from_marker_body(marker_body)
+
+
+def embed_iteration_state(
+    marker_body: str, state: IterationState
+) -> str:
+    """Inject or replace the IAR state HTML-comment block in a marker
+    body string. Deterministic: same inputs produce byte-identical output
+    (JSON is dumped with `sort_keys=True`).
+
+    Truncates `state.history` to the last IAR_HISTORY_MAX_ENTRIES entries
+    at embed time so the marker body cannot grow unboundedly across many
+    generations.
+    """
+    bounded_history: list[dict[str, Any]] = (
+        state.history[-IAR_HISTORY_MAX_ENTRIES:]
+        if len(state.history) > IAR_HISTORY_MAX_ENTRIES
+        else state.history
+    )
+    bounded_state: IterationState = IterationState(
+        version=state.version,
+        generation=state.generation,
+        generation_range_hash=state.generation_range_hash,
+        round_in_generation=state.round_in_generation,
+        policy_applied=state.policy_applied,
+        resolved_fingerprints=list(state.resolved_fingerprints),
+        open_fingerprints_this_gen=list(state.open_fingerprints_this_gen),
+        history=bounded_history,
+        base_sha=state.base_sha,
+        head_sha=state.head_sha,
+        reviewed_label_applied=state.reviewed_label_applied,
+    )
+    state_json: str = json.dumps(
+        asdict(bounded_state), indent=2, sort_keys=True
+    )
+    block: str = (
+        f"\n\n{IAR_STATE_TAG_OPEN}\n{state_json}\n{IAR_STATE_TAG_CLOSE}\n"
+    )
+    pattern: re.Pattern[str] = re.compile(
+        re.escape(IAR_STATE_TAG_OPEN)
+        + r".*?"
+        + re.escape(IAR_STATE_TAG_CLOSE)
+        + r"\n?",
+        re.DOTALL,
+    )
+    stripped_body: str = pattern.sub("", marker_body).rstrip()
+    return stripped_body + block
+
+
+# ---------------------------------------------------------------------------
+# Iteration-Aware Review (IAR) — generation tracking
+# ---------------------------------------------------------------------------
+# A "generation" is a stable diff-content window. When the developer
+# pushes new commits or rebases, the content window changes → a new
+# generation begins. The round counter resets; convergence policies
+# re-activate (e.g. first-pass-exhaustive fires again on the fresh
+# content). See docs/ITERATION_AWARENESS.md § 4.
+#
+# The generation counter is stored in `IterationState.generation` and
+# incremented by `advance_generation()`. Detection reads
+# `IterationState.generation_range_hash` + `IterationState.base_sha`
+# and compares them to the current values from the diff being reviewed.
+
+
+class GenerationTransition(str, Enum):
+    """Which of the possible transitions the current run represents.
+
+    Values match the strings persisted in `IterationState.policy_applied`
+    when relevant, and the debug-log tags. Surfaced to developers only
+    through the marker annotation (e.g. `(user_forced_reset)` after the
+    round/policy tags); consumers never see them in action outputs.
+
+    `USER_FORCED_RESET` fires ONLY when ALL FIVE conditions hold:
+    (1) the consumer's `applied-label` (the "reviewed" label the
+    action stamps on a successful review) is configured; (2) a prior
+    IAR state exists in the tracking marker; (3) that prior state's
+    `reviewed_label_applied` bit is `True` (recording that the
+    reviewer previously stamped the label successfully — the
+    load-bearing guard that prevents a blocked review's natural
+    re-trigger from being misclassified as a deliberate reset);
+    (4) the PR-labels fetch succeeded (`label_fetch_ok is True` —
+    a transient GitHub 5xx returning an empty list from
+    `_fetch_pr_labels` must NOT be misread as "label absent" or
+    the reset gesture would silently wipe fingerprint memory on
+    every transient outage — round-14 F1); and (5) the label is
+    absent from the returned PR-labels list. Semantically identical
+    to `FIRST_REVIEW` downstream (fresh state, no dedup memory,
+    round-1 exhaustive under the default policy) — separated out
+    only so the log + marker can tell developers that the reset was
+    a deliberate gesture, not the first-ever review of the PR. Full
+    contract in docs/ITERATION_AWARENESS.md § 8.5.
+    """
+
+    FIRST_REVIEW = "first_review"
+    SAME_GENERATION = "same_generation"
+    NEW_COMMITS = "new_commits"
+    REBASED = "rebased"
+    USER_FORCED_RESET = "user_forced_reset"
+
+
+def compute_generation_range_hash(
+    *,
+    base_sha: str,
+    head_sha: str,
+    repo_root: str | None = None,
+) -> str:
+    """Deterministic 16-hex-char hash of the diff content between
+    `base_sha` and `head_sha`.
+
+    Two commits producing the same diff content produce the same hash →
+    used to detect content-window changes across runs. Empty string is
+    returned when the git subprocess fails (network hiccup, missing
+    refs, sparse checkout) — callers treat that as "unknown" and
+    fall back to conservative behavior (typically FIRST_REVIEW).
+
+    Uses THREE-dot `base_sha...head_sha` (not two-dot `base_sha..head_sha`)
+    so the hash mirrors the exact diff the review payload sees via
+    `fetch_pr_context` (`origin/<base>...HEAD`). Two-dot would recompute
+    the hash every time `origin/<base>` advanced upstream even though
+    the PR-visible diff is unchanged — that produced false REBASED /
+    NEW_COMMITS transitions on any label-gated re-review after the
+    base branch moved, burning a full exhaustive pass and re-surfacing
+    already-open warnings. Three-dot pins the comparison to the merge
+    base of the two commits, matching the PR contract.
+    """
+    if not base_sha or not head_sha:
+        return ""
+    try:
+        result: subprocess.CompletedProcess[str] = subprocess.run(
+            ["git", "diff", f"{base_sha}...{head_sha}"],
+            capture_output=True,
+            check=True,
+            text=True,
+            cwd=repo_root,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        log(
+            f"IAR: compute_generation_range_hash failed "
+            f"(base={base_sha[:8]}, head={head_sha[:8]}): {exc}. "
+            "Returning empty hash; caller falls back to FIRST_REVIEW."
+        )
+        return ""
+    digest: str = hashlib.sha256(result.stdout.encode("utf-8")).hexdigest()
+    return digest[:16]
+
+
+def detect_generation_change(
+    *,
+    prior_state: IterationState | None,
+    current_range_hash: str,
+    current_base_sha: str,
+) -> GenerationTransition:
+    """Classify what kind of transition the current run represents.
+
+    Precedence:
+    1. No prior state → `FIRST_REVIEW`.
+    2. Range hash matches prior → `SAME_GENERATION` (adds a round).
+    3. Base SHA changed (and we know both) → `REBASED`.
+    4. Otherwise (hash mismatch, same or unknown base) → `NEW_COMMITS`.
+
+    When `prior_state.base_sha` is empty (older marker from a prior IAR
+    version that didn't persist base_sha), rebase detection is impossible
+    → we default to NEW_COMMITS. This is the safest fallback: NEW_COMMITS
+    still advances the generation and re-activates first-pass-exhaustive.
+    """
+    if prior_state is None:
+        return GenerationTransition.FIRST_REVIEW
+    if current_range_hash and prior_state.generation_range_hash == current_range_hash:
+        return GenerationTransition.SAME_GENERATION
+    prior_base: str = prior_state.base_sha
+    if prior_base and current_base_sha and prior_base != current_base_sha:
+        return GenerationTransition.REBASED
+    return GenerationTransition.NEW_COMMITS
+
+
+def advance_generation(
+    *,
+    prior_state: IterationState | None,
+    transition: GenerationTransition,
+    new_range_hash: str,
+    new_base_sha: str,
+    policy: str,
+    new_head_sha: str = "",
+) -> IterationState:
+    """Return a fresh `IterationState` reflecting a generation change.
+
+    Preserves `resolved_fingerprints` across generations (they carry
+    audit-trail value across the whole PR lifetime). Appends a summary
+    entry to `history` describing the closed-out generation (Task 8
+    populates `tokens_used` + `wall_clock_ms`).
+
+    For `SAME_GENERATION`, callers do NOT invoke this function — they
+    just increment `round_in_generation` in place via
+    `increment_round_in_generation()`.
+    """
+    if transition in (
+        GenerationTransition.FIRST_REVIEW,
+        GenerationTransition.USER_FORCED_RESET,
+    ) or prior_state is None:
+        log(
+            f"IAR: {transition.value} — starting generation 1 "
+            f"(range_hash={new_range_hash!r}, base_sha={new_base_sha[:8]!r})."
+        )
+        return new_iteration_state(
+            generation=1,
+            generation_range_hash=new_range_hash,
+            round_in_generation=1,
+            policy_applied=policy,
+            base_sha=new_base_sha,
+            head_sha=new_head_sha,
+        )
+    closed_gen_entry: dict[str, Any] = {
+        "gen": prior_state.generation,
+        "range_hash": prior_state.generation_range_hash,
+        "rounds_ran": prior_state.round_in_generation,
+        "converged": len(prior_state.open_fingerprints_this_gen) == 0,
+        "tokens_used": 0,     # populated by Task 8 (observability)
+        "wall_clock_ms": 0,   # populated by Task 8 (observability)
+    }
+    new_history: list[dict[str, Any]] = list(prior_state.history) + [
+        closed_gen_entry
+    ]
+    log(
+        f"IAR: generation change detected ({transition.value}). "
+        f"Prior: gen={prior_state.generation}, "
+        f"rounds={prior_state.round_in_generation}, "
+        f"range_hash={prior_state.generation_range_hash!r}, "
+        f"converged={closed_gen_entry['converged']}. "
+        f"New: gen={prior_state.generation + 1}, "
+        f"range_hash={new_range_hash!r}, "
+        f"base_sha={new_base_sha[:8]!r}."
+    )
+    return IterationState(
+        version=IAR_STATE_SCHEMA_VERSION,
+        generation=prior_state.generation + 1,
+        generation_range_hash=new_range_hash,
+        round_in_generation=1,
+        policy_applied=policy,
+        # resolved_fingerprints crosses generations for cross-gen dedup
+        # (used by `critical-gate` policy and audit trail).
+        resolved_fingerprints=list(prior_state.resolved_fingerprints),
+        # open_fingerprints_this_gen resets — repopulated by Task 5 dedup.
+        open_fingerprints_this_gen=[],
+        history=new_history,
+        base_sha=new_base_sha,
+        head_sha=new_head_sha,
+    )
+
+
+def increment_round_in_generation(
+    *,
+    prior_state: IterationState,
+    policy: str,
+    new_head_sha: str = "",
+) -> IterationState:
+    """For `SAME_GENERATION` transitions: bump `round_in_generation` and
+    refresh `policy_applied` without touching fingerprints or history.
+
+    `new_head_sha` refreshes the persisted head_sha so subsequent runs
+    measure new-lines-pct against the most recent reviewed head, not the
+    first one in the generation. When empty, the prior head is preserved.
+    """
+    log(
+        f"IAR: SAME_GENERATION — advancing round "
+        f"{prior_state.round_in_generation} → "
+        f"{prior_state.round_in_generation + 1} "
+        f"(gen={prior_state.generation})."
+    )
+    return IterationState(
+        version=prior_state.version,
+        generation=prior_state.generation,
+        generation_range_hash=prior_state.generation_range_hash,
+        round_in_generation=prior_state.round_in_generation + 1,
+        policy_applied=policy,
+        resolved_fingerprints=list(prior_state.resolved_fingerprints),
+        open_fingerprints_this_gen=list(
+            prior_state.open_fingerprints_this_gen
+        ),
+        history=list(prior_state.history),
+        base_sha=prior_state.base_sha,
+        head_sha=new_head_sha or prior_state.head_sha,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Provider-independent review payload
 # ---------------------------------------------------------------------------
+#
+# The IAR dedup engine consumes `Finding` instances (defined immediately
+# below) — so the fingerprinting + dedup helpers live AFTER the `Finding`
+# dataclass to avoid forward references. See the "Iteration-Aware Review
+# (IAR) — fingerprinting + dedup engine" block further down the file.
 
 
 @dataclass
@@ -1709,6 +2671,1504 @@ class ReviewResult:
     summary: str = ""
     findings: list[Finding] = field(default_factory=list)
     overall_severity: str = SEVERITY_NONE
+
+
+# ---------------------------------------------------------------------------
+# Iteration-Aware Review (IAR) — fingerprinting + dedup engine
+# ---------------------------------------------------------------------------
+# The dedup engine consumes `Finding` (defined above) and prior
+# `IterationState` (defined near the top of the file). Every convergence
+# policy in Tasks 6/7 flows through `dedupe_findings_against_prior`; the
+# critical-always-surfaces safety rail is hardcoded INSIDE that function
+# and MUST NOT be moved into a policy — that's the load-bearing
+# correctness invariant of the whole subsystem
+# (docs/ITERATION_AWARENESS.md § 7.1).
+
+
+@dataclass(frozen=True)
+class CodeContext:
+    """Immutable snapshot of a file's contents at a specific SHA. Used to
+    ground the finding fingerprint in the actual code around the anchor
+    line — so a small refactor around a warning shifts the fingerprint
+    and the warning re-surfaces (correct behavior)."""
+
+    path: str
+    lines: tuple[str, ...]
+
+    def lines_around(self, line: int, radius: int) -> list[str]:
+        """Return up to `2*radius + 1` lines centered on the 1-indexed
+        anchor. Handles boundary cases (near start / end of file) by
+        truncating rather than raising."""
+        if not self.lines:
+            return []
+        start: int = max(1, line - radius)
+        end: int = min(len(self.lines), line + radius)
+        return list(self.lines[start - 1:end])
+
+
+def load_code_context(
+    *, path: str, review_sha: str, repo_root: str | None = None
+) -> CodeContext | None:
+    """Read a file's contents at a specific SHA via `git show <sha>:<path>`.
+
+    Returns `None` if the file didn't exist at that SHA (deleted,
+    pre-add, or the SHA doesn't resolve). Uses `safe_repo_path` to
+    reject any path that escapes the workspace (DO #7).
+    """
+    if not path or not review_sha:
+        return None
+    try:
+        safe_target: Path = safe_repo_path(path)
+    except ValueError as exc:
+        log(f"IAR: load_code_context refused path {path!r}: {exc}.")
+        return None
+    repo_root_path: Path = Path(repo_root).resolve() if repo_root else Path.cwd().resolve()
+    try:
+        rel_str: str = str(safe_target.relative_to(repo_root_path))
+    except ValueError:
+        rel_str = path
+    try:
+        result: subprocess.CompletedProcess[str] = subprocess.run(
+            ["git", "show", f"{review_sha}:{rel_str}"],
+            capture_output=True,
+            check=True,
+            text=True,
+            cwd=repo_root,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        # File missing at this SHA is a normal case (e.g. newly-added
+        # file where review_sha predates the add); log at debug level.
+        log(
+            f"IAR: load_code_context({rel_str}@{review_sha[:8]}) "
+            f"unavailable: {exc}."
+        )
+        return None
+    return CodeContext(
+        path=rel_str, lines=tuple(result.stdout.splitlines())
+    )
+
+
+def finding_fingerprint(
+    *, finding: Finding, code_context: CodeContext | None
+) -> str:
+    """Deterministic 16-hex-char content-anchored hash of a single
+    finding.
+
+    Two runs producing the same finding on the same code produce the
+    same fingerprint. Code changes around the anchor produce a
+    different fingerprint (correct re-surfacing when new commits land).
+
+    Fingerprint inputs:
+    - `path` + `line` + `severity` — the coarse anchor.
+    - First 200 chars of `body` — the finding identity (dedupes
+      re-worded restatements of the same finding).
+    - Hash of `2 * IAR_CONTEXT_HASH_RADIUS + 1` lines around the anchor
+      — content-anchored. When `code_context` is missing (file didn't
+      exist at review SHA), falls back to the string "no_context" so
+      the fingerprint stays deterministic across runs.
+    """
+    if code_context is not None:
+        context_lines: list[str] = code_context.lines_around(
+            finding.line, IAR_CONTEXT_HASH_RADIUS
+        )
+        context_hash: str = hashlib.sha256(
+            "\n".join(context_lines).encode("utf-8")
+        ).hexdigest()[:16]
+    else:
+        context_hash = "no_context"
+    payload: str = (
+        f"{finding.path}|{finding.line}|{finding.severity}|"
+        f"{finding.body[:IAR_FINGERPRINT_BODY_PREFIX_CHARS]}|{context_hash}"
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class SilencedFinding:
+    """A finding that the dedup engine chose NOT to surface, with a
+    machine-readable reason. Aggregate surfaced/silenced counts are
+    rendered in the marker annotation and the post-LLM debug log
+    (`run_iar_post_llm`).
+    """
+
+    finding: Finding
+    reason: str
+
+
+@dataclass(frozen=True)
+class DedupResult:
+    """Typed return of `dedupe_findings_against_prior`.
+
+    - `surfaced`: findings the reviewer will submit to GitHub.
+    - `silenced`: findings suppressed by dedup (with reasons).
+    - `fingerprints_by_finding`: index → fingerprint for the caller to
+      write into the updated `IterationState.open_fingerprints_this_gen`.
+    """
+
+    surfaced: list[Finding]
+    silenced: list[SilencedFinding]
+    fingerprints_by_finding: dict[int, str]
+
+
+def dedupe_findings_against_prior(
+    *,
+    new_findings: list[Finding],
+    prior_state: IterationState | None,
+    code_contexts: dict[str, CodeContext | None],
+    strict_cross_gen: bool = False,
+) -> DedupResult:
+    """Filter `new_findings` against prior IAR state.
+
+    CRITICAL SAFETY RAIL (docs/ITERATION_AWARENESS.md § 7.1):
+    Findings with `severity == "critical"` ALWAYS surface, unconditionally,
+    regardless of whether their fingerprint matches a prior open/resolved
+    finding. This rule is HARDCODED inside this function and MUST NOT be
+    moved into a policy, made configurable, or moved to a caller. Doing
+    so is a critical safety bug. Every policy path in Tasks 6/7 goes
+    through this function precisely so this safety rail cannot be
+    accidentally bypassed.
+
+    Non-critical dedup behavior (default — `strict_cross_gen=False`):
+    - `first review` (prior_state is None) → all findings surface.
+    - Fingerprint matches `prior_state.open_fingerprints_this_gen` →
+      silence with reason "already reported in gen N, unresolved".
+    - Fingerprint matches `prior_state.resolved_fingerprints` → surface
+      (regression signal — the finding was resolved but re-appeared).
+      Caller may attach a "previously resolved" annotation.
+    - Otherwise → surface.
+
+    Strict cross-generation dedup (`strict_cross_gen=True`, used by the
+    `critical-gate` policy in Task 7):
+    - Fingerprint matches `prior_state.resolved_fingerprints` → silence
+      instead of surfacing (treats resolved status as permanent for
+      non-critical findings across generations). Critical severity
+      still surfaces via the hardcoded safety rail above.
+    """
+    fingerprints_by_finding: dict[int, str] = {}
+    surfaced: list[Finding] = []
+    silenced: list[SilencedFinding] = []
+    if prior_state is None:
+        for i, finding in enumerate(new_findings):
+            fingerprints_by_finding[i] = finding_fingerprint(
+                finding=finding,
+                code_context=code_contexts.get(finding.path),
+            )
+        return DedupResult(
+            surfaced=list(new_findings),
+            silenced=[],
+            fingerprints_by_finding=fingerprints_by_finding,
+        )
+    known_open: set[str] = set(prior_state.open_fingerprints_this_gen)
+    known_resolved: set[str] = set(prior_state.resolved_fingerprints)
+    for i, finding in enumerate(new_findings):
+        fp: str = finding_fingerprint(
+            finding=finding,
+            code_context=code_contexts.get(finding.path),
+        )
+        fingerprints_by_finding[i] = fp
+        # >>> CRITICAL SAFETY RAIL — DO NOT MOVE, DO NOT GATE, DO NOT WEAKEN.
+        # docs/ITERATION_AWARENESS.md § 7.1 pins this behavior. Every
+        # convergence policy in Tasks 6/7 relies on this branch being
+        # here and being unconditional.
+        if finding.severity == SEVERITY_CRITICAL:
+            surfaced.append(finding)
+            continue
+        # <<< end critical safety rail.
+        if fp in known_open:
+            silenced.append(
+                SilencedFinding(
+                    finding=finding,
+                    reason=(
+                        f"already reported in gen "
+                        f"{prior_state.generation}, unresolved"
+                    ),
+                )
+            )
+            continue
+        if strict_cross_gen and fp in known_resolved:
+            silenced.append(
+                SilencedFinding(
+                    finding=finding,
+                    reason=(
+                        "previously resolved in an earlier generation; "
+                        "cross-generation dedup active (critical-gate policy)"
+                    ),
+                )
+            )
+            continue
+        # Default: `known_resolved` matches surface (regression signal);
+        # the caller may attach a "previously resolved" annotation.
+        surfaced.append(finding)
+    return DedupResult(
+        surfaced=surfaced,
+        silenced=silenced,
+        fingerprints_by_finding=fingerprints_by_finding,
+    )
+
+
+def resolve_finding_status(
+    *,
+    prior_open_fingerprints: list[str],
+    current_fps: dict[int, str],
+) -> tuple[list[str], list[str]]:
+    """Given the prior generation's open fingerprints and the current
+    run's fingerprints (indexed by finding), return
+    `(still_open, newly_resolved)` fingerprint lists.
+
+    A fingerprint is:
+    - `still_open` if the current run produced a matching one → the
+      finding is still present.
+    - `newly_resolved` if the prior fingerprint has no match in the
+      current run → the finding was fixed OR the code around it changed
+      enough that the fingerprint no longer matches. Either way, it is
+      no longer reported and moves to `resolved_fingerprints`.
+
+    Deterministic ordering — sorts both lists so the marker embed step
+    produces byte-identical output for byte-identical inputs.
+    """
+    current_fp_set: set[str] = set(current_fps.values())
+    still_open: list[str] = sorted(
+        fp for fp in prior_open_fingerprints if fp in current_fp_set
+    )
+    newly_resolved: list[str] = sorted(
+        fp
+        for fp in prior_open_fingerprints
+        if fp not in current_fp_set
+    )
+    return still_open, newly_resolved
+
+
+# ---------------------------------------------------------------------------
+# Iteration-Aware Review (IAR) — convergence policies (Tasks 6 + 7)
+# ---------------------------------------------------------------------------
+# Every policy returns a `PolicyResult` — a small typed struct that
+# carries the two things a policy can influence:
+# * `effective_max_inline_comments` + `prompt_addendum` (consumed BEFORE
+#   the LLM call, to shape the prompt + cap).
+# * `findings_to_surface` + `findings_silenced` (consumed AFTER the LLM
+#   call, to filter its output).
+#
+# All policies flow through `dedupe_findings_against_prior` (Task 5) so
+# the hardcoded critical-always-surfaces safety rail is respected — no
+# policy can bypass or weaken it.
+#
+# Cap multiplication raises the tool-call ceiling (max-inline-comments),
+# not `max_tokens` or `MAX_TURNS`. See AGENTS.md DON'T #9.
+
+
+@dataclass(frozen=True)
+class PolicyResult:
+    """Return type of every `apply_*_policy` function. Consumed by
+    Task 8's `main()` integration — the two `prompt_*` / `effective_*`
+    fields shape the LLM call, the two `findings_*` fields shape the
+    submission."""
+
+    findings_to_surface: list[Finding]
+    findings_silenced: list[SilencedFinding]
+    effective_max_inline_comments: int
+    prompt_addendum: str
+    policy_applied: str
+
+
+def apply_iterative_policy(
+    *,
+    findings: list[Finding],
+    prior_state: IterationState | None,
+    code_contexts: dict[str, "CodeContext | None"],
+    base_max_inline_comments: int,
+) -> PolicyResult:
+    """The default IAR policy: dedup only. Findings whose fingerprint
+    matches `prior_state.open_fingerprints_this_gen` are silenced;
+    everything else surfaces. `severity == critical` always surfaces
+    (Task 5's safety rail).
+
+    Steady-state cost is close to a non-dedup baseline: the LLM produces
+    the same set of findings, but the reviewer only submits deltas —
+    saving tokens on the GitHub API submission side (small) and reducing
+    developer noise (large)."""
+    dedup: DedupResult = dedupe_findings_against_prior(
+        new_findings=findings,
+        prior_state=prior_state,
+        code_contexts=code_contexts,
+    )
+    return PolicyResult(
+        findings_to_surface=list(dedup.surfaced),
+        findings_silenced=list(dedup.silenced),
+        effective_max_inline_comments=base_max_inline_comments,
+        prompt_addendum="",
+        policy_applied=IAR_POLICY_ITERATIVE,
+    )
+
+
+def apply_first_pass_exhaustive_policy(
+    *,
+    findings: list[Finding],
+    prior_state: IterationState | None,
+    code_contexts: dict[str, "CodeContext | None"],
+    base_max_inline_comments: int,
+    cap_multiplier: int,
+    is_round_1_of_generation: bool,
+) -> PolicyResult:
+    """Round 1 of each generation: exhaustive prompt splicing + cap
+    multiplication. Rounds 2+: delegate to `apply_iterative_policy`
+    (dedup only).
+
+    "Round 1 of each generation" means either:
+    - First-ever review of the PR (FIRST_REVIEW), OR
+    - First review after `advance_generation()` was called for a
+      NEW_COMMITS / REBASED transition.
+
+    On round 1, the caller MUST also splice `PolicyResult.prompt_addendum`
+    into the system prompt AND raise the LLM's max-inline-comments to
+    `PolicyResult.effective_max_inline_comments` BEFORE invoking the
+    model. This function's post-LLM job is to truncate the model's
+    output at the increased cap — nothing more. (Critical-always-
+    surfaces still applies via dedup path on rounds 2+.)
+    """
+    if is_round_1_of_generation:
+        # Round-1 exhaustive: raise the inline-comments ceiling and
+        # splice the addendum. `findings` at this point is already the
+        # LLM's output (produced with the raised cap upstream); we
+        # truncate defensively in case the model produced more.
+        #
+        # Criticals-first sort BEFORE truncation is load-bearing for
+        # the hardcoded critical-always-surfaces safety rail (docs
+        # § 7.1). A naive `findings[:effective_cap]` would drop
+        # criticals if the model happened to emit them past position N,
+        # silently bypassing the rail on round-1 of every generation.
+        # `_sort_findings_criticals_first` preserves the model's
+        # within-tier ordering (so info/warning ordering stays intact
+        # within their tiers) while lifting all criticals to the front —
+        # the tail truncation then only ever sheds warnings/infos.
+        effective_cap: int = base_max_inline_comments * cap_multiplier
+        prioritized: list[Finding] = _sort_findings_criticals_first(findings)
+        return PolicyResult(
+            findings_to_surface=list(prioritized[:effective_cap]),
+            findings_silenced=[],
+            effective_max_inline_comments=effective_cap,
+            prompt_addendum=IAR_EXHAUSTIVE_PROMPT_ADDENDUM,
+            policy_applied=IAR_POLICY_FIRST_PASS_EXHAUSTIVE,
+        )
+    # Rounds 2+ of the same generation: iterative dedup takes over.
+    # The critical-always-surfaces safety rail lives inside the dedup
+    # engine, so it applies transparently here.
+    iterative_result: PolicyResult = apply_iterative_policy(
+        findings=findings,
+        prior_state=prior_state,
+        code_contexts=code_contexts,
+        base_max_inline_comments=base_max_inline_comments,
+    )
+    # Preserve the policy name for observability — on rounds 2+ the
+    # user configured `first-pass-exhaustive` even though today's run
+    # applied iterative internally. Marker state records what actually
+    # ran, so we return "first-pass-exhaustive" for the audit trail
+    # while the behavior is identical to iterative.
+    return PolicyResult(
+        findings_to_surface=iterative_result.findings_to_surface,
+        findings_silenced=iterative_result.findings_silenced,
+        effective_max_inline_comments=iterative_result.effective_max_inline_comments,
+        prompt_addendum="",
+        policy_applied=IAR_POLICY_FIRST_PASS_EXHAUSTIVE,
+    )
+
+
+# The two `policy_applied` string values below are outputs of the
+# round-capped policy so consumers can distinguish "still under cap"
+# from "cap reached, only criticals surfacing".
+IAR_POLICY_ROUND_CAPPED_PRE_CAP: str = "round-capped-pre-cap"
+IAR_POLICY_ROUND_CAPPED_POST_CAP: str = "round-capped-post-cap"
+# When the escape label short-circuits dedup for one run.
+IAR_POLICY_ESCAPE_LABEL_FORCED: str = "escape-label-forced-full-review"
+# When the 30% new-lines safety net forces first-pass-exhaustive.
+IAR_POLICY_SAFETY_NET_FORCED: str = "safety-net-forced-first-pass-exhaustive"
+
+
+def apply_round_capped_policy(
+    *,
+    findings: list[Finding],
+    prior_state: IterationState | None,
+    code_contexts: dict[str, "CodeContext | None"],
+    base_max_inline_comments: int,
+    max_rounds: int,
+    is_round_1_of_generation: bool,
+) -> PolicyResult:
+    """After N rounds in the current generation, only critical findings
+    surface — non-critical warnings/infos are silenced with a "cap
+    reached" reason.
+
+    Pre-cap: behaves like `iterative` (dedup only via
+    `dedupe_findings_against_prior`).
+    Post-cap: this function itself filters to
+    `severity == SEVERITY_CRITICAL` and silences the rest with a
+    "cap reached" reason — it does NOT call the dedup engine. The
+    critical-always-surfaces invariant still holds because the
+    filter keeps every critical; the dedup rail is simply not on
+    this path (generation-fresh fingerprints + prior resolved set
+    are irrelevant once only criticals remain).
+
+    `max_rounds == 0` means unlimited (post-cap never triggers).
+
+    `is_round_1_of_generation` is load-bearing when transitions happen:
+    on `NEW_COMMITS`, `REBASED`, `USER_FORCED_RESET`, or `FIRST_REVIEW`,
+    the round counter resets to 1 for the new generation. Without this
+    parameter, `current_round` would be computed from the prior gen's
+    counter (`prior_state.round_in_generation + 1`) and a consumer with
+    e.g. `max_rounds=3` who pushed new commits after a converged
+    generation would land in the post-cap path on run 1 of the new
+    generation and see all non-critical findings silenced. `dispatch_policy`
+    computes and passes the flag exactly as it does to
+    `apply_first_pass_exhaustive_policy` — the two policies must agree
+    on when a round-1 restart is happening.
+    """
+    if is_round_1_of_generation:
+        # New generation → round counter restarts at 1, regardless of
+        # the prior state's counter. Never lands in post-cap on the
+        # first round of a fresh generation.
+        current_round: int = 1
+    else:
+        # +1 because this run IS a round in the current generation; if
+        # prior_state.round_in_generation == max_rounds, THIS run is the
+        # first one past the cap. `prior_state is None` is impossible
+        # here (would have set is_round_1_of_generation=True upstream)
+        # but keep the defensive guard so a future refactor can't
+        # silently reintroduce a NoneType access.
+        current_round = (
+            1 if prior_state is None else prior_state.round_in_generation + 1
+        )
+    if max_rounds > 0 and current_round > max_rounds:
+        critical_only: list[Finding] = [
+            f for f in findings if f.severity == SEVERITY_CRITICAL
+        ]
+        silenced: list[SilencedFinding] = [
+            SilencedFinding(
+                finding=f,
+                reason=(
+                    f"round cap ({max_rounds}) reached; non-critical "
+                    "suppressed"
+                ),
+            )
+            for f in findings
+            if f.severity != SEVERITY_CRITICAL
+        ]
+        return PolicyResult(
+            findings_to_surface=critical_only,
+            findings_silenced=silenced,
+            effective_max_inline_comments=base_max_inline_comments,
+            prompt_addendum="",
+            policy_applied=IAR_POLICY_ROUND_CAPPED_POST_CAP,
+        )
+    iterative_result: PolicyResult = apply_iterative_policy(
+        findings=findings,
+        prior_state=prior_state,
+        code_contexts=code_contexts,
+        base_max_inline_comments=base_max_inline_comments,
+    )
+    return PolicyResult(
+        findings_to_surface=iterative_result.findings_to_surface,
+        findings_silenced=iterative_result.findings_silenced,
+        effective_max_inline_comments=iterative_result.effective_max_inline_comments,
+        prompt_addendum="",
+        policy_applied=IAR_POLICY_ROUND_CAPPED_PRE_CAP,
+    )
+
+
+def apply_critical_gate_policy(
+    *,
+    findings: list[Finding],
+    prior_state: IterationState | None,
+    code_contexts: dict[str, "CodeContext | None"],
+    base_max_inline_comments: int,
+) -> PolicyResult:
+    """Strict cross-generation dedup. Same as `iterative` for the
+    open-fingerprints path, but also silences findings whose fingerprint
+    matches `prior_state.resolved_fingerprints` (treating resolved
+    status as permanent across generations).
+
+    Critical severity findings still surface unconditionally via the
+    hardcoded safety rail in `dedupe_findings_against_prior`.
+    """
+    dedup: DedupResult = dedupe_findings_against_prior(
+        new_findings=findings,
+        prior_state=prior_state,
+        code_contexts=code_contexts,
+        strict_cross_gen=True,
+    )
+    return PolicyResult(
+        findings_to_surface=list(dedup.surfaced),
+        findings_silenced=list(dedup.silenced),
+        effective_max_inline_comments=base_max_inline_comments,
+        prompt_addendum="",
+        policy_applied=IAR_POLICY_CRITICAL_GATE,
+    )
+
+
+def should_force_exhaustive_via_safety_net(
+    *,
+    transition: GenerationTransition,
+    new_lines_pct: float,
+    threshold_pct: int = IAR_SAFETY_NET_NEW_LINES_PCT,
+) -> bool:
+    """Returns True when the current run represents a NEW_COMMITS or
+    REBASED transition AND the generation change brought at least
+    `threshold_pct` new lines relative to the total diff.
+
+    When True, the dispatcher overrides the configured policy back to
+    `first-pass-exhaustive` for this run's round-1 pass — protecting
+    against the "PR grew significantly; critical findings in new code
+    might otherwise get silenced" scenario. Safety net never fires on
+    SAME_GENERATION or FIRST_REVIEW.
+    """
+    if transition not in (
+        GenerationTransition.NEW_COMMITS,
+        GenerationTransition.REBASED,
+    ):
+        return False
+    return new_lines_pct >= float(threshold_pct)
+
+
+def compute_new_lines_pct(
+    *,
+    prior_base_sha: str,
+    prior_head_sha: str,
+    current_base_sha: str,
+    current_head_sha: str,
+    repo_root: str | None = None,
+) -> float:
+    """Estimate the percentage of net-new lines introduced by the
+    current generation vs the prior one.
+
+    Formula: `new_added / max(total_current, 1) * 100`, where
+    `total_current = added + removed` across all files in the
+    three-dot diff `current_base_sha...current_head_sha` (matching
+    the PR-visible diff pinned to the merge base — see
+    docs/ITERATION_AWARENESS.md § 4.3 for why three-dot), and
+    `new_added` counts only lines added since `prior_head..current_head`
+    (net new — this one is two-dot on purpose because both SHAs are
+    head SHAs on the same branch, no merge-base semantics apply).
+
+    Best-effort: returns `0.0` on any git subprocess failure so the
+    safety net defaults to "no override" rather than crashing the run.
+    """
+    if not current_base_sha or not current_head_sha:
+        return 0.0
+    try:
+        total_stat: subprocess.CompletedProcess[str] = subprocess.run(
+            [
+                "git", "diff", "--numstat",
+                # Three-dot: same convention as compute_generation_range_hash
+                # and fetch_pr_context — pins the diff to the merge base
+                # so upstream base-branch movement doesn't inflate the
+                # denominator (see docs/ITERATION_AWARENESS.md § 4.3).
+                f"{current_base_sha}...{current_head_sha}",
+            ],
+            capture_output=True,
+            check=True,
+            text=True,
+            cwd=repo_root,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return 0.0
+    total_added: int = 0
+    total_removed: int = 0
+    for line in total_stat.stdout.splitlines():
+        parts: list[str] = line.split("\t")
+        if len(parts) < 2:
+            continue
+        try:
+            total_added += int(parts[0]) if parts[0] != "-" else 0
+            total_removed += int(parts[1]) if parts[1] != "-" else 0
+        except ValueError:
+            continue
+    total: int = total_added + total_removed
+    if total <= 0:
+        return 0.0
+    # Net-new since the prior run — only relevant when we have a prior
+    # head to diff against. Fall back to the whole current diff when we
+    # don't (first review; the safety net won't fire anyway because the
+    # transition will be FIRST_REVIEW).
+    if not prior_head_sha:
+        return 0.0
+    try:
+        new_stat: subprocess.CompletedProcess[str] = subprocess.run(
+            [
+                "git", "diff", "--numstat",
+                f"{prior_head_sha}..{current_head_sha}",
+            ],
+            capture_output=True,
+            check=True,
+            text=True,
+            cwd=repo_root,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return 0.0
+    new_added: int = 0
+    for line in new_stat.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        try:
+            new_added += int(parts[0]) if parts[0] != "-" else 0
+        except ValueError:
+            continue
+    return (new_added / float(total)) * 100.0
+
+
+def _labels_contain_ci(*, needle: str, haystack: list[str]) -> bool:
+    """Case-insensitive, whitespace-trimmed label membership check.
+
+    GitHub labels preserve the case they were created with but the
+    reviewer's public contract (like `label-gate`) treats them
+    case-insensitively — see `resolve_trigger_action` (`gating on
+    exact case is a foot-gun`). This helper centralises the same
+    normalisation for the three OTHER label comparisons that
+    influence review behaviour: `iteration-escape-label`,
+    `skip-review-label`, and the reviewed-label-based
+    USER_FORCED_RESET / `compute_reviewed_label_applied` path.
+
+    Consistency here matters most for USER_FORCED_RESET: a casing
+    mismatch between the configured `applied-label` and the label
+    GitHub returns on the PR would look identical to "reviewed
+    label deliberately removed" and silently wipe fingerprint
+    memory on the next run — the opposite of what the developer
+    intended (round-8 F3).
+    """
+    needle_norm: str = needle.strip().lower()
+    if not needle_norm:
+        return False
+    return any(lbl.strip().lower() == needle_norm for lbl in haystack)
+
+
+def detect_skip_label_collisions(
+    *,
+    skip_review_label: str,
+    label_gate: str,
+    applied_label: str,
+    iteration_escape_label: str,
+) -> list[str]:
+    """Return a list of human-readable collision descriptions when
+    `skip-review-label` matches any of the runtime's other semantic
+    labels. Empty list means safe to proceed. Used by `main()` to
+    fail loudly on misconfiguration before the reviewer runs, rather
+    than silently converting every trigger into a skip.
+
+    The three collision cases:
+      - **label-gate:** the label that gates whether the reviewer
+        runs at all. If `skip-review-label == label-gate`, then
+        applying the gate label to request a review IMMEDIATELY
+        cancels the request. Every gated review silently skips.
+      - **applied-label:** the label stamped by the reviewer on
+        successful completion. If `skip-review-label == applied-
+        label`, then the first successful review arms the skip on
+        every subsequent trigger — state freezes at round 1
+        forever, IAR never advances, no new findings ever surface.
+      - **iteration-escape-label:** the "force a full un-deduped
+        review" gesture. If `skip-review-label == escape-label`,
+        the developer's request for a thorough re-review is
+        silently converted into a skip — the exact opposite of
+        the requested behaviour.
+
+    Empty strings for `label-gate` / `applied-label` are ignored
+    (means "not configured"). The escape label always has a value
+    (`IAR_DEFAULT_ESCAPE_LABEL` if unset) so it is always checked.
+    All comparisons are case-insensitive to match `_labels_contain_ci`
+    semantics at the runtime check sites.
+    """
+    skip_norm: str = skip_review_label.strip().lower()
+    if not skip_norm:
+        return []
+    collisions: list[str] = []
+    if label_gate and skip_norm == label_gate.strip().lower():
+        collisions.append(f"label-gate ({label_gate!r})")
+    if applied_label and skip_norm == applied_label.strip().lower():
+        collisions.append(f"applied-label ({applied_label!r})")
+    escape_norm: str = iteration_escape_label.strip().lower()
+    if escape_norm and skip_norm == escape_norm:
+        collisions.append(
+            f"iteration-escape-label ({iteration_escape_label!r})"
+        )
+    return collisions
+
+
+def check_escape_label(
+    *, pr_labels: list[str], escape_label: str
+) -> bool:
+    """Returns True when a human has applied the escape label to the
+    PR. When True, the dispatcher short-circuits dedup for THIS run
+    only — persisted state is NOT mutated so subsequent normal runs
+    resume from where they left off. Removing the label restores
+    normal IAR behavior. Match is case-insensitive (see
+    `_labels_contain_ci`)."""
+    return _labels_contain_ci(needle=escape_label, haystack=pr_labels)
+
+
+def dispatch_policy(
+    *,
+    iar_config: IARConfig,
+    findings: list[Finding],
+    prior_state: IterationState | None,
+    code_contexts: dict[str, "CodeContext | None"],
+    base_max_inline_comments: int,
+    transition: GenerationTransition,
+    new_lines_pct: float,
+    pr_labels: list[str],
+) -> PolicyResult:
+    """Top-level IAR policy dispatch. Order of precedence (highest → lowest):
+
+    1. USER_FORCED_RESET transition → falls through to normal policy
+       dispatch with the reset already applied upstream (prior_state
+       has been cleared to None by `run_iar_pre_llm`). The reset is
+       the stronger of the two exhaustive-triggering gestures — it
+       DISCARDS state, whereas the escape label only bypasses dedup
+       for one run with state preserved. When a user applies BOTH
+       gestures the intent is "start clean," so we defer to the
+       reset semantics and skip the escape-label short-circuit
+       (docs/ITERATION_AWARENESS.md § 8.5 precedence).
+    2. Escape label short-circuit → surface all findings; no dedup;
+       NO state mutation for this run.
+    3. Safety net (>= 30% new lines on NEW_COMMITS or REBASED) → force
+       `first-pass-exhaustive` for this round regardless of configured
+       policy.
+    4. Configured `iar_config.policy` → one of iterative,
+       first-pass-exhaustive, round-capped, critical-gate.
+    5. Unknown policy (should be unreachable — `build_iar_config`
+       already falls back) → iterative + warning log.
+    """
+    if transition != GenerationTransition.USER_FORCED_RESET and check_escape_label(
+        pr_labels=pr_labels, escape_label=iar_config.escape_label
+    ):
+        log(
+            f"IAR: escape label {iar_config.escape_label!r} detected — "
+            "bypassing dedup for this run only. Persisted state unchanged."
+        )
+        return PolicyResult(
+            findings_to_surface=list(findings),
+            findings_silenced=[],
+            effective_max_inline_comments=base_max_inline_comments,
+            prompt_addendum="",
+            policy_applied=IAR_POLICY_ESCAPE_LABEL_FORCED,
+        )
+    is_round_1_of_generation: bool = (
+        prior_state is None
+        or transition != GenerationTransition.SAME_GENERATION
+    )
+    if should_force_exhaustive_via_safety_net(
+        transition=transition, new_lines_pct=new_lines_pct
+    ):
+        log(
+            f"IAR: safety net triggered ({new_lines_pct:.1f}% new lines "
+            f">= {IAR_SAFETY_NET_NEW_LINES_PCT}% threshold on "
+            f"{transition.value}) — forcing "
+            f"{IAR_POLICY_FIRST_PASS_EXHAUSTIVE}."
+        )
+        result: PolicyResult = apply_first_pass_exhaustive_policy(
+            findings=findings,
+            prior_state=prior_state,
+            code_contexts=code_contexts,
+            base_max_inline_comments=base_max_inline_comments,
+            cap_multiplier=iar_config.cap_multiplier,
+            is_round_1_of_generation=True,
+        )
+        return PolicyResult(
+            findings_to_surface=result.findings_to_surface,
+            findings_silenced=result.findings_silenced,
+            effective_max_inline_comments=result.effective_max_inline_comments,
+            prompt_addendum=result.prompt_addendum,
+            policy_applied=IAR_POLICY_SAFETY_NET_FORCED,
+        )
+    if iar_config.policy == IAR_POLICY_ITERATIVE:
+        return apply_iterative_policy(
+            findings=findings,
+            prior_state=prior_state,
+            code_contexts=code_contexts,
+            base_max_inline_comments=base_max_inline_comments,
+        )
+    if iar_config.policy == IAR_POLICY_FIRST_PASS_EXHAUSTIVE:
+        return apply_first_pass_exhaustive_policy(
+            findings=findings,
+            prior_state=prior_state,
+            code_contexts=code_contexts,
+            base_max_inline_comments=base_max_inline_comments,
+            cap_multiplier=iar_config.cap_multiplier,
+            is_round_1_of_generation=is_round_1_of_generation,
+        )
+    if iar_config.policy == IAR_POLICY_ROUND_CAPPED:
+        return apply_round_capped_policy(
+            findings=findings,
+            prior_state=prior_state,
+            code_contexts=code_contexts,
+            base_max_inline_comments=base_max_inline_comments,
+            max_rounds=iar_config.max_review_rounds,
+            is_round_1_of_generation=is_round_1_of_generation,
+        )
+    if iar_config.policy == IAR_POLICY_CRITICAL_GATE:
+        return apply_critical_gate_policy(
+            findings=findings,
+            prior_state=prior_state,
+            code_contexts=code_contexts,
+            base_max_inline_comments=base_max_inline_comments,
+        )
+    log(
+        f"IAR: unreachable — unknown convergence-policy "
+        f"{iar_config.policy!r}; falling back to iterative."
+    )
+    return apply_iterative_policy(
+        findings=findings,
+        prior_state=prior_state,
+        code_contexts=code_contexts,
+        base_max_inline_comments=base_max_inline_comments,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Iteration-Aware Review (IAR) — observability + main() integration (Task 8)
+# ---------------------------------------------------------------------------
+# Wires the engine (Tasks 1–7) into the reviewer's `main()`. Two touchpoints:
+#
+#   1. Pre-LLM: `run_iar_pre_llm()` reads prior state, computes the
+#      generation transition, calls `dispatch_policy` with empty findings
+#      to extract `effective_max_inline_comments` + `prompt_addendum`, and
+#      returns a bundle the caller uses to shape the LLM call.
+#
+#   2. Post-LLM: `run_iar_post_llm()` re-runs `dispatch_policy` with the
+#      LLM's actual findings to get the surfacing decision, mutates
+#      `result.findings` in place, and returns the new IterationState to
+#      embed in the tracking marker + telemetry to write to outputs.
+#
+# Both touchpoints are wrapped in `try/except` at the `main()` call site
+# (see `tests/test_iar_failure_fallback.py` for the safety contract). On
+# any IAR failure the reviewer logs the exception, leaves the 5 IAR
+# outputs as empty strings (populated by `write_iar_outputs_empty()`),
+# and falls through to the baseline review path — the CI check still
+# gets a review, IAR just skips that run.
+#
+# `tokens_used` is a best-effort field. Populating it accurately requires
+# per-provider instrumentation (Anthropic's `usage.input_tokens`/`output_tokens`,
+# OpenAI's `usage.prompt_tokens`/`completion_tokens`, etc.), which is out of
+# scope for Task 8 — the field ships as `0` for now with the schema pinned
+# so a future provider-hook PR can populate it without changing the
+# public output contract. `wall_clock_ms` is always populated (monotonic).
+
+
+@dataclass
+class RunTelemetry:
+    """Mutable telemetry populated across a single run. Consumed by the
+    IAR post-LLM step to write action outputs and the `history` entry.
+
+    - `start_time_monotonic`: seconds from `time.monotonic()` at run start.
+      `wall_clock_ms` is computed at write-time so the caller doesn't have
+      to remember to call `.finalize()`.
+    - `tokens_used`: best-effort token estimate. See module comment.
+    - `estimated_baseline_tokens`: what the LLM would have consumed WITHOUT
+      IAR (i.e. with the baseline `max_inline_comments` cap and no prompt
+      addendum). Used to compute the cost-vs-baseline output.
+    """
+
+    start_time_monotonic: float = 0.0
+    tokens_used: int = 0
+    estimated_baseline_tokens: int = 0
+
+    def wall_clock_ms(self) -> int:
+        """Elapsed wall-clock ms since `start_time_monotonic` was set."""
+        if not self.start_time_monotonic:
+            return 0
+        return int((time.monotonic() - self.start_time_monotonic) * 1000)
+
+
+@dataclass(frozen=True)
+class IARPreLLMContext:
+    """Bundle returned by `run_iar_pre_llm()`. Carries everything the
+    caller needs to (a) shape the LLM call and (b) hand back to
+    `run_iar_post_llm()` for the surfacing decision.
+
+    `pre_policy_result` is produced by `dispatch_policy` with
+    `findings=[]` so its `findings_to_surface`/`findings_silenced` are
+    always empty; only `effective_max_inline_comments`, `prompt_addendum`,
+    and `policy_applied` are meaningful at this stage.
+    """
+
+    prior_state: IterationState | None
+    transition: GenerationTransition
+    base_sha: str
+    head_sha: str
+    range_hash: str
+    new_lines_pct: float
+    pr_labels: list[str]
+    pre_policy_result: PolicyResult
+
+
+def _resolve_base_sha(*, base_ref: str, repo_root: str | None = None) -> str:
+    """Best-effort `git rev-parse origin/<base_ref>`. Returns empty
+    string on any failure (missing remote, unresolved ref, sparse
+    checkout). Empty base_sha degrades `detect_generation_change` to
+    NEW_COMMITS on any hash mismatch — safe conservative fallback."""
+    if not base_ref:
+        return ""
+    for ref_candidate in (f"origin/{base_ref}", base_ref):
+        try:
+            result: subprocess.CompletedProcess[str] = subprocess.run(
+                ["git", "rev-parse", ref_candidate],
+                capture_output=True,
+                check=True,
+                text=True,
+                cwd=repo_root,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            continue
+        sha: str = result.stdout.strip()
+        if sha:
+            return sha
+    log(
+        f"IAR: could not resolve base SHA for ref {base_ref!r} "
+        "(tried origin/<ref> and <ref>). Range hash + rebase detection "
+        "will fall back to conservative defaults."
+    )
+    return ""
+
+
+def _fetch_pr_labels(
+    *, token: str, repo: str, pr_number: int
+) -> tuple[list[str], bool]:
+    """Fetch PR labels via REST. Returns `(labels, ok)`:
+      - `(labels, True)` — API call succeeded; `labels` is the
+        authoritative list (possibly empty because the PR has no
+        labels).
+      - `([], False)` — API call failed; `labels` is empty as a
+        conservative default and `ok=False` warns the caller not
+        to distinguish "no labels" from "unknown".
+
+    The `ok` bit is load-bearing for anywhere that would take an
+    IRREVERSIBLE action on the "label absent" branch — most notably
+    USER_FORCED_RESET, which wipes IAR dedup memory + resets the
+    generation counter (round-14 F1). Without the bit, a transient
+    GitHub 5xx during label fetch would look identical to "user
+    deliberately removed the reviewed label" and silently wipe
+    dedup state on the next run — the exact "infinite loop" symptom
+    IAR is designed to prevent.
+
+    Escape-label detection is a REVERSIBLE side-effect (skip dedup
+    for THIS run only) so it can safely treat `ok=False` as "escape
+    label not applied" — the next successful fetch restores the
+    proper behaviour. USER_FORCED_RESET cannot degrade the same
+    way: once state is wiped, the marker no longer records it,
+    and the fingerprint memory is unrecoverable.
+    """
+    if "/" not in repo or pr_number <= 0:
+        return [], False
+    owner: str
+    name: str
+    owner, name = repo.split("/", 1)
+    try:
+        pr: Any = gh_request(
+            "GET", f"/repos/{owner}/{name}/pulls/{pr_number}", token=token
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort GH API call:
+        # transient network / rate-limit / 5xx failures are expected;
+        # we return `ok=False` so callers can distinguish "PR has no
+        # labels" from "we don't know if it has labels" — see
+        # docstring for why that distinction is load-bearing.
+        log(f"IAR: _fetch_pr_labels failed: {exc!r}. Returning empty list.")
+        return [], False
+    raw: list[dict[str, Any]] = pr.get("labels", []) or []
+    labels: list[str] = [
+        str(lbl.get("name") or "") for lbl in raw if lbl.get("name")
+    ]
+    return labels, True
+
+
+def _load_code_contexts_for_findings(
+    *, findings: list[Finding], review_sha: str
+) -> dict[str, "CodeContext | None"]:
+    """Load one CodeContext per unique file path. Missing / read-error
+    files map to `None` — `finding_fingerprint` handles that by falling
+    back to a context-less hash (still deterministic; just less resilient
+    to nearby refactors)."""
+    unique_paths: set[str] = {f.path for f in findings if f.path}
+    contexts: dict[str, "CodeContext | None"] = {}
+    for path in unique_paths:
+        contexts[path] = load_code_context(path=path, review_sha=review_sha)
+    return contexts
+
+
+def _estimate_cost_vs_baseline(
+    *,
+    effective_cap: int,
+    base_cap: int,
+    prompt_addendum: str,
+    silenced_count: int,
+    surfaced_count: int,
+) -> str:
+    """Return a short human-readable cost-vs-baseline estimate string
+    (e.g. `"+25%"`, `"0%"`). Best-effort heuristic — the true number
+    requires per-provider token accounting.
+
+    Today's function only models two effects:
+    - Cap expansion (`effective_cap / base_cap - 1`) increases LLM
+      generation cost roughly proportionally (more tool calls, more
+      output tokens per call).
+    - Prompt addendum adds a small fixed overhead per turn (~5%).
+
+    Both effects are non-negative, so the returned string is always
+    `"0%"` (baseline path — iterative / round-capped / cap not raised)
+    or `"+N%"` (round 1 of `first-pass-exhaustive` or safety net
+    override raising the cap). Silenced findings are a NET SAVE on
+    the submission side (fewer GitHub API calls, less user noise) but
+    do NOT affect LLM cost and are NOT modelled here — see
+    `docs/ITERATION_AWARENESS.md § 13.3` for the follow-up plan to
+    extend this to a `"-N%"` / `"unknown"` heuristic. Downstream
+    consumers today MUST NOT gate CI on `== '-N%'`; the condition
+    will never fire under the current implementation.
+
+    `silenced_count` and `surfaced_count` are accepted but not yet
+    consumed — the signature is stable so the future silence-savings
+    extension does not force a call-site sweep.
+
+    Returned string is safe to embed in a workflow log or output.
+    Never raises; unknown inputs collapse to `"0%"`.
+    """
+    if base_cap <= 0:
+        return "0%"
+    cap_delta: float = (effective_cap / base_cap) - 1.0
+    addendum_delta: float = 0.05 if prompt_addendum else 0.0
+    total_delta: float = cap_delta + addendum_delta
+    pct: int = int(round(total_delta * 100))
+    sign: str = "+" if pct > 0 else ""
+    return f"{sign}{pct}%"
+
+
+def compute_reviewed_label_applied(
+    *,
+    applied_label: str,
+    label_stamped: bool,
+    current_labels: list[str],
+    prior_state: "IterationState | None",
+) -> bool:
+    """Compute the `reviewed_label_applied` bit that gets embedded in
+    the outgoing IAR state block at the end of a run.
+
+    This is the arming signal for USER_FORCED_RESET on the NEXT run
+    (docs/ITERATION_AWARENESS.md § 8.5): the reset gesture only fires
+    when the prior state's `reviewed_label_applied` was `True` AND the
+    label is now absent from the PR. So this function's job is to
+    answer: "is the reviewed label (going to be) on the PR at the end
+    of this run — such that its removal on a future run means the
+    developer deliberately took it off?"
+
+    Returns `True` if ANY of:
+      1. `label_stamped` — this run's `gh_apply_label` call succeeded.
+      2. `_labels_contain_ci(current_labels, applied_label)` — the
+         label was already on the PR at trigger time (a prior run
+         stamped it; this run may be a blocked follow-up or a no-op
+         re-trigger, but the label is still present). Uses the
+         same case-insensitive helper as `label-gate`, the
+         escape-label check, and the skip-review-label check, so
+         a casing mismatch between the configured `applied-label`
+         and the GitHub-returned name can never falsely clear the
+         arming bit and wrongly disarm a legitimate reset gesture.
+      3. `prior_state.reviewed_label_applied is True` — the previous
+         run's marker recorded a successful stamp AND this run took
+         a path (blocked, escape-label, etc.) that does not remove
+         the label. Preserving the prior bit here prevents a blocked
+         follow-up from silently clearing the arming signal for a
+         later legitimate reset gesture.
+
+    Returns `False` only when NONE of these hold — the reviewer has
+    never successfully stamped the label AND it is not currently on
+    the PR AND prior state does not record a successful stamp. In
+    that case there is nothing meaningful to "reset from" and
+    USER_FORCED_RESET on the next run correctly no-ops.
+
+    Also returns `False` when `applied_label` is empty (consumer opted
+    out of the reviewed-label workflow entirely).
+    """
+    if not applied_label:
+        return False
+    prior_bit: bool = (
+        prior_state is not None and prior_state.reviewed_label_applied
+    )
+    label_currently_on_pr: bool = _labels_contain_ci(
+        needle=applied_label, haystack=current_labels
+    )
+    return label_stamped or label_currently_on_pr or prior_bit
+
+
+def _render_iar_marker_annotation(
+    *,
+    state: IterationState,
+    policy_result: PolicyResult,
+    transition: GenerationTransition,
+) -> str:
+    """Short human-readable line appended to the tracking marker body so a
+    developer glancing at the comment sees the iteration status without
+    having to inspect the embedded JSON state block. Kept to one line +
+    optional detail line so the marker stays scannable."""
+    surfaced: int = len(policy_result.findings_to_surface)
+    silenced: int = len(policy_result.findings_silenced)
+    critical_silenced: int = sum(
+        1 for sf in policy_result.findings_silenced
+        if sf.finding.severity == SEVERITY_CRITICAL
+    )
+    # This should always be 0 — the safety rail guarantees it. Log if
+    # not, and expose the count as a visible red flag in the marker.
+    critical_note: str = ""
+    if critical_silenced > 0:
+        critical_note = (
+            f" ⚠️ **{critical_silenced} critical finding(s) silenced — "
+            "this violates the IAR safety rail; please file a bug.**"
+        )
+    detail: str = ""
+    if silenced > 0:
+        detail = f", {silenced} deduplicated from prior rounds"
+    return (
+        f"\n\n_Iteration-Aware Review: gen {state.generation}, "
+        f"round {state.round_in_generation}, "
+        f"policy=`{policy_result.policy_applied}` "
+        f"({transition.value}) — {surfaced} surfaced{detail}._"
+        f"{critical_note}"
+    )
+
+
+def write_iar_outputs_populated(
+    *,
+    state: IterationState,
+    policy_result: PolicyResult,
+    telemetry: RunTelemetry,
+    effective_cap: int,
+    base_cap: int,
+) -> None:
+    """Overwrite the five IAR action outputs with real values. Called
+    after `write_all_outputs` (which writes empty strings) so the
+    last-write-wins semantics of `$GITHUB_OUTPUT` land the populated
+    values on the downstream step.
+    """
+    write_action_output("iteration-round", str(state.round_in_generation))
+    write_action_output("iteration-generation", str(state.generation))
+    # Same rule as _render_iar_marker_annotation (see round-7 fix):
+    # emit the current run's `policy_result.policy_applied`, NOT the
+    # preserved-state's `state.policy_applied`. On an escape-label run
+    # `run_iar_post_llm` returns the prior state unchanged (contract:
+    # no mutation) while `policy_result.policy_applied` carries the
+    # override (`escape-label-forced-full-review` or a `safety-net-*`
+    # variant). Consumers keying downstream steps on this output MUST
+    # see the current run's actual effective policy, or they will
+    # miss escape / safety-net firings entirely.
+    write_action_output(
+        "iteration-policy-applied", policy_result.policy_applied
+    )
+    write_action_output("iteration-tokens-used", str(telemetry.tokens_used))
+    write_action_output(
+        "iteration-cost-vs-baseline-estimate",
+        _estimate_cost_vs_baseline(
+            effective_cap=effective_cap,
+            base_cap=base_cap,
+            prompt_addendum=policy_result.prompt_addendum,
+            silenced_count=len(policy_result.findings_silenced),
+            surfaced_count=len(policy_result.findings_to_surface),
+        ),
+    )
+
+
+def run_iar_pre_llm(
+    *,
+    iar_config: IARConfig,
+    repo: str,
+    pr_number: int,
+    gh_token: str,
+    base_ref: str,
+    head_sha: str,
+    base_max_inline_comments: int,
+    applied_label: str = "",
+    provider_id: str = "",
+    bot_login: str = "",
+) -> IARPreLLMContext:
+    """Prepare IAR context BEFORE the LLM call.
+
+    Computes prior state, detects generation transition, loads PR labels
+    for escape-label check, computes new-lines-pct for safety net, and
+    runs `dispatch_policy` with an empty findings list to extract the
+    prompt addendum + effective cap the caller will use to shape the
+    LLM call.
+
+    User-forced reset: fires when ALL FIVE conditions hold — (a)
+    `applied_label` (the consumer's "reviewed" label — the one the
+    action stamps on a successful review) is configured, (b) prior IAR
+    state exists in the tracking marker, (c) the prior state records
+    that the reviewer had previously stamped that label
+    (`prior_state.reviewed_label_applied is True`), (d) the PR-labels
+    fetch succeeded (`label_fetch_ok is True` — a transient GitHub
+    5xx returning an empty list CANNOT be misread as "label absent"
+    or the reset gesture would falsely fire and wipe fingerprint
+    memory), and (e) that label is absent from the returned list.
+    Downstream this behaves identically to `FIRST_REVIEW`: prior
+    state is discarded, dedup memory is wiped, round-1 exhaustive
+    fires under the default policy. The only reason the transition
+    is a distinct enum value is so the log + marker annotation can
+    tell developers the reset was a deliberate gesture (they removed
+    the reviewed label before re-triggering) rather than a first-ever
+    review of the PR.
+
+    Condition (c) is load-bearing: without it, any blocked review
+    (`block-on-critical` fired, so the label was never stamped)
+    followed by the natural re-trigger would look identical to a
+    deliberate reset and wipe fingerprint memory. Condition (d)
+    (round-14 F1) is load-bearing for the same reason: transient
+    API failures cannot silently look like a reset gesture. See
+    `docs/ITERATION_AWARENESS.md` § 8.5 for the full contract.
+
+    Caller SHOULD wrap this in `try/except` — the function does full
+    GH API + git work and any failure should degrade to the baseline
+    review path (IAR outputs stay empty, review still ships).
+    """
+    prior_state: IterationState | None = read_prior_iteration_state(
+        repo=repo,
+        pr_number=pr_number,
+        token=gh_token,
+        provider_id=provider_id,
+        bot_login=bot_login,
+    )
+    base_sha: str = _resolve_base_sha(base_ref=base_ref)
+    range_hash: str = compute_generation_range_hash(
+        base_sha=base_sha, head_sha=head_sha
+    )
+    transition: GenerationTransition = detect_generation_change(
+        prior_state=prior_state,
+        current_range_hash=range_hash,
+        current_base_sha=base_sha,
+    )
+    new_lines_pct: float = 0.0
+    if transition in (
+        GenerationTransition.NEW_COMMITS,
+        GenerationTransition.REBASED,
+    ) and prior_state is not None:
+        new_lines_pct = compute_new_lines_pct(
+            prior_base_sha=prior_state.base_sha,
+            prior_head_sha=prior_state.head_sha,
+            current_base_sha=base_sha,
+            current_head_sha=head_sha,
+        )
+    pr_labels: list[str]
+    label_fetch_ok: bool
+    pr_labels, label_fetch_ok = _fetch_pr_labels(
+        token=gh_token, repo=repo, pr_number=pr_number
+    )
+    # User-forced reset detection — see docstring. Overrides both
+    # `transition` and `prior_state` so every downstream code path
+    # (dedup, dispatch, advance_generation, safety-net) behaves as if
+    # this were a first review. Fires only when the FIVE conditions in
+    # the docstring all hold — the `reviewed_label_applied` guard is
+    # the safety net that stops any blocked review's natural re-trigger
+    # from being misclassified as a deliberate reset. The
+    # `label_fetch_ok` guard (round-14 F1) prevents a transient GitHub
+    # 5xx from silently wiping fingerprint memory — we can only trust
+    # "reviewed label absent" when the API said it's absent, not when
+    # we couldn't ask.
+    if (
+        applied_label
+        and prior_state is not None
+        and prior_state.reviewed_label_applied
+        and label_fetch_ok
+        and not _labels_contain_ci(
+            needle=applied_label, haystack=pr_labels
+        )
+    ):
+        log(
+            f"IAR: user-forced reset detected — reviewed label "
+            f"{applied_label!r} previously stamped (recorded in prior "
+            f"state) but now absent from PR (prior gen="
+            f"{prior_state.generation}, "
+            f"round={prior_state.round_in_generation}). Treating this "
+            "run as USER_FORCED_RESET: dedup memory wiped, generation "
+            "counter reset to 1, round-1 exhaustive fires under the "
+            "default policy."
+        )
+        transition = GenerationTransition.USER_FORCED_RESET
+        prior_state = None
+        new_lines_pct = 0.0
+    # Dispatch with empty findings — extracts cap + addendum only.
+    pre_policy_result: PolicyResult = dispatch_policy(
+        iar_config=iar_config,
+        findings=[],
+        prior_state=prior_state,
+        code_contexts={},
+        base_max_inline_comments=base_max_inline_comments,
+        transition=transition,
+        new_lines_pct=new_lines_pct,
+        pr_labels=pr_labels,
+    )
+    log(
+        f"IAR pre-LLM: transition={transition.value}, "
+        f"gen={prior_state.generation if prior_state else 0}, "
+        f"prior_round={prior_state.round_in_generation if prior_state else 0}, "
+        f"policy={pre_policy_result.policy_applied}, "
+        f"effective_cap={pre_policy_result.effective_max_inline_comments} "
+        f"(base={base_max_inline_comments}), "
+        f"prompt_addendum={'yes' if pre_policy_result.prompt_addendum else 'no'}, "
+        f"new_lines_pct={new_lines_pct:.1f}%."
+    )
+    return IARPreLLMContext(
+        prior_state=prior_state,
+        transition=transition,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        range_hash=range_hash,
+        new_lines_pct=new_lines_pct,
+        pr_labels=pr_labels,
+        pre_policy_result=pre_policy_result,
+    )
+
+
+def run_iar_post_llm(
+    *,
+    iar_config: IARConfig,
+    pre_context: IARPreLLMContext,
+    result: ReviewResult,
+    base_max_inline_comments: int,
+    telemetry: RunTelemetry,
+) -> tuple[IterationState, PolicyResult]:
+    """Apply IAR filtering AFTER the LLM call and return the state to
+    embed + the surfacing decision.
+
+    Side effects:
+    - Mutates `result.findings` in place to the surfaced subset.
+    - Recomputes `result.overall_severity` if any findings were dropped.
+
+    Escape-label runs return the prior state unchanged (Task 7 contract:
+    persisted state is NOT mutated for escape-label runs so the next
+    normal run resumes where it left off). Everything else advances or
+    increments the state and populates telemetry.
+    """
+    # Load code contexts only for finding paths — one git-show per unique
+    # file; a warmup penalty scoped to the number of findings, not the
+    # size of the diff.
+    code_contexts: dict[str, "CodeContext | None"] = (
+        _load_code_contexts_for_findings(
+            findings=result.findings, review_sha=pre_context.head_sha
+        )
+    )
+    policy_result: PolicyResult = dispatch_policy(
+        iar_config=iar_config,
+        findings=result.findings,
+        prior_state=pre_context.prior_state,
+        code_contexts=code_contexts,
+        base_max_inline_comments=base_max_inline_comments,
+        transition=pre_context.transition,
+        new_lines_pct=pre_context.new_lines_pct,
+        pr_labels=pre_context.pr_labels,
+    )
+    original_finding_count: int = len(result.findings)
+    result.findings = list(policy_result.findings_to_surface)
+    # Recompute severity when the filter dropped findings — the strictness
+    # gate downstream reads `overall_severity`, so a silenced warning
+    # would otherwise still block the check.
+    if len(result.findings) != original_finding_count:
+        result.overall_severity = overall_severity(
+            [f.severity for f in result.findings]
+        )
+    # Escape-label short-circuit: preserve prior state exactly, no
+    # mutations. This is the contract from Task 7 — persisted state must
+    # survive an escape-label run so the next normal run resumes the
+    # dedup timeline as if the escape never happened.
+    if policy_result.policy_applied == IAR_POLICY_ESCAPE_LABEL_FORCED:
+        log(
+            "IAR post-LLM: escape-label run — persisted state unchanged. "
+            f"Surfaced {len(policy_result.findings_to_surface)} "
+            f"(silenced {len(policy_result.findings_silenced)})."
+        )
+        return (
+            pre_context.prior_state
+            or new_iteration_state(
+                generation_range_hash=pre_context.range_hash,
+                base_sha=pre_context.base_sha,
+                head_sha=pre_context.head_sha,
+                policy_applied=policy_result.policy_applied,
+            ),
+            policy_result,
+        )
+    # Compute the state for the NEXT round based on transition.
+    state_before_fp_update: IterationState
+    if pre_context.transition == GenerationTransition.SAME_GENERATION:
+        assert pre_context.prior_state is not None  # transition guarantees it
+        state_before_fp_update = increment_round_in_generation(
+            prior_state=pre_context.prior_state,
+            policy=policy_result.policy_applied,
+            new_head_sha=pre_context.head_sha,
+        )
+    else:
+        state_before_fp_update = advance_generation(
+            prior_state=pre_context.prior_state,
+            transition=pre_context.transition,
+            new_range_hash=pre_context.range_hash,
+            new_base_sha=pre_context.base_sha,
+            new_head_sha=pre_context.head_sha,
+            policy=policy_result.policy_applied,
+        )
+    # Update open + resolved fingerprint sets. Re-fingerprint on the
+    # ORIGINAL LLM findings (surfaced + silenced) — a silenced finding
+    # is still "open in reality"; only findings the LLM stopped producing
+    # count as resolved.
+    all_original_findings: list[Finding] = list(
+        policy_result.findings_to_surface
+    ) + [sf.finding for sf in policy_result.findings_silenced]
+    current_fps: dict[int, str] = {}
+    for i, finding in enumerate(all_original_findings):
+        current_fps[i] = finding_fingerprint(
+            finding=finding, code_context=code_contexts.get(finding.path)
+        )
+    current_fp_set: set[str] = set(current_fps.values())
+    next_open: list[str] = sorted(current_fp_set)
+    # `newly_resolved` = prior open that are no longer in the current run.
+    _still_open: list[str]
+    newly_resolved: list[str]
+    if pre_context.prior_state is not None:
+        _still_open, newly_resolved = resolve_finding_status(
+            prior_open_fingerprints=pre_context.prior_state.open_fingerprints_this_gen,
+            current_fps=current_fps,
+        )
+    else:
+        newly_resolved = []
+    next_resolved: list[str] = sorted(
+        set(state_before_fp_update.resolved_fingerprints) | set(newly_resolved)
+    )
+    state_final: IterationState = IterationState(
+        version=state_before_fp_update.version,
+        generation=state_before_fp_update.generation,
+        generation_range_hash=state_before_fp_update.generation_range_hash,
+        round_in_generation=state_before_fp_update.round_in_generation,
+        policy_applied=state_before_fp_update.policy_applied,
+        resolved_fingerprints=next_resolved,
+        open_fingerprints_this_gen=next_open,
+        history=list(state_before_fp_update.history),
+        base_sha=state_before_fp_update.base_sha,
+        head_sha=state_before_fp_update.head_sha,
+    )
+    # NOTE on generation-history telemetry attribution: the closed
+    # prior-generation entry in `state_final.history[-1]` (created by
+    # `advance_generation` on NEW_COMMITS/REBASED transitions) holds
+    # `tokens_used=0` + `wall_clock_ms=0` placeholders. We do NOT
+    # backfill those placeholders from THIS run's telemetry, because
+    # this run is round 1 of the NEW generation — attributing its
+    # tokens/wall-clock to the closed prior generation misreports
+    # per-generation cost history and poisons the cost-vs-baseline
+    # estimate once token accounting lands (`tokens_used` is 0 today
+    # so the harm is currently limited to `wall_clock_ms`, but the
+    # semantics need to be right before that changes).
+    #
+    # The current run's telemetry surfaces as-is via `write_iar_outputs_populated`
+    # (`iteration-tokens-used`, `iteration-cost-vs-baseline-estimate`,
+    # observability marker annotation). Attributing per-round telemetry
+    # to individual `history[]` entries would require accumulating
+    # across a generation's rounds and only close the entry when the
+    # generation itself closes — a bigger refactor tracked as a
+    # follow-up (docs § 13.3 to be added).
+    log(
+        f"IAR post-LLM: policy={policy_result.policy_applied}, "
+        f"surfaced={len(policy_result.findings_to_surface)}, "
+        f"silenced={len(policy_result.findings_silenced)}, "
+        f"newly_resolved={len(newly_resolved)}, "
+        f"open_next={len(next_open)}, "
+        f"tokens={telemetry.tokens_used}, "
+        f"wall_clock_ms={telemetry.wall_clock_ms()}."
+    )
+    return state_final, policy_result
 
 
 # ---------------------------------------------------------------------------
@@ -3361,6 +5821,39 @@ def render_tracking_body_failed(
     )
 
 
+def render_tracking_body_skipped_by_label(
+    *, head_sha: str, skip_label: str, provider: str = ""
+) -> str:
+    """The terminal 'skipped by label' tracking-comment body.
+
+    Posted when the developer applied the `skip-review-label` alongside the
+    normal trigger — the reviewer short-circuits before the LLM call so the
+    merge can proceed without burning tokens. The comment carries the same
+    `<!-- ai-pr-reviewer-marker -->` header as any other terminal comment so
+    downstream tooling (dashboards, `collapse-previous` on the next run,
+    audit scripts) treats it uniformly.
+
+    The GitHub check reports `success` (exit 0). No IAR state is written; the
+    next real review starts from wherever the pipeline left off before this
+    skip. The `applied-label` is NOT stamped on skip runs — applying it would
+    misrepresent an unreviewed PR as reviewed.
+    """
+    return (
+        f"{_tracking_marker_header(provider)}\n"
+        f"### AI review for `{head_sha[:7]}` — ⏭️ skipped\n\n"
+        f"Full SHA: `{head_sha}`\n\n"
+        f"The `{skip_label}` label was applied to this PR, so the AI "
+        "reviewer short-circuited: **no LLM call, no findings, no state "
+        "mutation.** The GitHub check reports success so the merge can "
+        "proceed.\n\n"
+        f"_This is the intended behaviour when `skip-review-label` is "
+        "configured — use it deliberately for hotfixes, rollbacks, or "
+        "changes where an LLM review would burn tokens for no "
+        "incremental value. Remove the label + push a new commit to "
+        "get a real review on the follow-up work._"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -3409,6 +5902,39 @@ def main() -> int:
     ).strip()
     label_gate: str = os.environ.get("AIPRR_LABEL_GATE", "").strip()
     applied_label: str = os.environ.get("AIPRR_APPLIED_LABEL", "").strip()
+    skip_review_label: str = os.environ.get(
+        "AIPRR_SKIP_REVIEW_LABEL", ""
+    ).strip()
+
+    # Load-bearing misconfiguration guard: `skip-review-label` is an
+    # emergency-bypass hatch (silently skipping the review). If it
+    # collides with any of the runtime's other semantic labels,
+    # every normal trigger silently becomes a skip. Abort loudly.
+    # See detect_skip_label_collisions() for the collision matrix.
+    if skip_review_label:
+        _iar_escape_label_default: str = (
+            os.environ.get("AIPRR_ITERATION_ESCAPE_LABEL", "").strip()
+            or IAR_DEFAULT_ESCAPE_LABEL
+        )
+        _collisions: list[str] = detect_skip_label_collisions(
+            skip_review_label=skip_review_label,
+            label_gate=label_gate,
+            applied_label=applied_label,
+            iteration_escape_label=_iar_escape_label_default,
+        )
+        if _collisions:
+            log(
+                f"CONFIGURATION ERROR: skip-review-label "
+                f"{skip_review_label!r} collides with: "
+                f"{', '.join(_collisions)}. "
+                "This would cause every normal review trigger to be "
+                "silently skipped. Rename skip-review-label to a "
+                "distinct value (recommended: 'skip-ai-review', "
+                "'hotfix-no-review', or similar). Aborting."
+            )
+            write_all_outputs(skipped=False)
+            return 1
+
     collapse_previous: bool = parse_bool(
         os.environ.get("AIPRR_COLLAPSE_PREVIOUS", "true"), default=True
     )
@@ -3426,6 +5952,41 @@ def main() -> int:
     max_turns: int = int(
         os.environ.get("AIPRR_MAX_TURNS", DEFAULT_MAX_TURNS)
         or DEFAULT_MAX_TURNS
+    )
+
+    # Iteration-Aware Review (IAR). Every review runs the IAR pipeline;
+    # the four tunable inputs (convergence-policy, max-review-rounds,
+    # exhaustive-first-pass-cap-multiplier, iteration-escape-label)
+    # shape it. Pre-LLM / post-LLM helpers are wrapped in try/except at
+    # their call sites — an IAR failure degrades to the baseline review
+    # path (5 IAR outputs stay empty via write_iar_outputs_empty(),
+    # tracking marker skips the annotation). See docs/ITERATION_AWARENESS.md.
+    iar_config: IARConfig = build_iar_config(dict(os.environ))
+    iar_telemetry: RunTelemetry = RunTelemetry(
+        start_time_monotonic=time.monotonic()
+    )
+    iar_pre_context: IARPreLLMContext | None = None
+    iar_state_final: IterationState | None = None
+    iar_policy_final: PolicyResult | None = None
+    iar_effective_cap: int = 0  # populated pre-LLM; used by cost estimate
+    # Detect silently-fallback-corrected policy inputs so miswiring is
+    # visible in the workflow log rather than swallowed. The build_iar_config
+    # helper rewrote the value; we compare raw vs effective.
+    raw_policy: str = (
+        os.environ.get("AIPRR_CONVERGENCE_POLICY", "").strip()
+        or IAR_POLICY_FIRST_PASS_EXHAUSTIVE
+    )
+    if raw_policy not in IAR_VALID_POLICIES:
+        log(
+            f"IAR: unknown convergence-policy {raw_policy!r}; falling back "
+            f"to {IAR_POLICY_FIRST_PASS_EXHAUSTIVE!r}. "
+            f"Valid values: {list(IAR_VALID_POLICIES)}."
+        )
+    log(
+        f"IAR: policy={iar_config.policy}, "
+        f"max-rounds={iar_config.max_review_rounds}, "
+        f"cap-multiplier={iar_config.cap_multiplier}, "
+        f"escape-label={iar_config.escape_label!r}."
     )
 
     # PR description review (v1.2.0+)
@@ -3581,19 +6142,120 @@ def main() -> int:
         return 0
 
     # ------------------------------------------------------------------
+    # Skip-review-label short-circuit (emergency-bypass hatch)
+    # ------------------------------------------------------------------
+    # Opt-in escape: when `skip-review-label` is configured AND that label
+    # is present on the PR at trigger time, the reviewer short-circuits to
+    # success without touching the LLM, IAR state, or any other side
+    # effects. Intended for hotfixes / rollbacks / trivially safe changes
+    # where an LLM review would burn tokens for no incremental value.
+    #
+    # Contract (mirrors action.yml + docs/TRIGGER_MODES.md § "Emergency-bypass label"):
+    #   1. No LLM call — the reviewer never enters `run_agentic_loop`.
+    #   2. No IAR state mutation — persisted state is left exactly as it
+    #      was; the next non-skip run resumes from where the pipeline
+    #      last left off.
+    #   3. No `applied-label` stamp — applying it would misrepresent an
+    #      unreviewed PR as reviewed. Anyone dashboarding on that label
+    #      keeps seeing the truth.
+    #   4. No collapse-previous — the skip is meant to be minimal; prior
+    #      reviews (if any) stay visible so the human reviewer still
+    #      has context before merging. The next real review will
+    #      collapse them as usual.
+    #   5. A tracking comment IS posted (subject to `tracking-comment`)
+    #      so the audit trail records WHY the review was skipped, and
+    #      so `collapse-previous` on the next real run treats this like
+    #      any other terminal comment.
+    #   6. Outputs: `skipped=true`, `severity=none`, `blocked=false`.
+    #      The GitHub check reports success (exit 0) so the merge
+    #      proceeds.
+    #
+    # SECURITY NOTE: anyone who can label a PR can bypass code review via
+    # this gesture. Consumers who care must combine this input with a
+    # ruleset / CODEOWNERS rule restricting who can apply the label.
+    #
+    # The `if skip_review_label:` guard is defensive: `_labels_contain_ci`
+    # already returns False for an empty needle (documented contract),
+    # so the behaviour is correct without it — but the explicit guard
+    # makes the "feature disabled when input is empty" contract visible
+    # at the call site rather than relying on knowledge of the helper's
+    # semantics one level down. If the helper's contract ever changes
+    # (e.g. someone adds an `if not needle: return True` optimization
+    # for a legitimate but unrelated reason), this guard prevents the
+    # skip-review short-circuit from silently activating on every
+    # trigger for consumers who don't use the feature.
+    if skip_review_label and _labels_contain_ci(
+        needle=skip_review_label, haystack=current_labels
+    ):
+        log(
+            f"Skip-review-label {skip_review_label!r} present on PR — "
+            "short-circuiting to success without invoking the LLM. No "
+            "findings, no IAR state mutation, no reviewed-label stamp."
+        )
+        if tracking_comment_enabled:
+            try:
+                gh_post_issue_comment(
+                    token=gh_token,
+                    repo=repo,
+                    pr_number=pr_number,
+                    body=render_tracking_body_skipped_by_label(
+                        head_sha=head_sha,
+                        skip_label=skip_review_label,
+                        provider=provider_id,
+                    ),
+                )
+            except Exception as e:  # noqa: BLE001 — audit trail is
+                # best-effort; the skip must still succeed even if the
+                # tracking comment fails to post (network hiccup,
+                # permissions revoked mid-run, etc.).
+                log(
+                    f"Could not post skip-review tracking comment "
+                    f"(non-fatal): {e}"
+                )
+        write_all_outputs(skipped=True)
+        return 0
+
+    # ------------------------------------------------------------------
+    # Resolve the reviewer's own bot identity — always, regardless of
+    # `collapse-previous`. Two independent downstream consumers need it:
+    # (1) `gh_collapse_previous_reviews` (below, guarded by
+    # `collapse_previous`) filters comments to authors matching this
+    # login; (2) the IAR marker-author filter in
+    # `_fetch_latest_marker_body` (via `run_iar_pre_llm` below) uses
+    # it to reject forged state markers from non-bot commenters
+    # (round-10 F1 security fix). Prior to round-11 this was scoped
+    # inside `if collapse_previous:` so consumers with
+    # `collapse-previous: false` had IAR's author filter permanently
+    # disabled. Failure mode is safe on both sides — `""` disables
+    # the collapse loop's filter (already documented) and disables
+    # the IAR author filter (falls back to pre-round-10 behaviour —
+    # over-review, never under-surface).
+    bot_login: str = ""
+    try:
+        # v1.2.0+: pass repo + pr_number so the fallback chain in
+        # `gh_get_authenticated_login` can marker-scan for the prior
+        # bot's login when the built-in `GITHUB_TOKEN` refuses
+        # `/user` (the fix for the silent 403 that broke this
+        # feature for every workflow-token consumer).
+        bot_login = gh_get_authenticated_login(
+            gh_token, repo=repo, pr_number=pr_number
+        )
+        log(f"Authenticated as: {bot_login}")
+    except Exception as e:  # noqa: BLE001 — best-effort GH API call:
+        # bot identity resolution is optional context (used by the
+        # collapse-previous loop's author filter AND the round-10 IAR
+        # marker author filter). If it fails (permission problem, API
+        # outage, marker-scan fallback exhausted, etc.), both consumers
+        # degrade to their pre-filter behaviour (over-review, never
+        # under-surface) rather than crashing the whole review — the
+        # documented safe fallback for the whole reviewer's identity path.
+        log(f"bot-login lookup failed (non-fatal): {e}")
+
+    # ------------------------------------------------------------------
     # Collapse previous bot reviews/comments as outdated
     # ------------------------------------------------------------------
     if collapse_previous:
         try:
-            # v1.2.0+: pass repo + pr_number so the fallback chain in
-            # `gh_get_authenticated_login` can marker-scan for the prior
-            # bot's login when the built-in `GITHUB_TOKEN` refuses
-            # `/user` (the fix for the silent 403 that broke this
-            # feature for every workflow-token consumer).
-            bot_login: str = gh_get_authenticated_login(
-                gh_token, repo=repo, pr_number=pr_number
-            )
-            log(f"Authenticated as: {bot_login}")
             gh_collapse_previous_reviews(
                 token=gh_token,
                 repo=repo,
@@ -3686,9 +6348,55 @@ def main() -> int:
     system_prompt: str = compose_system_prompt(base_prompt, extension_text)
 
     # ------------------------------------------------------------------
+    # IAR pre-LLM: shape the LLM call.
+    #
+    # Reads the prior state, detects generation transition, and dispatches
+    # to the configured policy with empty findings to extract the effective
+    # cap + optional prompt addendum. Wrapped in try/except so any IAR
+    # failure degrades to the baseline review path (effective cap =
+    # base cap, system_prompt unchanged, outputs stay empty) — the safety
+    # contract locked by tests/test_iar_failure_fallback.py.
+    # ------------------------------------------------------------------
+    effective_max_inline_comments: int = max_inline_comments
+    try:
+        iar_pre_context = run_iar_pre_llm(
+            iar_config=iar_config,
+            repo=repo,
+            pr_number=pr_number,
+            gh_token=gh_token,
+            base_ref=base_ref,
+            head_sha=head_sha,
+            base_max_inline_comments=max_inline_comments,
+            applied_label=applied_label,
+            provider_id=provider_id,
+            bot_login=bot_login,
+        )
+        effective_max_inline_comments = (
+            iar_pre_context.pre_policy_result.effective_max_inline_comments
+        )
+        iar_effective_cap = effective_max_inline_comments
+        if iar_pre_context.pre_policy_result.prompt_addendum:
+            system_prompt = compose_system_prompt(
+                system_prompt,
+                iar_pre_context.pre_policy_result.prompt_addendum,
+            )
+    except Exception as exc:  # noqa: BLE001 — best-effort IAR wrap
+        # IAR must never crash the reviewer. On any pre-LLM error we
+        # log and continue with baseline behavior — the review still
+        # runs (IAR simply won't populate outputs or state this run).
+        log(
+            f"IAR pre-LLM crashed: {type(exc).__name__}: {exc}. "
+            "Continuing with baseline (non-IAR) review path."
+        )
+        iar_pre_context = None
+        effective_max_inline_comments = max_inline_comments
+
+    # ------------------------------------------------------------------
     # Fetch PR + run agentic loop, all wrapped so failures hit the spinner
     # ------------------------------------------------------------------
-    state: ReviewState = ReviewState(max_inline_comments=max_inline_comments)
+    state: ReviewState = ReviewState(
+        max_inline_comments=effective_max_inline_comments
+    )
     try:
         pr_ctx: PRContext = fetch_pr_context(
             repo=repo, pr_number=pr_number, base_ref=base_ref, token=gh_token
@@ -3748,15 +6456,29 @@ def main() -> int:
             # Enforce max_inline_comments on the agent-runner path too. The
             # tool handler enforces this for chat-completions providers; the
             # cap is a documented safety control (docs/SECURITY.md) that
-            # applies to every provider family.
-            if len(result.findings) > max_inline_comments:
-                dropped: int = len(result.findings) - max_inline_comments
+            # applies to every provider family. On round 1 of a new
+            # generation under `first-pass-exhaustive` (or when the 30%
+            # safety net fires), IAR raises the effective cap via
+            # `exhaustive-first-pass-cap-multiplier` so the LLM can
+            # surface a more complete initial pass; subsequent rounds
+            # converge back to the baseline cap.
+            if len(result.findings) > effective_max_inline_comments:
+                dropped: int = (
+                    len(result.findings) - effective_max_inline_comments
+                )
                 log(
                     f"Agent-runner provider produced {len(result.findings)} "
-                    f"findings; capping to max-inline-comments="
-                    f"{max_inline_comments} ({dropped} dropped)"
+                    f"findings; capping to effective-max-inline-comments="
+                    f"{effective_max_inline_comments} ({dropped} dropped)"
                 )
-                result.findings = result.findings[:max_inline_comments]
+                # Criticals-first before truncation — same load-bearing
+                # invariant as apply_first_pass_exhaustive_policy round 1:
+                # never let a naive `[:cap]` silently drop a critical
+                # finding past the cap. See docs/ITERATION_AWARENESS.md
+                # § 7.1 (critical-always-surfaces safety rail).
+                result.findings = _sort_findings_criticals_first(
+                    result.findings
+                )[:effective_max_inline_comments]
                 # Recompute overall_severity — dropping the tail may lower it.
                 result.overall_severity = overall_severity(
                     [f.severity for f in result.findings]
@@ -3768,8 +6490,15 @@ def main() -> int:
             ]
             # Expose set_pr_description only in autocomplete mode; expose
             # set_pr_complexity only when complexity labeling is enabled.
+            # `effective_max_inline_comments` == `max_inline_comments` when
+            # the IAR pre-LLM step didn't amplify the cap (i.e. NOT round 1
+            # of a new generation under first-pass-exhaustive / safety net,
+            # OR the pre-LLM step crashed and the try/except fell back to
+            # the baseline cap — see docs/ITERATION_AWARENESS.md § 2).
+            # On round 1 of a new generation the multiplier raises the cap
+            # so the LLM can surface an exhaustive initial pass.
             tools: list[dict[str, Any]] = tools_schema(
-                max_inline_comments,
+                effective_max_inline_comments,
                 allow_set_pr_description=(
                     pr_desc_mode == PR_DESC_MODE_AUTOCOMPLETE
                     and not description_verdict.is_adequate
@@ -3801,6 +6530,33 @@ def main() -> int:
         )
         write_all_outputs(skipped=False)
         return 1
+
+    # ------------------------------------------------------------------
+    # IAR post-LLM: filter findings + build the state to persist.
+    #
+    # When the pre-LLM step failed (`iar_pre_context is None`) this block
+    # is a no-op — the submission path sees exactly what the LLM produced.
+    # Otherwise we mutate `result.findings` to the surfaced subset and
+    # stash the new state + policy result for marker embedding + output
+    # writing further down.
+    # ------------------------------------------------------------------
+    if iar_pre_context is not None:
+        try:
+            iar_state_final, iar_policy_final = run_iar_post_llm(
+                iar_config=iar_config,
+                pre_context=iar_pre_context,
+                result=result,
+                base_max_inline_comments=max_inline_comments,
+                telemetry=iar_telemetry,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort IAR wrap
+            log(
+                f"IAR post-LLM crashed: {type(exc).__name__}: {exc}. "
+                "Submitting the review with the raw LLM findings (IAR "
+                "skipped for this run)."
+            )
+            iar_state_final = None
+            iar_policy_final = None
 
     # ------------------------------------------------------------------
     # Post the review (with 422 fallback)
@@ -3976,26 +6732,72 @@ def main() -> int:
             tracking_body,
             {"label_toggle_generation": label_toggle_generation},
         )
+    # ------------------------------------------------------------------
+    # Apply success label (only if not blocked) — must happen BEFORE the
+    # IAR state embed so `reviewed_label_applied` reflects the ACTUAL
+    # outcome of the label stamp, not the intent. If we set the bit to
+    # `True` before the stamp and the stamp then fails (network hiccup,
+    # revoked permissions, deleted-label race, etc.), the next run's
+    # USER_FORCED_RESET detection sees `reviewed_label_applied=True` +
+    # label absent → wrongly fires a reset that wipes dedup memory.
+    # Attempting the stamp first and recording the observed outcome
+    # keeps the marker honest.
+    # ------------------------------------------------------------------
+    label_stamped: bool = False
+    if applied_label and not blocked:
+        try:
+            gh_apply_label(
+                token=gh_token,
+                repo=repo,
+                pr_number=pr_number,
+                label=applied_label,
+            )
+            log(f"Applied label {applied_label!r}")
+            label_stamped = True
+        except Exception as e:  # noqa: BLE001 — best-effort GH API call;
+            # a label-stamp failure MUST NOT crash the reviewer (the
+            # review has already posted successfully), but we must record
+            # the failure so USER_FORCED_RESET's guard reads the truth.
+            log(
+                f"Failed to apply label {applied_label!r} (non-fatal, "
+                f"marker will record reviewed_label_applied=False): {e}"
+            )
+    elif applied_label and blocked:
+        log(f"Skipped applying {applied_label!r} — strictness gate blocked")
+
+    # IAR marker embed: append a one-line annotation for developers who
+    # skim the marker + embed the machine-readable state block that the
+    # next run will parse. Skipped only if the pre-LLM or post-LLM step
+    # crashed (state/policy will be None in that case) — the review still
+    # ships, IAR just doesn't annotate this specific marker.
+    if (
+        iar_state_final is not None
+        and iar_policy_final is not None
+        and iar_pre_context is not None
+    ):
+        # Load-bearing for USER_FORCED_RESET: the arming bit reflects
+        # whether the applied label is (or should be treated as) on the
+        # PR at the end of this run — see `compute_reviewed_label_applied`.
+        iar_state_final.reviewed_label_applied = (
+            compute_reviewed_label_applied(
+                applied_label=applied_label,
+                label_stamped=label_stamped,
+                current_labels=current_labels,
+                prior_state=iar_pre_context.prior_state,
+            )
+        )
+        tracking_body = tracking_body + _render_iar_marker_annotation(
+            state=iar_state_final,
+            policy_result=iar_policy_final,
+            transition=iar_pre_context.transition,
+        )
+        tracking_body = embed_iteration_state(tracking_body, iar_state_final)
     gh_update_issue_comment(
         token=gh_token,
         repo=repo,
         comment_id=tracking_id,
         body=tracking_body,
     )
-
-    # ------------------------------------------------------------------
-    # Apply success label (only if not blocked)
-    # ------------------------------------------------------------------
-    if applied_label and not blocked:
-        gh_apply_label(
-            token=gh_token,
-            repo=repo,
-            pr_number=pr_number,
-            label=applied_label,
-        )
-        log(f"Applied label {applied_label!r}")
-    elif applied_label and blocked:
-        log(f"Skipped applying {applied_label!r} — strictness gate blocked")
 
     # ------------------------------------------------------------------
     # Action outputs
@@ -4008,6 +6810,22 @@ def main() -> int:
         blocked=blocked,
         review_url=review_url,
     )
+    # IAR outputs: overwrite the five empty defaults from write_all_outputs
+    # with real values ($GITHUB_OUTPUT is append-only; last write wins).
+    # Only fires when the full IAR pipeline succeeded — a mid-flight
+    # crash leaves the empty defaults in place so downstream steps still
+    # see defined values.
+    if (
+        iar_state_final is not None
+        and iar_policy_final is not None
+    ):
+        write_iar_outputs_populated(
+            state=iar_state_final,
+            policy_result=iar_policy_final,
+            telemetry=iar_telemetry,
+            effective_cap=iar_effective_cap or max_inline_comments,
+            base_cap=max_inline_comments,
+        )
 
     # Exit code 2 = blocked, so the GitHub check turns red but we keep
     # exit code 1 reserved for hard failures.
