@@ -109,7 +109,7 @@ That's the minimum. Open a PR; the action posts a tracking comment, runs a revie
 - **Optional label gate**: only run when a PR carries a label (e.g. `ready`).
 - **Optional "reviewed" label**: applied automatically after a successful, non-blocked review.
 - **Self-healing on GitHub 422**: if the model anchors a comment outside the diff, the action retries summary-only instead of losing every other comment.
-- **Iteration-Aware Review (on by default, v1.8.0+)**: dedup findings against prior rounds so the same warnings don't come back forever. The reviewer ships with `iteration-awareness-enabled: true` and `convergence-policy: first-pass-exhaustive` — exhaustive first pass (up to 3× the normal cap), dedup on subsequent rounds. Four convergence policies, a 30% new-lines safety net that forces an exhaustive pass when a big push arrives, and a hardcoded "criticals always surface" rail that no policy can bypass. Set `iteration-awareness-enabled: false` to opt out and get byte-identical pre-v1.8 behavior. See [docs/ITERATION_AWARENESS.md](docs/ITERATION_AWARENESS.md) for the full spec and [examples/iteration-aware.yml](examples/iteration-aware.yml) for tuning knobs.
+- **Iteration-Aware Review**: dedup findings against prior rounds so the same warnings don't come back forever. Every review runs with `convergence-policy: first-pass-exhaustive` by default — exhaustive first pass (up to 3× the normal cap), dedup on subsequent rounds. Four convergence policies (`iterative`, `first-pass-exhaustive`, `round-capped`, `critical-gate`), a 30% new-lines safety net that forces an exhaustive pass when a big push arrives, and a hardcoded "criticals always surface" rail that no policy can bypass. Two escape gestures: apply the `iteration-escape-label` to bypass dedup for one run (state preserved) or remove the `applied-label` before the next review to force a full state reset (fresh generation, dedup memory wiped). See [docs/ITERATION_AWARENESS.md](docs/ITERATION_AWARENESS.md) for the full spec and [examples/iteration-aware.yml](examples/iteration-aware.yml) for tuning knobs.
 
 ## Providers
 
@@ -175,6 +175,7 @@ Like Cursor, `claude-code` can bill against a **Claude Pro/Max subscription**. R
 | `label-gate` | | `''` | If non-empty, the review only runs when the PR carries this label (e.g. `ready`). Combined with `trigger-mode`. |
 | `trigger-mode` | | _(auto)_ | `always` / `label-required` / `label-once` / `label-added-only` — see [docs/TRIGGER_MODES.md](docs/TRIGGER_MODES.md). Empty picks `label-required` when `label-gate` is set, else `always`. |
 | `applied-label` | | `''` | If non-empty, this label is applied to the PR after a successful, non-blocked review (e.g. `pr-reviewed`). The label is auto-created if it doesn't exist. |
+| `skip-review-label` | | `''` | Optional emergency-bypass label (e.g. `skip-ai-review`). When BOTH the workflow trigger fires AND this label is on the PR, the reviewer short-circuits: no LLM call, no findings, no state mutation, the GitHub check reports success. A tracking comment records the skip. Intended for hotfixes / rollbacks. **Security:** anyone who can label a PR can bypass review — pair with a ruleset/CODEOWNERS rule restricting who can apply this label. Empty (default) disables the feature. See [docs/TRIGGER_MODES.md § Emergency-bypass label](docs/TRIGGER_MODES.md). |
 | `collapse-previous` | | `true` | Mark previous bot reviews/comments as `OUTDATED` via GraphQL `minimizeComment`. |
 | `tracking-comment` | | `true` | Post a spinner comment that transitions to the final review URL. |
 | `strictness` | | `lenient` | `lenient` / `block-on-critical` / `block-on-warning` / `block-on-any` — see [docs/STRICTNESS.md](docs/STRICTNESS.md). |
@@ -190,8 +191,7 @@ Like Cursor, `claude-code` can bill against a **Claude Pro/Max subscription**. R
 | `claude-code-version` | | `''` | Pin the Claude Code CLI version (npm semver). Empty = latest. |
 | `cursor-version` | | `''` | Pin the Cursor Agent CLI version. Empty = latest stable. |
 | `codex-version` | | `''` | Pin the OpenAI Codex CLI version (npm semver). Empty = latest. |
-| `iteration-awareness-enabled` | | `true` | **Iteration-Aware Review (IAR) master switch (v1.8.0+ default: on).** IAR gives the reviewer memory across rounds: dedup against prior reports, generation tracking (new commits reset the round counter), 4 convergence policies. Set to `false` for byte-identical pre-v1.8 behavior. See [docs/ITERATION_AWARENESS.md](docs/ITERATION_AWARENESS.md). |
-| `convergence-policy` | | `first-pass-exhaustive` | IAR policy. Default `first-pass-exhaustive` (exhaustive round 1 + higher cap, dedup on rounds 2+) — solves the "10 loops of trickled warnings" pain. Alternatives: `iterative` (dedup only, cost-neutral), `round-capped` (post-cap only critical surfaces), `critical-gate` (strict cross-gen dedup). Ignored when `iteration-awareness-enabled` is `false`. |
+| `convergence-policy` | | `first-pass-exhaustive` | Iteration-Aware Review policy. Default `first-pass-exhaustive` (exhaustive round 1 + higher cap, dedup on rounds 2+) — solves the "10 loops of trickled warnings" pain. Alternatives: `iterative` (dedup only, cost-neutral), `round-capped` (post-cap only critical surfaces), `critical-gate` (strict cross-gen dedup). See [docs/ITERATION_AWARENESS.md](docs/ITERATION_AWARENESS.md). |
 | `max-review-rounds` | | `0` | Hard cap for `round-capped`. `0` = unlimited. After N rounds only critical severity findings surface. Ignored by other policies. |
 | `exhaustive-first-pass-cap-multiplier` | | `3` | Multiplier applied to `max-inline-comments` on round 1 of each generation when policy is `first-pass-exhaustive`. Set to `1` to keep exhaustive prompting without amplification. |
 | `iteration-escape-label` | | `full-review-please` | Label a human applies to force a full review — dedup skipped for that run, persisted state unchanged. |
@@ -208,11 +208,11 @@ Like Cursor, `claude-code` can bill against a **Claude Pro/Max subscription**. R
 | `inline-dropped` | int | Inline comments dropped because GitHub returned 422. |
 | `blocked` | bool | Whether strictness blocked the check. When `true`, the action exits with code 2. |
 | `skipped` | bool | Whether the run was skipped (label/author gate). |
-| `iteration-round` | int (as string) | IAR round number within the current generation. Populated on every run when IAR is on (default); empty when `iteration-awareness-enabled` is explicitly set to `false`. |
-| `iteration-generation` | int (as string) | IAR generation counter; increments on new commits or rebase (empty when IAR disabled). |
-| `iteration-policy-applied` | string | Which IAR policy actually fired (usually matches `convergence-policy`; safety net or escape label can override). Empty when IAR disabled. |
-| `iteration-tokens-used` | int (as string) | Total LLM input+output tokens for this run (cost telemetry). Empty when IAR disabled. |
-| `iteration-cost-vs-baseline-estimate` | string | Heuristic cost delta vs projected non-IAR baseline (e.g. `-30%`, `+15%`, `unknown`). Empty when IAR disabled. |
+| `iteration-round` | int (as string) | IAR round number within the current generation. Populated on every successful IAR pipeline run; empty if the pipeline crashed mid-flight (caught by the try/except safety net). |
+| `iteration-generation` | int (as string) | IAR generation counter; increments on new commits or rebase. Empty if the IAR pipeline crashed. |
+| `iteration-policy-applied` | string | Which IAR policy actually fired (usually matches `convergence-policy`; safety net or escape label can override). Empty if the IAR pipeline crashed. |
+| `iteration-tokens-used` | int (as string) | Total LLM input+output tokens for this run (cost telemetry). Empty if the IAR pipeline crashed. |
+| `iteration-cost-vs-baseline-estimate` | string | Heuristic cost delta vs a projected no-dedup baseline (e.g. `-30%`, `+15%`, `unknown`). Empty if the IAR pipeline crashed. |
 
 Consume them in a later step by giving the action step an `id`:
 
@@ -595,13 +595,14 @@ The [`generate-extension` sub-skill](#sub-skill-generate-extension--tailor-the-r
 The Action's runtime (the local skill mirrors these steps in your coding agent):
 
 1. **Access & trigger gates** (cheapest first, no API calls) — `author-association` runs first (skip if the PR author isn't in the whitelist), then the `label-gate` / `trigger-mode` check (skip if the required label is missing or this label application was already reviewed).
-2. **Collapse previous** — marks prior bot reviews/comments as `OUTDATED` via GraphQL.
-3. **Tracking comment** — posts a `Working…` comment with a stable marker.
-4. **Fetch PR** — pulls metadata, file list, and `git diff origin/<base>...HEAD`.
-5. **Agentic loop** — runs the model with five tools: `read_file`, `grep`, `glob`, `post_inline_comment`, `submit_review`. Inline comments are queued in memory and posted atomically with the final review. Conversation history is pruned in pairs to bound token cost.
-6. **Submit** — `POST /pulls/{n}/reviews` with the summary and queued inline comments. On HTTP 422 (one bad anchor line in any comment ⇒ entire request rejected), the action retries summary-only and reports the dropped count in the tracking comment.
-7. **Apply label** — applies `applied-label` if set and the strictness gate didn't block.
-8. **Strictness gate** — exits 2 if blocked, 0 otherwise.
+2. **Emergency-bypass check** — if `skip-review-label` is configured AND that label is on the PR, short-circuit to success (no LLM call, no state mutation, `⏭️ skipped` tracking comment posted). See [docs/TRIGGER_MODES.md § Emergency-bypass label](docs/TRIGGER_MODES.md).
+3. **Collapse previous** — marks prior bot reviews/comments as `OUTDATED` via GraphQL.
+4. **Tracking comment** — posts a `Working…` comment with a stable marker.
+5. **Fetch PR** — pulls metadata, file list, and `git diff origin/<base>...HEAD`.
+6. **Agentic loop** — runs the model with five tools: `read_file`, `grep`, `glob`, `post_inline_comment`, `submit_review`. Inline comments are queued in memory and posted atomically with the final review. Conversation history is pruned in pairs to bound token cost.
+7. **Submit** — `POST /pulls/{n}/reviews` with the summary and queued inline comments. On HTTP 422 (one bad anchor line in any comment ⇒ entire request rejected), the action retries summary-only and reports the dropped count in the tracking comment.
+8. **Apply label** — applies `applied-label` if set and the strictness gate didn't block.
+9. **Strictness gate** — exits 2 if blocked, 0 otherwise.
 
 The local skill diverges only at the boundary: instead of posting inline comments to GitHub (step 6), it collects them in-memory and prints the review as a Markdown table in your agent's terminal. Same tools, same prompt, same output shape.
 

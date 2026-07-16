@@ -271,9 +271,9 @@ If you want to reduce the action's blast radius further:
 - **Provider data retention.** Anthropic's policy applies to anything the action sends. As of this writing, Anthropic does not train on Messages API data, but you should verify against the provider's current Terms of Service for your specific compliance needs.
 - **The `severity` field is model-asserted, not verified.** A model that systematically under-tags severity will under-block. The bundled default prompt explicitly defines severity levels to mitigate this; calibrate via a custom prompt if your team needs stricter assignments.
 
-## Iteration-Aware Review (IAR) trust boundary (v1.8.0+, on by default)
+## Iteration-Aware Review (IAR) trust boundary
 
-The IAR subsystem (see [`ITERATION_AWARENESS.md`](ITERATION_AWARENESS.md)) adds three surfaces worth calling out explicitly. As of v1.8.0 IAR is on by default; consumers who set `iteration-awareness-enabled: false` disable every code path in this section and the trust model is byte-identical to pre-v1.8.0.
+The IAR subsystem (see [`ITERATION_AWARENESS.md`](ITERATION_AWARENESS.md)) adds three surfaces worth calling out explicitly. IAR runs on every review; the pipeline is wrapped in `try/except` at every `main()` touchpoint so an IAR failure degrades to the baseline review path — the reviewer never fails because of IAR.
 
 ### New subprocess boundary — `git diff` / `git show` / `git rev-parse`
 
@@ -299,7 +299,7 @@ Two new inputs accept user text: `convergence-policy` and `iteration-escape-labe
 
 ### API surface delta
 
-Zero new endpoints. The one HTTP call added by IAR (`_fetch_pr_labels` in Task 8) reuses the existing `gh_request` helper against `GET /repos/{owner}/{repo}/pulls/{pr}`, which requires no additional token scope beyond the `pull-requests: read` the reviewer already needs. The marker-comment read + write path is unchanged from pre-IAR runs (existing `gh_request` GraphQL/REST). No token elevation required.
+Zero new endpoints beyond the reviewer's baseline set. The one HTTP call the IAR pipeline adds (`_fetch_pr_labels`) reuses the existing `gh_request` helper against `GET /repos/{owner}/{repo}/pulls/{pr}`, which requires no additional token scope beyond the `pull-requests: read` the reviewer already needs. The marker-comment read + write path uses the same `gh_request` GraphQL/REST helpers as the rest of the runtime. No token elevation required.
 
 ### Cost telemetry
 

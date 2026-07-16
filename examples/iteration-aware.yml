@@ -1,8 +1,8 @@
 # Iteration-Aware Review (IAR) — explicit configuration example.
 #
-# As of v1.8.0, IAR is ON BY DEFAULT with `convergence-policy:
-# first-pass-exhaustive`. Consumers who don't set any of the five
-# `iteration-*` inputs get exactly the config shown below automatically —
+# IAR runs on every review with `convergence-policy: first-pass-exhaustive`
+# as the default. Consumers who don't set any of the four `iteration-*`
+# / `convergence-*` inputs get exactly the config shown below automatically —
 # you do NOT need to copy this file. It's kept here as a reference for
 # consumers who want to tune the knobs (e.g. lower the cap multiplier,
 # add a round cap, or rename the escape label) or for documentation.
@@ -13,9 +13,6 @@
 # ~500-800 ms of ambient overhead + a one-time cap-expanded first pass
 # per generation (see docs/PERFORMANCE.md § Iteration-Aware Review for
 # the full cost matrix).
-#
-# To opt out of IAR entirely and get pre-v1.8 byte-identical behavior,
-# set `iteration-awareness-enabled: false` below.
 #
 # See docs/ITERATION_AWARENESS.md for the authoritative spec.
 
@@ -49,11 +46,10 @@ jobs:
           api-key: ${{ secrets.ANTHROPIC_API_KEY }}
           strictness: block-on-critical
 
-          # Iteration-Aware Review — every input below matches the
-          # v1.8.0+ shipped default. All five can be omitted entirely
-          # and you'll get the same behavior. Kept explicit here as
-          # documentation.
-          iteration-awareness-enabled: true                # DEFAULT
+          # Iteration-Aware Review tuning knobs — every input below
+          # matches the shipped default. All four can be omitted
+          # entirely and you'll get the same behavior. Kept explicit
+          # here as documentation.
           convergence-policy: first-pass-exhaustive        # DEFAULT
           # Round 1 of a new generation gets 3x the baseline cap so the
           # LLM can surface a comprehensive initial pass.

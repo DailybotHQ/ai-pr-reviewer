@@ -1622,6 +1622,72 @@ class TrackingRenderTests(unittest.TestCase):
         self.assertIn("3 dropped", body)
         self.assertIn("422", body)
 
+    # ------------------------------------------------------------------
+    # Skip-review-label short-circuit renderer
+    # ------------------------------------------------------------------
+
+    def test_skipped_by_label_body_carries_review_marker(self) -> None:
+        """The skip-tracker comment MUST include `REVIEW_MARKER` so that
+        `collapse-previous` on the next real review recognises it as a
+        prior bot artefact and minimises it. Missing the marker would
+        leave the skip comment orphaned in the PR."""
+        body: str = reviewer.render_tracking_body_skipped_by_label(
+            head_sha="abc1234def", skip_label="skip-ai-review",
+        )
+        self.assertIn(reviewer.REVIEW_MARKER, body)
+
+    def test_skipped_by_label_body_surfaces_the_label(self) -> None:
+        """The label name MUST appear verbatim in the comment body so
+        the developer reading the PR sees WHICH label triggered the
+        skip — critical for audit trail on multi-label workflows."""
+        body: str = reviewer.render_tracking_body_skipped_by_label(
+            head_sha="abc1234def", skip_label="emergency-bypass",
+        )
+        self.assertIn("emergency-bypass", body)
+
+    def test_skipped_by_label_body_uses_skip_emoji(self) -> None:
+        """Distinguishes the skip terminal state from ✅ done, 🚫 blocked,
+        and ❌ failed — glanceable in a comments list."""
+        body: str = reviewer.render_tracking_body_skipped_by_label(
+            head_sha="abc1234def", skip_label="skip-ai-review",
+        )
+        self.assertIn("⏭️", body)
+        self.assertIn("skipped", body.lower())
+
+    def test_skipped_by_label_body_states_no_llm_call(self) -> None:
+        """Documents the contract in-line so a developer reading the
+        comment understands nothing was analysed — no false sense that
+        the review passed."""
+        body: str = reviewer.render_tracking_body_skipped_by_label(
+            head_sha="abc1234def", skip_label="skip-ai-review",
+        )
+        self.assertIn("no LLM call", body)
+
+    def test_skipped_by_label_body_includes_provider_marker(self) -> None:
+        """When `provider` is set the body must include the per-provider
+        marker so provider-scoped `collapse-previous` sees this skip
+        comment on the next same-provider run — otherwise a
+        multi-provider workflow would leave the skip comment live
+        forever."""
+        body: str = reviewer.render_tracking_body_skipped_by_label(
+            head_sha="abc1234def",
+            skip_label="skip-ai-review",
+            provider="anthropic",
+        )
+        self.assertIn(reviewer.provider_marker("anthropic"), body)
+
+    def test_skipped_by_label_body_omits_provider_marker_when_empty(
+        self,
+    ) -> None:
+        """No provider → no per-provider marker line. Symmetry with the
+        working/done renderers."""
+        body: str = reviewer.render_tracking_body_skipped_by_label(
+            head_sha="abc1234def",
+            skip_label="skip-ai-review",
+            provider="",
+        )
+        self.assertNotIn(reviewer.PROVIDER_MARKER_PREFIX, body)
+
 
 class OutputWritingTests(unittest.TestCase):
     def setUp(self) -> None:

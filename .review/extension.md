@@ -318,20 +318,21 @@ extend the security posture to the whole surface consumers touch.
 
 ## Iteration-Aware Review (IAR) conventions
 
-The IAR subsystem is on by default (v1.8.0+) and load-bearing: every
+The IAR subsystem runs on every review and is load-bearing: every
 consumer inherits the exact behavior contracts documented in
-[`docs/ITERATION_AWARENESS.md`](../docs/ITERATION_AWARENESS.md), and
-consumers who explicitly opt out via `iteration-awareness-enabled: false`
-rely on the regression suite guaranteeing byte-identical pre-v1.8
-behavior. These rules protect both contracts across future PRs.
+[`docs/ITERATION_AWARENESS.md`](../docs/ITERATION_AWARENESS.md). The
+pipeline is wrapped in `try/except` at each `main()` touchpoint so an
+IAR failure degrades to the baseline review path — the safety contract
+is locked by `tests/test_iar_failure_fallback.py`. These rules protect
+both contracts across future PRs.
 
-- **Always `critical`:** removal or rename of any of the 5 IAR inputs
-  (`iteration-awareness-enabled`, `convergence-policy`,
-  `max-review-rounds`, `exhaustive-first-pass-cap-multiplier`,
-  `iteration-escape-label`) or any of the 5 IAR outputs
-  (`iteration-round`, `iteration-generation`, `iteration-policy-applied`,
-  `iteration-tokens-used`, `iteration-cost-vs-baseline-estimate`).
-  Public contract — same rule as Rule #4 applies (v2.0.0 required).
+- **Always `critical`:** removal or rename of any of the 4 IAR inputs
+  (`convergence-policy`, `max-review-rounds`,
+  `exhaustive-first-pass-cap-multiplier`, `iteration-escape-label`) or
+  any of the 5 IAR outputs (`iteration-round`, `iteration-generation`,
+  `iteration-policy-applied`, `iteration-tokens-used`,
+  `iteration-cost-vs-baseline-estimate`). Public contract — same rule
+  as Rule #4 applies (v2.0.0 required).
 - **Always `critical`:** moving, weakening, or making configurable the
   hardcoded critical-always-surfaces branch in
   `dedupe_findings_against_prior()` (`scripts/reviewer.py`,
@@ -345,14 +346,17 @@ behavior. These rules protect both contracts across future PRs.
   is `max-inline-comments` and only on round 1 of a new generation.
   Per AGENTS.md DON'T #9, other budget defaults require a documented
   cost-per-review impact analysis first.
-- **Always `warning`:** a code path where IAR is enabled but not gated
-  on `iar_config.enabled` at the call site. The regression suite
-  `tests/test_backward_compat_iar_off.py` guards this — any change
-  that regresses it must be explicitly justified in the PR body.
+- **Always `warning`:** removing or weakening the `try/except` safety
+  wrap around either `run_iar_pre_llm()` or `run_iar_post_llm()` in
+  `main()`. The regression suite `tests/test_iar_failure_fallback.py`
+  guards the invariant that an IAR failure MUST NOT crash the run;
+  any change that regresses it must be explicitly justified in the
+  PR body.
 - **Always `warning`:** a new IAR helper that reads or writes network
   I/O outside `try/except` at the `main()` call site. IAR must NEVER
   crash the reviewer — every IAR failure path in `run_iar_pre_llm` /
-  `run_iar_post_llm` falls back to the baseline (IAR-off) review.
+  `run_iar_post_llm` falls back to the baseline review with empty
+  IAR outputs.
 - **Always `warning`:** a change to `IterationState` schema fields
   without a corresponding backward-compat parse test in
   `tests/test_iar_state_layer.py`. Older markers written by prior
@@ -360,11 +364,55 @@ behavior. These rules protect both contracts across future PRs.
   `""` / `[]` / `0` as appropriate. Version-bump the
   `IAR_STATE_SCHEMA_VERSION` constant only for genuinely
   breaking changes (never in a `v1.x` release).
+- **Always `warning`:** adding a new branch on `GenerationTransition`
+  values (e.g. `if transition == GenerationTransition.NEW_COMMITS`)
+  that does NOT explicitly consider `USER_FORCED_RESET`. The reset
+  override sets `prior_state = None` AND changes the transition value,
+  so most downstream code paths handle it correctly via the
+  `prior_state is None` short-circuit — but any new code that dispatches
+  on the transition enum without acknowledging `USER_FORCED_RESET`
+  risks silently ignoring the reset semantics. Add a comment showing
+  the reviewer considered it, or expand the branch to include it.
 - **Always `info`:** using the term "silence" for a finding IAR
   chose not to submit. The correct term is "dedup" or "silence"
   depending on the reason (dedup = the finding matches a prior
   fingerprint; silence = the policy chose to hide it). The
   `SilencedFinding.reason` field carries this distinction.
+
+## Skip-review-label conventions
+
+The `skip-review-label` input is an opt-in emergency-bypass hatch — when
+BOTH the workflow trigger fires AND the configured label is on the PR,
+`main()` short-circuits to success without invoking the LLM. It is a
+security-sensitive surface (anyone who can label a PR can bypass code
+review) so the rules below protect its invariants.
+
+- **Always `critical`:** removal or rename of the `skip-review-label`
+  input from `action.yml`, or of `AIPRR_SKIP_REVIEW_LABEL` from the
+  env-var wire-up. Public contract — same rule as Rule #4 applies
+  (v2.0.0 required).
+- **Always `critical`:** any change that lets the skip path stamp the
+  `applied-label` (the "reviewed" label). Applying it would
+  misrepresent an unreviewed PR as reviewed and lie to every
+  dashboard, ruleset, and reviewer downstream. The rule is unconditional.
+- **Always `warning`:** any change that lets the skip path read or
+  mutate IAR persisted state (marker parse, `read_prior_iteration_state`,
+  `write_iteration_state`, `advance_generation`, etc.). The skip must
+  leave IAR exactly as it was — the next non-skip run resumes from
+  where the pipeline last left off.
+- **Always `warning`:** any change that moves the skip short-circuit
+  AFTER a network-side-effecting step (collapse-previous, tracking
+  spinner post, PR context fetch, LLM invocation). The skip is meant
+  to be minimal — anything the reviewer did BEFORE the short-circuit
+  fires becomes a broken invariant.
+- **Always `warning`:** removing the `REVIEW_MARKER` (or the
+  per-provider marker) from `render_tracking_body_skipped_by_label`.
+  Both are needed for `collapse-previous` on the next real run to
+  recognise the skip comment as a prior bot artefact and minimise it.
+- **Always `info`:** using the word "blocked" or "failed" in
+  documentation for what a skip does. The correct terms are
+  "skipped", "bypassed", or "short-circuited" — the skip is a success
+  path from GitHub's perspective, not a failure or block.
 
 ## PR hygiene
 

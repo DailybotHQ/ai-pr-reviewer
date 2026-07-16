@@ -1,17 +1,17 @@
 # Iteration-Aware Review (IAR)
 
-> **On-by-default subsystem that gives the reviewer memory across rounds — converging multi-round self-review workflows instead of surfacing new warnings indefinitely.**
+> **Subsystem that gives the reviewer memory across rounds — converging multi-round self-review workflows instead of surfacing new warnings indefinitely.**
 
 **Status:** authoritative spec for the IAR subsystem. All implementation in `scripts/reviewer.py` and public surface in `action.yml` conforms to what is described here. If the code disagrees with this document, this document wins — file a bug.
 
-**Master switch (v1.8.0+):** `iteration-awareness-enabled: true` (default). The shipped `convergence-policy` is `first-pass-exhaustive`. Consumers who want the pre-v1.8 review shape can set `iteration-awareness-enabled: false` and the runtime becomes byte-identical to prior releases — all 4 other IAR inputs are then ignored.
+**How to configure:** IAR runs on every review. The default `convergence-policy` is `first-pass-exhaustive`; the four tunable inputs (`convergence-policy`, `max-review-rounds`, `exhaustive-first-pass-cap-multiplier`, `iteration-escape-label`) shape the pipeline. Full input reference in § 3.
 
 ---
 
 ## Table of contents
 
 1. [Motivation](#1-motivation)
-2. [Master switch + backward-compat contract](#2-master-switch--backward-compat-contract)
+2. [Failure-fallback safety contract](#2-failure-fallback-safety-contract)
 3. [Inputs and outputs](#3-inputs-and-outputs)
 4. [Generation model](#4-generation-model)
 5. [Content-anchored fingerprints](#5-content-anchored-fingerprints)
@@ -21,8 +21,7 @@
 9. [Cost and latency model](#9-cost-and-latency-model)
 10. [Walkthroughs](#10-walkthroughs)
 11. [Recommended configurations](#11-recommended-configurations)
-12. [Migration guide](#12-migration-guide)
-13. [Reference — `IterationState` JSON schema v1](#13-reference--iterationstate-json-schema-v1)
+12. [Reference — `IterationState` JSON schema v1](#12-reference--iterationstate-json-schema-v1)
 
 ---
 
@@ -45,45 +44,37 @@ IAR reshapes the feedback:
 - **Dedup**: don't re-flag findings you've already reported that remain open — the developer already knows.
 - **Generation reset**: when the developer pushes new commits, review the new content as if it were a fresh review — don't silence critical bugs in the new code just because you've seen a lot of the file already.
 - **Safety rails**: `critical` severity findings ALWAYS surface, unconditionally. No policy can silence them.
-- **Escape hatch**: developer can apply a label to force a full review whenever they want to see everything again.
+- **Escape hatch**: developer can apply the `iteration-escape-label` to force a full review whenever they want to see everything again (one-shot, state preserved), or remove the `applied-label` before the next run to force a complete state reset (fresh generation, dedup memory wiped).
 
-As of v1.8.0 IAR is **on by default** with the `first-pass-exhaustive` policy — the shape the maintainer team recommends for the majority of consumers. Consumers who prefer the pre-v1.8 review behavior can flip `iteration-awareness-enabled: false` and the runtime becomes byte-identical to prior releases (see § 2).
+IAR ships with the `first-pass-exhaustive` policy — the shape the maintainer team recommends for the majority of consumers. Consumers who want a different convergence profile can pick one of the other three policies (see § 6).
 
 ---
 
-## 2. Master switch + opt-out contract
+## 2. Failure-fallback safety contract
 
-**Contract:** when `iteration-awareness-enabled: false` (explicitly set), the runtime is **byte-identical** to pre-v1.8 releases.
+**Contract:** when the IAR pipeline fails mid-flight (any exception in `run_iar_pre_llm()` or `run_iar_post_llm()`), the reviewer MUST still ship a review. The IAR outputs stay as empty strings (via `write_iar_outputs_empty()`), the tracking marker skips the IAR annotation, and the review posts with the raw LLM findings — the consumer never experiences an IAR bug as "no review at all".
 
 This is enforced by two independent mechanisms:
 
-1. **Structural guard rails.** Every IAR code path in `scripts/reviewer.py` is gated at its call site in `main()`. When the master switch is off, none of the new code executes — the runtime falls through to the pre-IAR path unchanged.
-2. **Regression test suite.** `tests/test_backward_compat_iar_off.py` captures the runtime's output shape with `iteration-awareness-enabled=false` (explicit opt-out) and asserts byte-identical behavior against a mock LLM baseline. This suite runs in CI on every PR and MUST stay green — it is the load-bearing contract for consumers who opt out of the v1.8.0 default flip.
+1. **Structural try/except at every call site.** Both `run_iar_pre_llm()` and `run_iar_post_llm()` are wrapped in `try/except BaseException` in `main()`. On failure the caller logs the exception, leaves the safety-net empty outputs in place, and continues to the baseline review path.
+2. **Regression test suite.** `tests/test_iar_failure_fallback.py` locks the invariant: garbled env vars still produce a valid `IARConfig`, the safety-net writer writes exactly 5 empty outputs, and `write_all_outputs()` on every exit path (skip, success, block) always includes the 5 IAR outputs. This suite runs in CI on every PR and MUST stay green.
 
 **Ways this can be broken:**
-- Removing the guard rails would break Test 1 of the regression suite.
-- Changing the marker title format for IAR-off runs would break Test 2.
-- Adding non-empty values to the 5 new outputs when IAR is off would break Test 3.
-- Adding new debug log lines that fire for IAR-off runs would break Test 4.
+- Removing a try/except around an IAR call site would let an IAR bug surface as a workflow failure.
+- Changing `write_iar_outputs_empty()` to write fewer than 5 keys would break downstream steps that key on `steps.review.outputs.iteration-round`.
+- Making `build_iar_config()` raise on any input would crash the run before the safety net is even in place.
 
-All 4 would fail CI. This is by design.
-
-**Migration guidance (v1.7 → v1.8):**
-- Consumers on `@v1` who don't touch their workflow YAML get IAR + `first-pass-exhaustive` automatically at the next release. Round 1 of the next new-generation review will surface up to 3× as many findings as before (bounded by `exhaustive-first-pass-cap-multiplier`, default `3`); subsequent rounds delegate to `iterative` (dedup only, no cost change).
-- Consumers who want the pre-v1.8 shape can add `iteration-awareness-enabled: false` to their workflow — the regression suite locks byte-identical behavior on that path.
-- Consumers who want IAR but prefer the flat cost profile can add `convergence-policy: iterative` — dedup only, no cap boost.
-- The critical-always-surfaces safety rail is hardcoded and cannot be silenced by any policy or opt-out setting.
+All three would fail CI. This is by design.
 
 ---
 
 ## 3. Inputs and outputs
 
-### 3.1 Inputs (5 — all optional, defaults ship IAR-on)
+### 3.1 Inputs (4 — all optional, tune the pipeline)
 
 | Input | Default | Type | Description |
 |---|---|---|---|
-| `iteration-awareness-enabled` | `true` | boolean | **Master switch.** Ships on. Set to `false` for byte-identical pre-v1.8 behavior; all other IAR inputs are then ignored. |
-| `convergence-policy` | `first-pass-exhaustive` | enum | One of `iterative` \| `first-pass-exhaustive` \| `round-capped` \| `critical-gate`. Only consulted when master switch is on. See § 6. |
+| `convergence-policy` | `first-pass-exhaustive` | enum | One of `iterative` \| `first-pass-exhaustive` \| `round-capped` \| `critical-gate`. See § 6. |
 | `max-review-rounds` | `0` | integer | Hard cap for `round-capped` policy. `0` = unlimited. Ignored by other policies. See § 6.3. |
 | `exhaustive-first-pass-cap-multiplier` | `3` | integer | Multiplier applied to `max-inline-comments` on round 1 of each generation when policy is `first-pass-exhaustive`. Ignored by other policies. See § 6.2. |
 | `iteration-escape-label` | `full-review-please` | string | Label name a human can apply to a PR to force a full review (clears dedup for this run only; does NOT mutate persisted state). See § 8. |
@@ -92,11 +83,11 @@ All 4 would fail CI. This is by design.
 
 | Output | Type | When populated |
 |---|---|---|
-| `iteration-round` | integer string | Round number within the current generation. `1` on first review, resets to `1` on generation change. Empty string when IAR disabled. |
-| `iteration-generation` | integer string | Generation counter. Increments on new commits or rebase. Empty string when IAR disabled. |
-| `iteration-policy-applied` | string | Which policy actually fired this run (usually matches `convergence-policy`, unless overridden by the 30% safety net). Empty string when IAR disabled. |
-| `iteration-tokens-used` | integer string | Sum of input+output LLM tokens for this run. Cost telemetry. Empty string when IAR disabled. |
-| `iteration-cost-vs-baseline-estimate` | string | Heuristic estimate vs a projected non-IAR baseline (e.g. `"-30%"`, `"+15%"`, `"unknown"`). Empty string when IAR disabled. |
+| `iteration-round` | integer string | Round number within the current generation. `1` on first review, resets to `1` on generation change. Empty string if the IAR pipeline crashed. |
+| `iteration-generation` | integer string | Generation counter. Increments on new commits or rebase. Empty string if the IAR pipeline crashed. |
+| `iteration-policy-applied` | string | Which policy actually fired this run (usually matches `convergence-policy`, unless overridden by the 30% safety net). Empty string if the IAR pipeline crashed. |
+| `iteration-tokens-used` | integer string | Sum of input+output LLM tokens for this run. Cost telemetry. Empty string if the IAR pipeline crashed. |
+| `iteration-cost-vs-baseline-estimate` | string | Heuristic estimate vs a projected no-dedup baseline (e.g. `"-30%"`, `"+15%"`, `"unknown"`). Empty string if the IAR pipeline crashed. |
 
 ### 3.3 Environment variable mapping
 
@@ -104,7 +95,6 @@ Each input is forwarded to `scripts/reviewer.py` via the existing `AIPRR_*` conv
 
 | Input | Env var |
 |---|---|
-| `iteration-awareness-enabled` | `AIPRR_ITERATION_AWARENESS_ENABLED` |
 | `convergence-policy` | `AIPRR_CONVERGENCE_POLICY` |
 | `max-review-rounds` | `AIPRR_MAX_REVIEW_ROUNDS` |
 | `exhaustive-first-pass-cap-multiplier` | `AIPRR_EXHAUSTIVE_FIRST_PASS_CAP_MULTIPLIER` |
@@ -122,14 +112,15 @@ A **generation** is a stable diff-content window. Within a single generation, th
 
 This directly solves the "push new commits after convergence" concern: the round counter resets to 1, and any first-pass policies (like `first-pass-exhaustive`) re-fire on the new content instead of accidentally silencing critical bugs.
 
-### 4.2 The 4 transition types
+### 4.2 The 5 transition types
 
 ```python
 class GenerationTransition(str, Enum):
-    FIRST_REVIEW = "first_review"       # No prior state — starting from scratch.
-    SAME_GENERATION = "same_generation" # HEAD unchanged since last review.
-    NEW_COMMITS = "new_commits"         # HEAD advanced; base unchanged.
-    REBASED = "rebased"                 # Base SHA changed (branch rebased).
+    FIRST_REVIEW = "first_review"           # No prior state — starting from scratch.
+    SAME_GENERATION = "same_generation"     # HEAD unchanged since last review.
+    NEW_COMMITS = "new_commits"             # HEAD advanced; base unchanged.
+    REBASED = "rebased"                     # Base SHA changed (branch rebased).
+    USER_FORCED_RESET = "user_forced_reset" # Reviewed label removed → full reset. See § 8.5.
 ```
 
 Detection logic (deterministic, no ambiguity):
@@ -137,6 +128,8 @@ Detection logic (deterministic, no ambiguity):
 - `prior_state.generation_range_hash == current_range_hash` → `SAME_GENERATION`
 - `prior_base_sha != current_base_sha` → `REBASED` (takes precedence over NEW_COMMITS)
 - Otherwise → `NEW_COMMITS`
+
+After the four-way classification above, one **override** may fire: if the consumer's `applied-label` (the "reviewed" label the action stamps on every successful review) is non-empty AND absent from the PR labels AND `prior_state` was not None, the transition is upgraded to `USER_FORCED_RESET` and `prior_state` is discarded before any downstream logic runs. Behaviorally identical to `FIRST_REVIEW` (fresh state, no dedup memory, round-1 exhaustive under the default policy) — the separate enum value only exists so the log and marker annotation can tell developers the reset was a deliberate gesture. Full spec in § 8.5.
 
 ### 4.3 The range hash
 
@@ -248,11 +241,11 @@ Four policies, selected via the `convergence-policy` input. All policies enforce
 **Round 1 of Gen 1:** all findings surface (no prior state to dedup against).
 **Round N of Gen G (N > 1):** dedup silences findings whose fingerprints match `open_fingerprints_this_gen`. Critical severities bypass unconditionally.
 
-**When to use:** cost-sensitive repos, push-heavy workflows where the round-1-of-new-gen boost of `first-pass-exhaustive` would fire frequently. This is the closest-to-baseline policy — cost delta ~0% vs pre-IAR.
+**When to use:** cost-sensitive repos, push-heavy workflows where the round-1-of-new-gen boost of `first-pass-exhaustive` would fire frequently. This is the closest-to-flat-cost policy — cost delta ~0% vs a no-dedup baseline.
 
 **Trade-off:** doesn't accelerate convergence beyond dedup. If the LLM's per-round finding output is non-deterministic (typical), convergence still takes multiple rounds — just without re-flagging already-reported findings.
 
-### 6.2 `first-pass-exhaustive` (shipped default, v1.8.0+)
+### 6.2 `first-pass-exhaustive` (shipped default)
 
 **Behavior:** on round 1 of each generation, the reviewer is instructed to be exhaustive with a higher findings cap. On rounds 2+ within the same generation, delegates to `iterative`.
 
@@ -370,6 +363,36 @@ The escape label is a plain label. It does NOT participate in `.github/workflows
 
 Consumers can rename the label via the `iteration-escape-label` input. Useful when the default conflicts with an existing repo convention.
 
+### 8.5 Full reset via reviewed-label removal
+
+Distinct from the escape label, there is a second **stateful** escape gesture that lets a developer force a complete IAR reset (as opposed to a one-run dedup skip). It uses the labels the workflow already has, so there is nothing new to configure.
+
+**Gesture:** on a PR with the reviewed label attached (e.g. `ai-reviewed`, whatever the consumer set as `applied-label`), the developer removes it. On the next review the reviewer sees that the reviewed label is absent while a prior IAR state still exists in the tracking marker — it interprets that as an intentional reset request.
+
+**Effect (this run):**
+- Transition classified as `USER_FORCED_RESET` (visible in the marker annotation and the workflow log).
+- Prior state is discarded — generation counter resets to 1, round-in-generation resets to 1, `resolved_fingerprints` and `open_fingerprints_this_gen` start empty, `history` starts empty.
+- The default `first-pass-exhaustive` policy fires round-1 exhaustive behaviour on a clean slate — identical to the very first review of the PR.
+- The safety net is deliberately silenced (`new_lines_pct` forced to 0.0) because "fresh start" already implies exhaustive.
+
+**Effect (subsequent runs):** whatever policy the consumer configured resumes normally, but the dedup timeline now starts from this reset point — prior findings that were resolved in earlier generations are treated as unseen and can resurface if the LLM finds them again.
+
+**Why this exists.** The escape-label pattern (§ 8.1–8.4) is one-shot: dedup is bypassed for a single run and state carries on. The reset gesture is for the harder case — the developer suspects the accumulated state itself is wrong (stale fingerprints, drift after a big rebase, or simply "I want to start clean"). Removing the reviewed label is a gesture the developer already makes when they want to re-open a PR for review, so the cost is zero.
+
+**How the two interact.**
+- `full-review-please` label applied AND reviewed label removed → reset takes precedence. The next run is USER_FORCED_RESET (fresh start) rather than an escape-label run (dedup skipped, state preserved).
+- Escape label alone → dedup skipped this run, state preserved.
+- Reviewed label removed alone → USER_FORCED_RESET, state discarded.
+
+**How the two are distinguished in the marker.** The annotation carries the transition name in parentheses — `(escape_label)` for one-shot bypass (state preserved) vs `(user_forced_reset)` for the reset (state discarded).
+
+**No-op cases.** The reset gesture does nothing when:
+- `applied-label` is empty / not configured (the consumer opted out of the reviewed-label workflow entirely).
+- No prior IAR state exists (first-ever review of the PR — no state to reset).
+- The reviewed label is still on the PR at review time (nothing was removed).
+
+**Test coverage:** [`tests/test_iar_observability.py`](../tests/test_iar_observability.py) `RunIarPreLlmTests.test_user_forced_reset_*` (four cases — fires, three no-ops).
+
 ---
 
 ## 9. Cost and latency model
@@ -381,9 +404,9 @@ Consumers can rename the label via the `iteration-escape-label` input. Useful wh
 
 ### 9.2 Lifetime cost matrix (theoretical — validated by dogfooding)
 
-For a typical PR that converges in 5 rounds pre-IAR:
+For a typical PR that would converge in 5 rounds without dedup:
 
-| Round | Baseline (no IAR) | `iterative` | `first-pass-exhaustive` | `round-capped` (N=3) | `critical-gate` |
+| Round | Baseline (no dedup) | `iterative` | `first-pass-exhaustive` | `round-capped` (N=3) | `critical-gate` |
 |---|---|---|---|---|---|
 | Round 1 | X | X | 1.5-2X | X | X |
 | Round 2 | X | 0.9X | 0.9X | 0.9X | 0.9X |
@@ -457,7 +480,7 @@ Trends are inspectable across runs by reading the marker's embedded state block.
 
 ### 10.1 "10-round loop → 3-round convergence" (the primary win)
 
-**Configuration:** `iteration-awareness-enabled: true`, `convergence-policy: first-pass-exhaustive`, `max-review-rounds: 5`, `cap-multiplier: 3`.
+**Configuration:** `convergence-policy: first-pass-exhaustive`, `max-review-rounds: 5`, `cap-multiplier: 3`.
 
 | Event | State transition | User-visible outcome |
 |---|---|---|
@@ -465,7 +488,7 @@ Trends are inspectable across runs by reading the marker's embedded state block.
 | Dev fixes 15 of them, pushes | (same generation — dev didn't add new code) `SAME_GENERATION` → Gen 1 round 2 | Reviewer runs with iterative dedup. Surfaces 5 findings (2 new, 3 carried-over-open). 15 findings silenced as "already reported". |
 | Dev fixes remaining, pushes | `SAME_GENERATION` → Gen 1 round 3 | Reviewer surfaces 1 new finding + 0 carried-over. Dev fixes it, ships. **Converged in 3 rounds.** |
 
-Pre-IAR baseline: same PR would have taken 5-10 rounds, each surfacing new low-priority findings that felt like nagging.
+Without dedup: the same PR would have taken 5-10 rounds, each surfacing new low-priority findings that felt like nagging.
 
 ### 10.2 "Push new commits after convergence" (the correctness win)
 
@@ -502,15 +525,12 @@ Marker title:
 
 ## 11. Recommended configurations
 
-Empirical defaults (theoretical; refined by dogfooding data in Task 10).
-
-### 11.1 Balanced (SHIPPED DEFAULT — v1.8.0+)
+### 11.1 Balanced (shipped default)
 
 This is what every consumer gets by default. **No YAML required** — the values below are the shipped defaults; the block is shown only for clarity:
 
 ```yaml
-# All of these are the v1.8.0+ shipped defaults — do NOT need to be set.
-iteration-awareness-enabled: true
+# All shipped defaults — do NOT need to be set.
 convergence-policy: first-pass-exhaustive
 max-review-rounds: 0                        # unlimited (only meaningful for round-capped)
 exhaustive-first-pass-cap-multiplier: 3
@@ -522,17 +542,15 @@ iteration-escape-label: full-review-please
 ### 11.2 Cost-sensitive
 
 ```yaml
-iteration-awareness-enabled: true
 convergence-policy: iterative
 max-review-rounds: 0  # unlimited
 ```
 
-**Use when:** cost is the primary concern. Cost delta ~0% vs baseline; you get dedup without the round-1 amplification.
+**Use when:** cost is the primary concern. Cost delta ~0% vs a no-dedup baseline; you get dedup without the round-1 amplification.
 
 ### 11.3 Strict-convergence
 
 ```yaml
-iteration-awareness-enabled: true
 convergence-policy: round-capped
 max-review-rounds: 3
 strictness: block-on-critical  # not block-on-warning; see § 6.3 note
@@ -543,7 +561,6 @@ strictness: block-on-critical  # not block-on-warning; see § 6.3 note
 ### 11.4 Discovery / no-nag
 
 ```yaml
-iteration-awareness-enabled: true
 convergence-policy: critical-gate
 ```
 
@@ -551,57 +568,7 @@ convergence-policy: critical-gate
 
 ---
 
-## 12. Migration guide
-
-### 12.1 Upgrading from v1.7 → v1.8.0
-
-**Nothing to do.** IAR is now on by default with the `first-pass-exhaustive` policy. On your next review after upgrading, you'll see:
-- The marker annotation gains a line like `_Iteration-Aware Review: gen 1, round 1, policy=first-pass-exhaustive (first_review) — N surfaced._`
-- Round 1 of each new generation may surface more findings than pre-v1.8 (bounded by `max-inline-comments × 3` under the default multiplier).
-- Rounds 2+ of the same generation dedup against prior unresolved findings.
-- 5 new action outputs populate on every run.
-
-**No other changes needed.** Your existing inputs (`strictness`, `provider`, `api-key`, etc.) work unchanged. The critical-always-surfaces safety rail guarantees no finding that could gate the check is ever silenced.
-
-### 12.2 Tuning after upgrade
-
-If the default profile doesn't suit your workflow:
-
-- Push-heavy repos → set `convergence-policy: iterative` (cost-neutral, dedup only, no round-1 boost).
-- Want a hard upper bound on rounds → `convergence-policy: round-capped` with `max-review-rounds: N`.
-- Manage resolution manually → `convergence-policy: critical-gate` (strict cross-gen dedup).
-- Want to force a full review on demand → apply the `full-review-please` label (or your custom label name via `iteration-escape-label`).
-
-### 12.3 Opting out of IAR entirely
-
-Add `iteration-awareness-enabled: false` to your workflow. The runtime becomes byte-identical to pre-v1.8:
-- No marker annotation.
-- 5 IAR outputs are empty strings; downstream steps reading them see `""`.
-- The 4 other IAR inputs are ignored.
-
-Persisted state in old markers is IGNORED (not deleted). If IAR is re-enabled later, it will resume from that state.
-
-### 12.3 First-PR expectations
-
-The first PR reviewed with IAR enabled will:
-- Be a `FIRST_REVIEW` transition (no prior state).
-- Have no dedup to apply.
-- Behave like a normal review (with the exhaustive prompt if `first-pass-exhaustive` is the policy).
-- Persist state for the next round.
-
-Subsequent runs on the same PR will begin exercising the dedup engine.
-
-### 12.4 Monitoring
-
-Track adoption via:
-- `iteration-tokens-used` output — feed into cost dashboards.
-- `iteration-round` output — flag PRs stuck at high round counts.
-- `iteration-cost-vs-baseline-estimate` output — spot regressions.
-- Marker titles containing `Gen \d+ round \d+` — indicate IAR-enabled reviews.
-
----
-
-## 13. Reference — `IterationState` JSON schema v1
+## 12. Reference — `IterationState` JSON schema v1
 
 Embedded in the tracking marker comment as an HTML-comment block:
 
@@ -630,7 +597,7 @@ Embedded in the tracking marker comment as an HTML-comment block:
 -->
 ```
 
-### 13.1 Field definitions
+### 12.1 Field definitions
 
 | Field | Type | Description |
 |---|---|---|
@@ -644,18 +611,18 @@ Embedded in the tracking marker comment as an HTML-comment block:
 | `history` | list of objects | Append-only summary of past generations. Each object: `{gen, range_hash, rounds_ran, converged, tokens_used, wall_clock_ms}`. Capped to the last 20 entries (`IAR_HISTORY_MAX_ENTRIES`) so the marker body cannot grow unboundedly across a long-lived PR. |
 | `base_sha` | string | The PR base SHA at the start of the current generation. Used by `detect_generation_change` to distinguish `REBASED` (base changed) from `NEW_COMMITS` (base same, head grew). Optional in schema v1 — an empty string means "prior IAR version didn't persist this" and `detect_generation_change` falls back to `NEW_COMMITS` on any hash mismatch (safe fallback: extra exhaustive review, never silent silencing). |
 
-### 13.2 Parse failure handling
+### 12.2 Parse failure handling
 
 If parsing the state block fails for ANY reason (malformed JSON, unknown version, missing fields, wrong types), `read_prior_iteration_state()` returns `None` + emits a debug log. The reviewer treats this as a first-review case.
 
 This is the safest fallback: nothing worse than a normal (non-IAR) review can happen when state is missing or malformed.
 
-### 13.3 Schema evolution
+### 12.3 Schema evolution
 
 Future schema changes will:
 1. Increment `IAR_STATE_SCHEMA_VERSION` in `scripts/reviewer.py`.
 2. Add explicit backward-read logic to `_parse_state_from_marker_body` (e.g. `if data["version"] == 1: hydrate_v1(); elif data["version"] == 2: hydrate_v2()`).
-3. Document the migration in a new `## 13.4 Schema v2` section here.
+3. Document the migration in a new `## 12.4 Schema v2` section here.
 
 No schema version is ever removed. Marker state written by prior versions will always be readable by future runtimes.
 

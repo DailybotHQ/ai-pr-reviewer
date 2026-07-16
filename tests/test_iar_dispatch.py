@@ -60,12 +60,12 @@ def _state(**overrides: Any) -> "reviewer.IterationState":
 
 
 def _cfg(
-    *, policy: str = "iterative", enabled: bool = True,
+    *, policy: str = "iterative",
     max_rounds: int = 0, cap_multiplier: int = 3,
     escape_label: str = "full-review-please",
 ) -> "reviewer.IARConfig":
     return reviewer.IARConfig(
-        enabled=enabled, policy=policy, max_review_rounds=max_rounds,
+        policy=policy, max_review_rounds=max_rounds,
         cap_multiplier=cap_multiplier, escape_label=escape_label,
     )
 

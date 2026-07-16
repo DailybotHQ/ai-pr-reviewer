@@ -1,24 +1,21 @@
 #!/usr/bin/env python3
-"""Opt-out regression suite for the Iteration-Aware Review (IAR) subsystem.
+"""Failure-fallback safety suite for the Iteration-Aware Review (IAR)
+subsystem.
 
-As of v1.8.0 the IAR subsystem is **on by default**
-(`iteration-awareness-enabled: true`, `convergence-policy:
-first-pass-exhaustive`). Consumers who want the pre-v1.8 review shape can
-explicitly set `iteration-awareness-enabled: false` — the load-bearing
-correctness invariant of the opt-out path is:
+IAR is an unconditional subsystem — every review runs the IAR pipeline —
+but the pipeline itself is wrapped in `try/except` at every `main()`
+touchpoint. The load-bearing safety invariant of that wrap is:
 
-    When the master switch is explicitly OFF, the runtime path is
-    byte-identical to prior releases.
+    When IAR crashes mid-flight, the reviewer MUST still ship a review.
+    The 5 IAR action outputs stay as empty strings (via
+    `write_iar_outputs_empty()`), the tracking marker skips the IAR
+    annotation, and the review posts with the raw LLM findings — the
+    consumer never experiences an IAR bug as "no review at all".
 
-This suite verifies that invariant with narrow, pure-logic assertions that
-cannot inadvertently drift as the IAR internals evolve. Any regression here
-means IAR has bled into a code path a consumer opted out of and MUST be
-treated as a blocker.
-
-The file is still named `test_backward_compat_iar_off.py` (rather than
-being renamed to `test_iar_opt_out.py`) so `git blame` continues to point
-at the original intent; the semantics of "off" simply flipped from "the
-default" to "an explicit opt-out" in v1.8.0.
+This suite verifies that invariant with narrow, pure-logic assertions
+that cannot inadvertently drift as the IAR internals evolve. Any
+regression here means an IAR failure mode has bled into a code path
+consumers rely on and MUST be treated as a blocker.
 
 Stdlib `unittest` only — matches the rest of `tests/*`. Run with:
 
@@ -80,143 +77,146 @@ def _parse_github_outputs(raw: str) -> dict[str, str]:
     return result
 
 
-class IAROptOutContractTests(unittest.TestCase):
-    """When a consumer explicitly sets `iteration-awareness-enabled: false`
-    the runtime MUST behave byte-identically to pre-v1.8 releases —
-    regardless of what the other four IAR env vars carry."""
+class IARConfigParsingTests(unittest.TestCase):
+    """Parser contract for the 4 IAR env vars. Every branch of the
+    parser must return a valid `IARConfig` — a misconfigured input can
+    never crash the run because `IARConfig` is built at the top of
+    `main()` before any error handling is in place."""
 
-    def test_build_iar_config_explicit_false_returns_disabled(self) -> None:
-        """`AIPRR_ITERATION_AWARENESS_ENABLED=false` MUST disable IAR
-        end-to-end. Any regression here breaks the opt-out contract."""
-        cfg: reviewer.IARConfig = reviewer.build_iar_config({
-            "AIPRR_ITERATION_AWARENESS_ENABLED": "false",
-        })
-        self.assertFalse(
-            cfg.enabled,
-            "AIPRR_ITERATION_AWARENESS_ENABLED='false' MUST disable IAR. "
-            "Any change that makes this True breaks the v1.8+ opt-out contract.",
-        )
-
-    def test_build_iar_config_switch_off_ignores_other_fields(self) -> None:
-        """When the master switch is explicitly off, the other IAR env
-        vars are still parsed for shape (so a subsequent flip of the
-        master switch never breaks), but the runtime path is byte-
-        identical. This test locks in that the parser is lenient enough
-        to not crash on garbage."""
-        cfg: reviewer.IARConfig = reviewer.build_iar_config({
-            "AIPRR_ITERATION_AWARENESS_ENABLED": "false",
-            "AIPRR_CONVERGENCE_POLICY": "not-a-real-policy",
-            "AIPRR_MAX_REVIEW_ROUNDS": "not-a-number",
-            "AIPRR_EXHAUSTIVE_FIRST_PASS_CAP_MULTIPLIER": "-99",
-            "AIPRR_ITERATION_ESCAPE_LABEL": "",
-        })
-        self.assertFalse(cfg.enabled)
-        # Falls back to defaults; no exception. In v1.8+ the fallback
-        # for an unknown policy is `first-pass-exhaustive` (matches the
-        # action.yml default), but this only matters when the master
-        # switch is on — it's asserted here purely as a shape check.
+    def test_empty_env_returns_defaults(self) -> None:
+        """A completely empty env dict must produce the shipped default
+        profile: `first-pass-exhaustive` policy, unlimited rounds, 3×
+        cap multiplier, `full-review-please` escape label."""
+        cfg: reviewer.IARConfig = reviewer.build_iar_config({})
         self.assertEqual(cfg.policy, reviewer.IAR_POLICY_FIRST_PASS_EXHAUSTIVE)
         self.assertEqual(cfg.max_review_rounds, 0)
-        self.assertEqual(cfg.cap_multiplier, 1)  # clamped up from -99
-        self.assertEqual(cfg.escape_label, reviewer.IAR_DEFAULT_ESCAPE_LABEL)
-
-    def test_build_iar_config_various_falsy_values(self) -> None:
-        """Every accepted "falsy" string keeps IAR off — same shape as
-        every other repo-native bool flag (`author-association`,
-        `label-gate`, etc.). parse_bool contract must stay symmetric
-        across the codebase."""
-        for raw in ("false", "False", "FALSE", "no", "0", "off"):
-            with self.subTest(raw=raw):
-                cfg: reviewer.IARConfig = reviewer.build_iar_config({
-                    "AIPRR_ITERATION_AWARENESS_ENABLED": raw,
-                })
-                self.assertFalse(
-                    cfg.enabled,
-                    f"Raw env value {raw!r} unexpectedly enabled IAR. "
-                    "parse_bool contract must stay symmetric with pre-IAR flags.",
-                )
-
-    def test_build_iar_config_empty_env_returns_v18_defaults(self) -> None:
-        """v1.8.0 behavior change: a completely empty env dict now
-        produces IAR-on with the `first-pass-exhaustive` policy — this
-        matches the shipped action.yml defaults. Consumers who want the
-        pre-v1.8 shape must explicitly set
-        `iteration-awareness-enabled: false`."""
-        cfg: reviewer.IARConfig = reviewer.build_iar_config({})
-        self.assertTrue(
-            cfg.enabled,
-            "v1.8.0+: IAR master switch defaults to True. If this fails, "
-            "either action.yml default was flipped back OR build_iar_config "
-            "no longer matches the action.yml contract.",
-        )
-        self.assertEqual(cfg.policy, reviewer.IAR_POLICY_FIRST_PASS_EXHAUSTIVE)
         self.assertEqual(cfg.cap_multiplier, reviewer.IAR_DEFAULT_CAP_MULTIPLIER)
         self.assertEqual(cfg.escape_label, reviewer.IAR_DEFAULT_ESCAPE_LABEL)
 
-
-class IARConfigParsingTests(unittest.TestCase):
-    """Basic parser contract — validates the shape, not the runtime effect
-    (which the master switch gates)."""
-
-    def test_switch_on_and_valid_policy(self) -> None:
+    def test_valid_policy_and_knobs(self) -> None:
         cfg: reviewer.IARConfig = reviewer.build_iar_config({
-            "AIPRR_ITERATION_AWARENESS_ENABLED": "true",
-            "AIPRR_CONVERGENCE_POLICY": "first-pass-exhaustive",
+            "AIPRR_CONVERGENCE_POLICY": "iterative",
             "AIPRR_MAX_REVIEW_ROUNDS": "5",
             "AIPRR_EXHAUSTIVE_FIRST_PASS_CAP_MULTIPLIER": "4",
             "AIPRR_ITERATION_ESCAPE_LABEL": "audit-me",
         })
-        self.assertTrue(cfg.enabled)
-        self.assertEqual(cfg.policy, "first-pass-exhaustive")
+        self.assertEqual(cfg.policy, "iterative")
         self.assertEqual(cfg.max_review_rounds, 5)
         self.assertEqual(cfg.cap_multiplier, 4)
         self.assertEqual(cfg.escape_label, "audit-me")
 
     def test_unknown_policy_silently_falls_back(self) -> None:
         """Unknown policy values MUST fall back to the shipped default
-        (`first-pass-exhaustive` as of v1.8.0) rather than crashing.
-        The workflow log surfaces the miswiring via the log() call in
-        main()."""
+        rather than crashing. The workflow log surfaces the miswiring
+        via the log() call in main()."""
         cfg: reviewer.IARConfig = reviewer.build_iar_config({
-            "AIPRR_ITERATION_AWARENESS_ENABLED": "true",
             "AIPRR_CONVERGENCE_POLICY": "bogus-policy",
         })
-        self.assertTrue(cfg.enabled)
         self.assertEqual(cfg.policy, reviewer.IAR_POLICY_FIRST_PASS_EXHAUSTIVE)
+
+    def test_garbage_env_still_returns_valid_config(self) -> None:
+        """Every parser branch is lenient enough that a fully-garbled
+        env dict still produces a valid config. This is the load-bearing
+        safety property: `build_iar_config()` is called before the
+        try/except in main() so it CANNOT raise."""
+        cfg: reviewer.IARConfig = reviewer.build_iar_config({
+            "AIPRR_CONVERGENCE_POLICY": "not-a-real-policy",
+            "AIPRR_MAX_REVIEW_ROUNDS": "not-a-number",
+            "AIPRR_EXHAUSTIVE_FIRST_PASS_CAP_MULTIPLIER": "-99",
+            "AIPRR_ITERATION_ESCAPE_LABEL": "",
+        })
+        self.assertEqual(cfg.policy, reviewer.IAR_POLICY_FIRST_PASS_EXHAUSTIVE)
+        self.assertEqual(cfg.max_review_rounds, 0)
+        self.assertEqual(cfg.cap_multiplier, 1)  # clamped up from -99
+        self.assertEqual(cfg.escape_label, reviewer.IAR_DEFAULT_ESCAPE_LABEL)
 
     def test_max_rounds_negative_clamped_to_zero(self) -> None:
         cfg: reviewer.IARConfig = reviewer.build_iar_config({
-            "AIPRR_ITERATION_AWARENESS_ENABLED": "true",
             "AIPRR_MAX_REVIEW_ROUNDS": "-3",
         })
         self.assertEqual(cfg.max_review_rounds, 0)
 
     def test_cap_multiplier_below_1_clamped_to_1(self) -> None:
         cfg: reviewer.IARConfig = reviewer.build_iar_config({
-            "AIPRR_ITERATION_AWARENESS_ENABLED": "true",
             "AIPRR_EXHAUSTIVE_FIRST_PASS_CAP_MULTIPLIER": "0",
         })
         self.assertEqual(cfg.cap_multiplier, 1)
 
     def test_escape_label_defaults_when_blank(self) -> None:
         cfg: reviewer.IARConfig = reviewer.build_iar_config({
-            "AIPRR_ITERATION_AWARENESS_ENABLED": "true",
             "AIPRR_ITERATION_ESCAPE_LABEL": "   ",
         })
         self.assertEqual(cfg.escape_label, reviewer.IAR_DEFAULT_ESCAPE_LABEL)
 
 
-class WriteAllOutputsBackwardCompatTests(unittest.TestCase):
+class WriteIAROutputsEmptyContractTests(unittest.TestCase):
+    """`write_iar_outputs_empty()` is the safety-net writer called by
+    `write_all_outputs()` on every exit path. It MUST write exactly the
+    5 IAR outputs (no more, no fewer) and every value MUST be an empty
+    string. `write_iar_outputs_populated()` later overwrites these on
+    the successful IAR path (last-write-wins on `$GITHUB_OUTPUT`)."""
+
+    def _write_and_read(self, fn: Any, **kwargs: Any) -> dict[str, str]:
+        """Redirect $GITHUB_OUTPUT to a tempfile, invoke `fn(**kwargs)`,
+        parse the resulting file into a dict."""
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False
+        ) as tmp:
+            tmp_path: str = tmp.name
+        prior: str | None = os.environ.get("GITHUB_OUTPUT")
+        try:
+            os.environ["GITHUB_OUTPUT"] = tmp_path
+            fn(**kwargs)
+            with open(tmp_path, encoding="utf-8") as fh:
+                raw: str = fh.read()
+        finally:
+            if prior is None:
+                os.environ.pop("GITHUB_OUTPUT", None)
+            else:
+                os.environ["GITHUB_OUTPUT"] = prior
+            os.unlink(tmp_path)
+        return _parse_github_outputs(raw)
+
+    def test_writes_exactly_5_iar_output_keys(self) -> None:
+        """`write_iar_outputs_empty()` writes exactly the 5 IAR outputs.
+        It MUST NOT accidentally write the 6 core action outputs (that's
+        `write_all_outputs()`'s job) or new keys that would drift the
+        contract."""
+        out: dict[str, str] = self._write_and_read(
+            reviewer.write_iar_outputs_empty
+        )
+        self.assertEqual(
+            set(out.keys()),
+            {"iteration-round", "iteration-generation",
+             "iteration-policy-applied", "iteration-tokens-used",
+             "iteration-cost-vs-baseline-estimate"},
+            "write_iar_outputs_empty MUST write exactly the 5 IAR outputs.",
+        )
+
+    def test_every_iar_output_is_empty_string(self) -> None:
+        out: dict[str, str] = self._write_and_read(
+            reviewer.write_iar_outputs_empty
+        )
+        for key, value in out.items():
+            self.assertEqual(
+                value, "",
+                f"IAR output {key!r} MUST be an empty string on the "
+                "safety-net writer path (populated writer overwrites "
+                "later via last-write-wins).",
+            )
+
+
+class WriteAllOutputsIntegrationTests(unittest.TestCase):
     """The `write_all_outputs()` helper is on every exit path. It MUST
-    still write the 6 pre-IAR outputs, and it MUST write the 5 new IAR
-    outputs as empty strings so downstream steps reading them always see
-    a defined value (never a missing key)."""
+    write the 6 core outputs AND call `write_iar_outputs_empty()` so
+    downstream steps reading `iteration-*` always see a defined value —
+    even when the review skipped (label gate, IAR never ran) or when
+    the review completed but the IAR pipeline crashed (post-LLM never
+    reached the populated-writer)."""
 
     def _write_and_read_outputs(
         self, **kwargs: Any
     ) -> dict[str, str]:
-        """Redirect $GITHUB_OUTPUT to a tempfile, run write_all_outputs,
-        parse the resulting file into a dict."""
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".txt", delete=False
         ) as tmp:
@@ -237,10 +237,10 @@ class WriteAllOutputsBackwardCompatTests(unittest.TestCase):
 
     def test_skipped_path_writes_all_11_outputs(self) -> None:
         """The skip path (e.g. author-association gate rejected the PR)
-        must write all 6 pre-IAR outputs AND all 5 IAR outputs. That's
-        11 total. IAR outputs must be empty strings by default."""
+        must write all 6 core outputs AND all 5 IAR outputs as empty
+        strings — IAR never ran, so downstream steps see empty."""
         out: dict[str, str] = self._write_and_read_outputs(skipped=True)
-        pre_iar_keys: set[str] = {
+        core_keys: set[str] = {
             "skipped", "severity", "inline-attached",
             "inline-dropped", "blocked", "review-url",
         }
@@ -249,30 +249,28 @@ class WriteAllOutputsBackwardCompatTests(unittest.TestCase):
             "iteration-policy-applied", "iteration-tokens-used",
             "iteration-cost-vs-baseline-estimate",
         }
-        for key in pre_iar_keys | iar_keys:
+        for key in core_keys | iar_keys:
             self.assertIn(
                 key, out,
                 f"Missing output {key!r} — write_all_outputs contract broken.",
             )
-        # Pre-IAR shape on skip.
         self.assertEqual(out["skipped"], "true")
         self.assertEqual(out["severity"], "none")
         self.assertEqual(out["inline-attached"], "0")
         self.assertEqual(out["inline-dropped"], "0")
         self.assertEqual(out["blocked"], "false")
         self.assertEqual(out["review-url"], "")
-        # IAR values MUST be empty strings when the runtime never
-        # populated them (i.e. IAR was disabled OR the code path never
-        # reached the IAR-populating helper).
         for key in iar_keys:
             self.assertEqual(
                 out[key], "",
-                f"IAR output {key!r} MUST be empty string on IAR-off paths.",
+                f"IAR output {key!r} MUST be empty string on the "
+                "skip path (IAR never ran).",
             )
 
-    def test_success_path_writes_all_11_outputs(self) -> None:
-        """The success path with a real severity + attached comments
-        still keeps the 5 IAR outputs empty when IAR is off."""
+    def test_success_path_iar_defaults_before_populate(self) -> None:
+        """`write_all_outputs()` writes IAR outputs as empty strings.
+        The populated writer runs after and overwrites — this test
+        just verifies the safety-net writer is on every path."""
         out: dict[str, str] = self._write_and_read_outputs(
             skipped=False,
             severity="warning",
@@ -290,7 +288,9 @@ class WriteAllOutputsBackwardCompatTests(unittest.TestCase):
             out["review-url"],
             "https://github.com/x/y/pull/1#pullrequestreview-42",
         )
-        # All 5 IAR outputs empty.
+        # All 5 IAR outputs start empty; the populated writer (called
+        # separately after run_iar_post_llm) is responsible for
+        # overwriting them on the success path.
         self.assertEqual(out["iteration-round"], "")
         self.assertEqual(out["iteration-generation"], "")
         self.assertEqual(out["iteration-policy-applied"], "")
@@ -298,7 +298,9 @@ class WriteAllOutputsBackwardCompatTests(unittest.TestCase):
         self.assertEqual(out["iteration-cost-vs-baseline-estimate"], "")
 
     def test_blocked_path_writes_all_11_outputs(self) -> None:
-        """Strictness-blocked exit path also writes IAR outputs empty."""
+        """Strictness-blocked exit path also writes IAR outputs empty by
+        default. IAR still runs on this path (it isn't gated on
+        blocking), but the safety-net writer fires first."""
         out: dict[str, str] = self._write_and_read_outputs(
             skipped=False,
             severity="critical",
@@ -308,14 +310,13 @@ class WriteAllOutputsBackwardCompatTests(unittest.TestCase):
             review_url="https://github.com/x/y/pull/1#pullrequestreview-99",
         )
         self.assertEqual(out["blocked"], "true")
-        # Master-switch-off contract: IAR outputs stay empty.
         self.assertEqual(out["iteration-round"], "")
         self.assertEqual(out["iteration-cost-vs-baseline-estimate"], "")
 
 
 class IARConstantsFrozenTests(unittest.TestCase):
     """Small guard against accidental drift in IAR constants that other
-    tasks (3–8) will depend on. If a constant changes intentionally, this
+    IAR subsystems depend on. If a constant changes intentionally, this
     test needs an intentional update — that's the point."""
 
     def test_valid_policies_tuple(self) -> None:
@@ -347,46 +348,29 @@ class IARConstantsFrozenTests(unittest.TestCase):
         self.assertEqual(reviewer.IAR_STATE_SCHEMA_VERSION, 1)
 
 
-class IARDoesNotLeakIntoOtherCodePathsTests(unittest.TestCase):
+class IARModuleSurfaceContainmentTests(unittest.TestCase):
     """Sanity-check that the IAR module surface is small and contained.
-    If a future refactor mixes IAR into an unrelated function, this test
-    should be the first to fail."""
+    If a future refactor mixes IAR into an unrelated function, this
+    test should be the first to fail."""
 
     def test_iar_config_dataclass_is_frozen(self) -> None:
-        """IARConfig is built once per run and passed around. A frozen
+        """`IARConfig` is built once per run and passed around. A frozen
         dataclass prevents accidental mutation deep in the runtime."""
         cfg: reviewer.IARConfig = reviewer.build_iar_config({})
         with self.assertRaises((AttributeError, Exception)):
-            cfg.enabled = True  # type: ignore[misc]
+            cfg.policy = "iterative"  # type: ignore[misc]
 
-    def test_write_iar_outputs_empty_writes_exactly_5_keys(self) -> None:
-        """`write_iar_outputs_empty()` is the sole helper that populates
-        IAR outputs on the off path. It must write exactly the 5 IAR
-        outputs (no more, no fewer) so it can be swapped for the
-        populate-real-values helper in Task 8 without contamination."""
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", delete=False
-        ) as tmp:
-            tmp_path: str = tmp.name
-        prior: str | None = os.environ.get("GITHUB_OUTPUT")
-        try:
-            os.environ["GITHUB_OUTPUT"] = tmp_path
-            reviewer.write_iar_outputs_empty()
-            with open(tmp_path, encoding="utf-8") as fh:
-                raw: str = fh.read()
-        finally:
-            if prior is None:
-                os.environ.pop("GITHUB_OUTPUT", None)
-            else:
-                os.environ["GITHUB_OUTPUT"] = prior
-            os.unlink(tmp_path)
-        keys: set[str] = set(_parse_github_outputs(raw).keys())
+    def test_iar_config_has_exactly_4_fields(self) -> None:
+        """The public shape of `IARConfig`. Adding a field here means
+        adding an env var, an `action.yml` input, an `AIPRR_*`
+        docstring, and a row in the setup skill reference. Locking the
+        field count forces authors to touch this test as a checklist."""
+        from dataclasses import fields
+        got_fields: set[str] = {f.name for f in fields(reviewer.IARConfig)}
         self.assertEqual(
-            keys,
-            {"iteration-round", "iteration-generation",
-             "iteration-policy-applied", "iteration-tokens-used",
-             "iteration-cost-vs-baseline-estimate"},
-            "write_iar_outputs_empty MUST write exactly the 5 IAR outputs.",
+            got_fields,
+            {"policy", "max_review_rounds", "cap_multiplier",
+             "escape_label"},
         )
 
 

@@ -9,6 +9,7 @@
 | [`basic.yml`](basic.yml) | The minimum — API key + GitHub token, defaults for everything else. Same shape as the "Quick start" in the root [`../README.md`](../README.md). |
 | [`open-source-safe.yml`](open-source-safe.yml) | **Public repo, safest defaults.** Combines the write-tier `author-association` gate, `label-gate: ai-review`, and `trigger-mode: label-once` so external contributors' PRs never trigger the reviewer (prevents LLM-budget abuse). Recommended starting point for any public open-source project. |
 | [`label-gated.yml`](label-gated.yml) | Only run when the PR carries a specific label (e.g. `ready`); apply another label after a successful review (e.g. `pr-reviewed`). Keeps work-in-progress noise out of the review queue. |
+| [`skip-review-label.yml`](skip-review-label.yml) | **Emergency-bypass label.** When the PR carries `skip-ai-review` (opt-in, configurable), the reviewer short-circuits to success — no LLM call, GitHub check green. For hotfixes, rollbacks, or trivially-safe commits. Security: pair with a ruleset that restricts who can apply the label. |
 | [`strict.yml`](strict.yml) | Fail the GitHub check on critical (or critical + warning) findings — pair with a branch-protection rule that requires the check to pass. |
 | [`custom-prompt.yml`](custom-prompt.yml) | Point the action at a house-rules prompt inside the consumer's own repo (full replacement). |
 | [`custom-prompt-per-stack.yml`](custom-prompt-per-stack.yml) | Layer a stack-specific extension on top of the bundled default prompt. See [`prompts/`](prompts/). |

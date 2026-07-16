@@ -238,21 +238,57 @@ jobs:
           # than one provider on the same PR".
           #
           # Iteration-Aware Review — dogfood (Rule #10 pillar A).
-          # As of v1.8.0 IAR ships on by default with `first-pass-exhaustive`;
-          # the block below is kept explicit as living documentation of the
-          # profile self-review exercises, but every value here matches the
-          # shipped default (`max-review-rounds: 5` differs from the shipped
-          # `0`, on purpose — self-review verifies the `round-capped`
-          # code path composes correctly with `first-pass-exhaustive`).
-          # Every self-review job exercises the full pre-LLM + post-LLM
-          # IAR path in production; the 429-test regression suite guards
-          # the explicit-opt-out (`iteration-awareness-enabled: false`)
-          # code path separately.
-          iteration-awareness-enabled: true                # shipped default
+          # Every value below matches the shipped default and could be
+          # omitted entirely — kept explicit as living documentation of
+          # the profile self-review exercises. The one exception is
+          # `max-review-rounds: 5` which differs from the shipped `0`
+          # (unlimited) on purpose: self-review verifies that the
+          # `round-capped` code path composes correctly with
+          # `first-pass-exhaustive`. Every self-review job exercises
+          # the full pre-LLM + post-LLM IAR path in production; the
+          # failure-fallback safety contract is locked separately by
+          # tests/test_iar_failure_fallback.py.
+          #
+          # Manual USER_FORCED_RESET smoke test (docs/ITERATION_AWARENESS.md § 8.5):
+          # this workflow also dogfoods the reset gesture. To verify it end-to-end
+          # on any PR that has already been self-reviewed at least once:
+          #   1. Remove the provider's `self-reviewed:<provider>` label (the
+          #      `applied-label` value below, per matrix leg — e.g.
+          #      `self-reviewed:anthropic`). Removing this label does NOT trigger
+          #      the workflow on its own; it just changes the PR's label state.
+          #   2. Remove the `ready` label. Same — no workflow trigger fires.
+          #   3. Re-add `ready`. The workflow fires (`types: [labeled]`); IAR sees
+          #      the reviewed label is missing while prior state still exists in
+          #      the marker → transition = USER_FORCED_RESET, prior state
+          #      discarded, round 1 exhaustive on a clean slate.
+          # Verification signals to look for on the completed review comment:
+          #   - Marker annotation reads `(user_forced_reset)` (not `(new_commits)`).
+          #   - `iteration-generation` output = 1; `iteration-round` output = 1.
+          #   - No prior findings are silenced as dedup — the dedup memory is gone.
+          # Scope: each provider maintains its own marker + IAR state, so the reset
+          # is scoped to whichever `self-reviewed:*` label you removed. Removing
+          # all four resets every provider's timeline independently.
           convergence-policy: first-pass-exhaustive        # shipped default
           exhaustive-first-pass-cap-multiplier: 3          # shipped default
           max-review-rounds: 5                             # dogfood-only override (default is 0/unlimited)
           iteration-escape-label: full-review-please       # shipped default
+          # Emergency-bypass label — dogfoods docs/TRIGGER_MODES.md
+          # § "Emergency-bypass label". Enabled here so the short-circuit
+          # path runs in production (zero LLM tokens on any PR that carries
+          # `skip-ai-review`). Manual smoke test:
+          #   1. On any PR with `ready` applied and a prior self-review run,
+          #      add the `skip-ai-review` label.
+          #   2. Remove and re-add `ready` to re-trigger the workflow.
+          #   3. Expected: the reviewer posts a `⏭️ skipped` tracking comment
+          #      naming `skip-ai-review`, does NOT stamp `self-reviewed:*`,
+          #      does NOT touch the IAR marker state, and the leg reports
+          #      success (green) so the `Self-review gate` also passes.
+          # Human review remains a separate concern — the AI-review skip is
+          # orthogonal to whatever approval / branch-protection rules the
+          # repo enforces. Consumers who make the AI review part of their
+          # merge gate should restrict who can apply `skip-ai-review` via a
+          # GitHub ruleset (see docs/TRIGGER_MODES.md for the worked pattern).
+          skip-review-label: skip-ai-review
 
   # ---------------------------------------------------------------------------
   # Stable-named MERGE GATE — the one check with a stable name across events

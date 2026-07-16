@@ -8,53 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Iteration-Aware Review (IAR) — convergence subsystem, on by default.**
-  New master switch `iteration-awareness-enabled` (default `true`) makes
-  the reviewer memory-aware across rounds: dedupes findings against prior
-  reports using content-anchored fingerprints (hash of the finding + ~20
-  lines of surrounding code), tracks generations (new commits or rebase
-  reset the round counter), and applies one of four convergence policies
-  (`iterative`, `first-pass-exhaustive` **— shipped default**,
+- **Iteration-Aware Review (IAR) — convergence subsystem.** Every
+  review now runs the IAR pipeline: dedupes findings against prior
+  reports using content-anchored fingerprints (hash of the finding +
+  ~20 lines of surrounding code), tracks generations (new commits or
+  rebase reset the round counter), and applies one of four convergence
+  policies (`iterative`, `first-pass-exhaustive` **— shipped default**,
   `round-capped`, `critical-gate`). **Critical severity findings ALWAYS
   surface unconditionally** — hardcoded safety rail, non-configurable.
-  Human escape hatch via a `full-review-please` label that forces a full
-  review without mutating persisted state. Full spec in
+  Human escape hatch via a `full-review-please` label that forces a
+  full review without mutating persisted state. Full spec in
   [docs/ITERATION_AWARENESS.md](docs/ITERATION_AWARENESS.md).
 
-### Changed (v1.8.0 default flip)
-- **`iteration-awareness-enabled` default is now `true`** (was `false` in
-  the pre-release preview). This means consumers on `@v1` who don't
-  configure anything get IAR automatically. Steady-state cost delta is
-  `+0%` for every policy; the shipped `first-pass-exhaustive` boosts
-  round 1 of each new generation (transient +205% on that specific round
-  under the default cap multiplier `3×`), then delegates to `iterative`
-  for rounds 2+. Weighted-lifetime cost vs the pre-IAR "infinite loop"
-  baseline is `~-42%` because IAR converges in ~half the rounds.
-- **`convergence-policy` default is now `first-pass-exhaustive`** (was
-  `iterative`). Matches the recommended profile from
-  [docs/PERFORMANCE.md](docs/PERFORMANCE.md) and directly addresses the
-  original developer pain: *"prefiero que me saques 20 warnings de golpe
-  a tener que hacer 10 loops"*.
-- **Opt-out:** consumers who want the pre-v1.8 review shape can set
-  `iteration-awareness-enabled: false`. The 19-test regression suite
-  `tests/test_backward_compat_iar_off.py` locks byte-identical behavior
-  on that path.
-
 ### Public surface
-- 5 new inputs (all optional; defaults now match the shipped IAR-on
-  profile): `iteration-awareness-enabled` (`true`), `convergence-policy`
+- 4 new tunable inputs (all optional): `convergence-policy`
   (`first-pass-exhaustive`), `max-review-rounds` (`0`),
   `exhaustive-first-pass-cap-multiplier` (`3`),
   `iteration-escape-label` (`full-review-please`).
-- 5 new outputs: populated on every enabled run, empty strings when IAR
-  is explicitly disabled (`iteration-awareness-enabled: false`) —
-  downstream steps reading them always see a defined value:
+- 5 new outputs, populated on every successful IAR pipeline run and
+  written as empty strings by the safety-net writer if the pipeline
+  crashes — downstream steps always see a defined value:
   `iteration-round`, `iteration-generation`, `iteration-policy-applied`,
   `iteration-tokens-used`, `iteration-cost-vs-baseline-estimate`.
-- The 5 inputs and 5 outputs are additive to `action.yml`. The behavior
-  change (dedup + exhaustive round 1) affects any consumer on `@v1` who
-  doesn't explicitly opt out — but the critical-always-surfaces safety
-  rail guarantees no finding that could gate the check is ever silenced.
 
 ### Convergence policies
 - **`first-pass-exhaustive`** (shipped default): round 1 of each
@@ -64,11 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   conciseness. Round 2+ of the same generation delegate to `iterative`
   (dedup only). Directly solves the "same warnings on every re-run"
   symptom by front-loading the exhaustive pass.
-- **`iterative`** (cost-neutral alternative — set explicitly to switch):
-  dedup only, no cap boost. Steady-state LLM cost is the pre-IAR
-  baseline; the reviewer just posts *deltas*. Recommended for
-  push-heavy workflows where round 1 of each new generation would fire
-  frequently.
+- **`iterative`** (cost-neutral alternative): dedup only, no cap boost.
+  Steady-state LLM cost is the no-dedup baseline; the reviewer just
+  posts *deltas*. Recommended for push-heavy workflows where round 1
+  of each new generation would fire frequently.
 - **`round-capped`** (`max-review-rounds: N`): behaves like `iterative`
   for the first N rounds of a generation; from round N+1 onward,
   non-critical findings are silenced. Criticals still surface (safety
@@ -80,7 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-critical finding the developer previously fixed does not
   resurface even after new commits. Criticals still surface.
 
-### Safety net + escape hatch
+### Safety net + escape hatches
 - **30% new-lines safety net**: when a `NEW_COMMITS` or `REBASED`
   transition adds ≥ 30% new lines to the current diff, the dispatcher
   forces `first-pass-exhaustive` for that run regardless of configured
@@ -89,14 +63,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this label to a PR bypasses dedup for the next run only. Persisted
   state is preserved so the following normal run resumes the dedup
   timeline from before the escape.
+- **User-forced reset via reviewed-label removal**: on a PR that already
+  has an IAR state block and a reviewed label (whatever the consumer
+  set as `applied-label`, e.g. `ai-reviewed`), removing the reviewed
+  label before the next review triggers a full IAR reset. The next
+  run is classified as `USER_FORCED_RESET` — prior state is discarded,
+  the generation counter restarts at 1, `resolved_fingerprints` and
+  `open_fingerprints_this_gen` reset to empty, and round-1 exhaustive
+  fires on a clean slate under the default policy. Reuses the labels
+  the workflow already has — no new inputs, no new outputs. Distinct
+  from the escape label (which is one-shot with state preserved):
+  removing the reviewed label is the "start clean" gesture, applying
+  the escape label is the "see everything this once" gesture. Full
+  spec in [docs/ITERATION_AWARENESS.md § 8.5](docs/ITERATION_AWARENESS.md).
 
 ### Observability + cost telemetry
 - IAR emits five populated action outputs (`iteration-round`,
   `iteration-generation`, `iteration-policy-applied`,
   `iteration-tokens-used`, `iteration-cost-vs-baseline-estimate`) on
-  every enabled run. When disabled, all five are empty strings —
-  downstream steps always see a defined value (last-write-wins on
-  `$GITHUB_OUTPUT`).
+  every successful run. Written as empty strings by
+  `write_iar_outputs_empty()` on every exit path first, then overwritten
+  on the successful path via last-write-wins on `$GITHUB_OUTPUT`.
 - The tracking-marker comment gains a one-line human-readable
   annotation (gen, round, policy, transition, surfaced/silenced
   counts) plus an embedded JSON state block the next run parses.
@@ -108,9 +95,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Failure semantics
 - IAR wraps its pre-LLM and post-LLM steps in `try/except` at the
   `main()` call site. On any IAR failure the reviewer logs the
-  exception and falls back to baseline (IAR-off) behavior — the CI
+  exception and falls back to the baseline review path — the CI
   check still gets a review, IAR just skips that specific run.
   Consumers never experience an IAR bug as "no review at all".
+
+### Emergency-bypass label (`skip-review-label`)
+- **New optional input `skip-review-label`.** Opt-in emergency-bypass
+  hatch for hotfixes, rollbacks, and trivially-safe changes where an
+  LLM review would burn tokens for no incremental value. When BOTH the
+  workflow trigger fires AND the configured label is on the PR, the
+  reviewer short-circuits BEFORE the LLM call: no findings, no state
+  mutation, GitHub check reports success (exit 0) so the merge can
+  proceed. A `⏭️ skipped` tracking comment records the skip and names
+  the label so the audit trail stays intact.
+- **Zero side effects on skip.** The `applied-label` is NOT stamped
+  (applying it would misrepresent an unreviewed PR as reviewed); IAR
+  state is NOT mutated (the next non-skip run resumes exactly where
+  the pipeline left off); `collapse-previous` is NOT run (prior
+  reviews stay visible so the human still has context before merging).
+- **Empty default = feature disabled.** Consumers must consciously
+  configure a label name to activate the bypass — no accidental
+  bypass paths.
+- **Security.** Anyone who can label a PR can bypass code review via
+  this gesture. Consumers who care must combine the input with a
+  ruleset / CODEOWNERS rule restricting who can apply the label —
+  the runtime does not police that. Full contract + security notes
+  in [docs/TRIGGER_MODES.md § Emergency-bypass label](docs/TRIGGER_MODES.md).
 
 ### Documentation + examples
 - New authoritative spec at [docs/ITERATION_AWARENESS.md](docs/ITERATION_AWARENESS.md).
@@ -121,19 +131,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [docs/PRODUCT_SPEC.md](docs/PRODUCT_SPEC.md),
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - README gains a feature callout in "What you get out of the box" and
-  the inputs/outputs tables list all 5 new inputs + 5 new outputs.
+  the inputs/outputs tables list all 4 new inputs + 5 new outputs.
 
-### Regression contract
-- New test suite `tests/test_backward_compat_iar_off.py` asserts
-  byte-identical runtime behavior when the master switch is explicitly
-  set to `false`. CI fails any PR where this suite regresses. This is
-  the load-bearing contract for consumers who opt out of the v1.8.0
-  default flip.
+### Safety contract
+- New test suite `tests/test_iar_failure_fallback.py` locks the
+  try/except safety invariant: garbled env vars still produce a valid
+  `IARConfig`, `write_iar_outputs_empty()` always writes exactly 5
+  empty outputs, and `write_all_outputs()` on every exit path
+  (skip, success, block) always includes the 5 IAR outputs. CI fails
+  any PR where this suite regresses.
 - 190+ additional unit tests across
   `test_iar_state_layer.py`, `test_iar_generation_tracking.py`,
   `test_iar_dedup.py`, `test_iar_policies.py`, `test_iar_dispatch.py`,
   and `test_iar_observability.py` cover the pure IAR helpers. Total
-  suite grew from 242 to **429 tests** (all passing).
+  suite: **429 tests** (all passing).
 
 - **New "Security audit alignment" section in `.review/extension.md`.**
   Codifies the review rules that keep the two external security

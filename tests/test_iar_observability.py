@@ -1,11 +1,11 @@
 """Unit tests for the IAR observability layer + main() integration
-scaffolding (Task 8 of PLAN_iteration_aware_review).
+scaffolding.
 
 Scope: the pure helpers that surround the `main()` wiring. The wiring
-itself is validated by (a) the backward-compat regression suite
-(`test_backward_compat_iar_off.py`) proving the IAR-off path is
-byte-identical, and (b) the dogfood run on self-review.yml which
-exercises the full end-to-end path against a real PR.
+itself is validated by (a) the failure-fallback regression suite
+(`test_iar_failure_fallback.py`) locking the try/except safety contract,
+and (b) the dogfood run on self-review.yml which exercises the full
+end-to-end path against a real PR.
 
 These tests focus on:
 - `RunTelemetry` — wall-clock computation, defaults.
@@ -80,7 +80,7 @@ from scripts.reviewer import (  # noqa: E402
 def _parse_github_outputs(path: str) -> dict[str, str]:
     """Parse a $GITHUB_OUTPUT file — supports both single-line
     `key=value` and multi-line HEREDOC formats. Mirrors the parser in
-    test_backward_compat_iar_off.py so both suites read the runtime's
+    test_iar_failure_fallback.py so both suites read the runtime's
     output format identically."""
     outputs: dict[str, str] = {}
     with open(path, "r", encoding="utf-8") as fh:
@@ -585,7 +585,7 @@ class RunIarPreLlmTests(unittest.TestCase):
 
     def _iar_config(self, *, policy: str = IAR_POLICY_ITERATIVE) -> IARConfig:
         return IARConfig(
-            enabled=True, policy=policy,
+            policy=policy,
             max_review_rounds=0, cap_multiplier=3, escape_label="full-review-please",
         )
 
@@ -669,6 +669,139 @@ class RunIarPreLlmTests(unittest.TestCase):
         self.assertEqual(ctx.transition, GenerationTransition.NEW_COMMITS)
         self.assertEqual(ctx.new_lines_pct, 42.5)
 
+    # ------------------------------------------------------------------
+    # User-forced reset (reviewed-label absence)
+    # ------------------------------------------------------------------
+
+    def test_user_forced_reset_when_reviewed_label_absent_with_prior_state(
+        self,
+    ) -> None:
+        """Reviewed label absent + prior state present → USER_FORCED_RESET,
+        prior_state wiped to None, new_lines_pct forced to 0.0 so the
+        safety net can't fire (irrelevant when we're starting fresh)."""
+        prior_state: IterationState = new_iteration_state(
+            generation=5, generation_range_hash="oldhash",
+            round_in_generation=3, base_sha="baseabc",
+            head_sha="prior_head",
+        )
+        with patch.object(
+            reviewer, "read_prior_iteration_state", return_value=prior_state,
+        ), patch.object(
+            reviewer, "_resolve_base_sha", return_value="basexyz",
+        ), patch.object(
+            reviewer, "compute_generation_range_hash", return_value="newhash",
+        ), patch.object(
+            reviewer, "_fetch_pr_labels",
+            return_value=["Ready", "priority:high"],  # reviewed label removed
+        ), patch.object(
+            reviewer, "compute_new_lines_pct", return_value=42.5,
+        ) as mock_new_lines:
+            ctx: IARPreLLMContext = run_iar_pre_llm(
+                iar_config=self._iar_config(),
+                repo="a/b", pr_number=1, gh_token="t",
+                base_ref="main", head_sha="head123",
+                base_max_inline_comments=10,
+                applied_label="ai-reviewed",
+            )
+        self.assertEqual(
+            ctx.transition, GenerationTransition.USER_FORCED_RESET
+        )
+        self.assertIsNone(ctx.prior_state)
+        self.assertEqual(
+            ctx.new_lines_pct, 0.0,
+            msg="USER_FORCED_RESET must zero out new_lines_pct so the "
+                "safety net cannot fire on a fresh-start run.",
+        )
+        # compute_new_lines_pct MAY have been called during the initial
+        # NEW_COMMITS detection (before the reset override kicks in),
+        # so we don't assert on the call count — only on the effective
+        # value that survives to the returned context.
+        _ = mock_new_lines
+
+    def test_user_forced_reset_no_op_when_reviewed_label_empty(self) -> None:
+        """Consumer didn't set a reviewed label → the gesture can't
+        exist, USER_FORCED_RESET never fires even if prior state exists."""
+        prior_state: IterationState = new_iteration_state(
+            generation=2, generation_range_hash="samehash",
+            round_in_generation=1, base_sha="baseabc",
+            head_sha="prior_head",
+        )
+        with patch.object(
+            reviewer, "read_prior_iteration_state", return_value=prior_state,
+        ), patch.object(
+            reviewer, "_resolve_base_sha", return_value="baseabc",
+        ), patch.object(
+            reviewer, "compute_generation_range_hash", return_value="samehash",
+        ), patch.object(
+            reviewer, "_fetch_pr_labels", return_value=["Ready"],
+        ):
+            ctx: IARPreLLMContext = run_iar_pre_llm(
+                iar_config=self._iar_config(),
+                repo="a/b", pr_number=1, gh_token="t",
+                base_ref="main", head_sha="head123",
+                base_max_inline_comments=10,
+                applied_label="",  # not configured
+            )
+        self.assertEqual(
+            ctx.transition, GenerationTransition.SAME_GENERATION
+        )
+        self.assertIs(ctx.prior_state, prior_state)
+
+    def test_user_forced_reset_no_op_when_reviewed_label_still_present(
+        self,
+    ) -> None:
+        """Reviewed label still on PR → not a reset gesture, IAR
+        proceeds along the normal generation path."""
+        prior_state: IterationState = new_iteration_state(
+            generation=2, generation_range_hash="samehash",
+            round_in_generation=1, base_sha="baseabc",
+            head_sha="prior_head",
+        )
+        with patch.object(
+            reviewer, "read_prior_iteration_state", return_value=prior_state,
+        ), patch.object(
+            reviewer, "_resolve_base_sha", return_value="baseabc",
+        ), patch.object(
+            reviewer, "compute_generation_range_hash", return_value="samehash",
+        ), patch.object(
+            reviewer, "_fetch_pr_labels",
+            return_value=["Ready", "ai-reviewed"],
+        ):
+            ctx: IARPreLLMContext = run_iar_pre_llm(
+                iar_config=self._iar_config(),
+                repo="a/b", pr_number=1, gh_token="t",
+                base_ref="main", head_sha="head123",
+                base_max_inline_comments=10,
+                applied_label="ai-reviewed",
+            )
+        self.assertEqual(
+            ctx.transition, GenerationTransition.SAME_GENERATION
+        )
+        self.assertIs(ctx.prior_state, prior_state)
+
+    def test_user_forced_reset_no_op_on_first_review(self) -> None:
+        """No prior state → reset gesture is undefined, transition
+        stays FIRST_REVIEW even if the reviewed label is absent (which
+        it always is on a first-ever review)."""
+        with patch.object(
+            reviewer, "read_prior_iteration_state", return_value=None,
+        ), patch.object(
+            reviewer, "_resolve_base_sha", return_value="baseabc",
+        ), patch.object(
+            reviewer, "compute_generation_range_hash", return_value="rangehash",
+        ), patch.object(
+            reviewer, "_fetch_pr_labels", return_value=["Ready"],
+        ):
+            ctx: IARPreLLMContext = run_iar_pre_llm(
+                iar_config=self._iar_config(),
+                repo="a/b", pr_number=1, gh_token="t",
+                base_ref="main", head_sha="head123",
+                base_max_inline_comments=10,
+                applied_label="ai-reviewed",
+            )
+        self.assertEqual(ctx.transition, GenerationTransition.FIRST_REVIEW)
+        self.assertIsNone(ctx.prior_state)
+
 
 # ---------------------------------------------------------------------------
 # run_iar_post_llm
@@ -679,7 +812,7 @@ class RunIarPostLlmTests(unittest.TestCase):
 
     def _iar_config(self, *, policy: str = IAR_POLICY_ITERATIVE) -> IARConfig:
         return IARConfig(
-            enabled=True, policy=policy,
+            policy=policy,
             max_review_rounds=0, cap_multiplier=3, escape_label="full-review-please",
         )
 

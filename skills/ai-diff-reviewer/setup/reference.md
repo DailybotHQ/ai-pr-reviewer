@@ -175,6 +175,32 @@ Every workflow using AI Diff Reviewer sets these two.
   successful, non-blocked review (e.g. `pr-reviewed`).
 - **Empty means:** no label is applied, but the review still runs.
 
+### `skip-review-label`
+
+- **Default:** `''` (empty — feature disabled).
+- **What it is:** Optional emergency-bypass label (e.g. `skip-ai-review`).
+  When BOTH the workflow trigger fires AND this label is on the PR,
+  the reviewer short-circuits: no LLM call, no findings, no state
+  mutation, the GitHub check reports success (exit 0) so the merge can
+  proceed. A `⏭️ skipped` tracking comment records the bypass and names
+  the label so the audit trail is intact.
+- **When to enable:** you want an emergency-bypass hatch for
+  hotfixes, rollbacks, or trivially-safe changes where an LLM review
+  would burn tokens for no incremental value.
+- **What is NOT done on skip:** `applied-label` is NOT stamped
+  (applying it would misrepresent an unreviewed PR as reviewed),
+  IAR state is NOT mutated (the next non-skip run resumes exactly
+  where the pipeline left off), and `collapse-previous` is NOT run
+  (prior reviews stay visible so the human reviewer still has
+  context).
+- **Security:** anyone who can label a PR can bypass code review.
+  Combine this input with a GitHub ruleset or CODEOWNERS-adjacent
+  policy that restricts who can apply the label. The runtime does
+  not police that — it's a repository-policy question the consumer
+  owns.
+- **See:** `docs/TRIGGER_MODES.md § Emergency-bypass label` in the
+  action repo for the full contract and worked security example.
+
 ---
 
 ## Presentation
@@ -354,34 +380,23 @@ These inputs affect only the CLI providers (`claude-code`, `cursor`,
 
 ---
 
-## Iteration-Aware Review (IAR) — on by default (v1.8.0+)
+## Iteration-Aware Review (IAR)
 
-Five inputs power the IAR subsystem. Master switch ships as `true`
-(v1.8.0+) with `convergence-policy: first-pass-exhaustive`, so consumers
-who don't configure anything get IAR automatically. Consumers who want the
-pre-v1.8 shape can set `iteration-awareness-enabled: false` and the
-runtime becomes byte-identical to prior releases. Full spec:
-[docs/ITERATION_AWARENESS.md](../../../docs/ITERATION_AWARENESS.md).
-
-### `iteration-awareness-enabled`
-
-- **Default:** `true` (was `false` in the v1.6 preview; flipped in v1.8.0).
-- **What it is:** Master switch. When `true` (default), the reviewer gains
-  memory across rounds: dedupes findings against prior reports, tracks
-  generations (new commits / rebase reset the round counter), and applies
-  the configured `convergence-policy`. Critical severity findings ALWAYS
-  surface unconditionally — hardcoded safety rail. Set to `false` to get
-  byte-identical pre-v1.8 behavior; the four other IAR inputs are then
-  ignored.
+Four tunable inputs shape the IAR pipeline. IAR runs on every review
+with `convergence-policy: first-pass-exhaustive` as the default, so
+consumers who don't configure anything get IAR automatically with the
+recommended profile. Critical severity findings ALWAYS surface
+unconditionally — a hardcoded safety rail that no policy can bypass.
+Full spec: [docs/ITERATION_AWARENESS.md](../../../docs/ITERATION_AWARENESS.md).
 
 ### `convergence-policy`
 
-- **Default:** `first-pass-exhaustive` (was `iterative` in the v1.6 preview; flipped in v1.8.0).
+- **Default:** `first-pass-exhaustive`.
 - **What it is:** Which IAR policy to apply. One of:
   - `first-pass-exhaustive` (default) — exhaustive prompt + higher
     findings cap on round 1 of each generation; dedup on rounds 2+.
     Solves the "prefer 20 findings at once vs 10 loops" workflow.
-  - `iterative` — dedup only, no cap boost. Cost-neutral vs pre-IAR
+  - `iterative` — dedup only, no cap boost. Cost-neutral vs a no-dedup
     baseline. Set explicitly when your workflow pushes frequently and
     the round-1-of-new-gen boost would fire too often.
   - `round-capped` — dedup pre-cap. Post-cap only critical findings
@@ -413,6 +428,15 @@ runtime becomes byte-identical to prior releases. Full spec:
   label is removed, subsequent reviews resume normal IAR behavior. Useful
   before final merge to see everything again, or when the developer
   suspects IAR silenced something they need to see.
+- **Companion gesture (no input needed):** on a PR that already has an
+  IAR state block, removing the reviewed label (`applied-label`, e.g.
+  `ai-reviewed`) before the next review triggers a full **state reset**
+  — the next run is classified `USER_FORCED_RESET`, prior state is
+  discarded, generation counter restarts at 1, and round-1 exhaustive
+  fires on a clean slate. Distinct from this escape label: applying
+  `full-review-please` is "see everything this once, state preserved";
+  removing `applied-label` is "start clean, state discarded". Full spec
+  in [docs/ITERATION_AWARENESS.md § 8.5](https://github.com/DailybotHQ/ai-diff-reviewer/blob/v1/docs/ITERATION_AWARENESS.md).
 
 ---
 
@@ -429,11 +453,11 @@ downstream steps to consume.
 | `inline-dropped` | Number of inline comments dropped because GitHub rejected the review with HTTP 422 (the action retries summary-only on 422). |
 | `blocked` | Whether the strictness gate decided to fail the check (`true`/`false`). When `true`, the action exits with code 2 so the GitHub check turns red. |
 | `skipped` | Whether the run was skipped by the label gate (`true`/`false`). |
-| `iteration-round` | IAR round number within the current generation. Populated on every enabled run (default). Empty when `iteration-awareness-enabled` is explicitly set to `false`. |
-| `iteration-generation` | IAR generation counter; increments on new commits or rebase. Empty when IAR disabled. |
-| `iteration-policy-applied` | Which IAR policy actually fired (usually matches `convergence-policy`; the 30% safety net or escape label can override). Empty when IAR disabled. |
-| `iteration-tokens-used` | Total LLM input+output tokens consumed this run (cost telemetry). Empty when IAR disabled. |
-| `iteration-cost-vs-baseline-estimate` | Heuristic estimate of this run's cost vs projected non-IAR baseline (e.g. `-30%`, `+15%`, `unknown`). Empty when IAR disabled. |
+| `iteration-round` | IAR round number within the current generation. Populated on every successful IAR pipeline run. Empty string if the pipeline crashed (caught by the try/except safety net). |
+| `iteration-generation` | IAR generation counter; increments on new commits or rebase. Empty if the IAR pipeline crashed. |
+| `iteration-policy-applied` | Which IAR policy actually fired (usually matches `convergence-policy`; the 30% safety net or escape label can override). Empty if the IAR pipeline crashed. |
+| `iteration-tokens-used` | Total LLM input+output tokens consumed this run (cost telemetry). Empty if the IAR pipeline crashed. |
+| `iteration-cost-vs-baseline-estimate` | Heuristic estimate of this run's cost vs a projected no-dedup baseline (e.g. `-30%`, `+15%`, `unknown`). Empty if the IAR pipeline crashed. |
 
 ---
 

@@ -311,11 +311,9 @@ ALLOWED_SIDES: tuple[str, ...] = ("LEFT", "RIGHT")
 CLI_INVOCATION_TIMEOUT: int = 900
 
 # ---------------------------------------------------------------------------
-# Iteration-Aware Review (IAR) — opt-in subsystem constants
+# Iteration-Aware Review (IAR) — subsystem constants
 # ---------------------------------------------------------------------------
-# Full spec in docs/ITERATION_AWARENESS.md. Master switch defaults to false so
-# every consumer's runtime behavior is byte-identical to prior releases unless
-# they explicitly opt in.
+# IAR runs on every review. Full spec in docs/ITERATION_AWARENESS.md.
 
 # Convergence policy enum values (docs/ITERATION_AWARENESS.md § 6).
 IAR_POLICY_ITERATIVE: str = "iterative"
@@ -502,7 +500,7 @@ def write_all_outputs(
     blocked: bool = False,
     review_url: str = "",
 ) -> None:
-    """Write the complete set of six pre-IAR action outputs + the five IAR
+    """Write the complete set of six core action outputs + the five IAR
     outputs (as empty strings) in one call.
 
     Every exit path — success, skip, and hard failure — routes through here so
@@ -513,10 +511,10 @@ def write_all_outputs(
     The five IAR outputs (`iteration-round`, `iteration-generation`,
     `iteration-policy-applied`, `iteration-tokens-used`,
     `iteration-cost-vs-baseline-estimate`) are always written as empty strings
-    here. When IAR is enabled AND the reviewer reaches its IAR-populating
-    code path, that path overwrites the four values with real data
-    (`$GITHUB_OUTPUT` is append-only; last write wins). See
-    docs/ITERATION_AWARENESS.md § 3.2.
+    here as the safety-net default. When the reviewer reaches its IAR-
+    populating code path after the LLM call, that path overwrites the five
+    values with real data (`$GITHUB_OUTPUT` is append-only; last write wins).
+    See docs/ITERATION_AWARENESS.md § 3.2.
     """
     write_action_output("skipped", "true" if skipped else "false")
     write_action_output("severity", severity)
@@ -1762,11 +1760,9 @@ def build_provider(
 # ---------------------------------------------------------------------------
 # Iteration-Aware Review (IAR) config
 # ---------------------------------------------------------------------------
-# The runtime reads the 5 IAR env vars once at the top of main() and packages
-# them into an IARConfig dataclass. When enabled=False (default), every IAR
-# integration point in main() takes an early-return path — the runtime
-# behavior is byte-identical to prior releases (verified by
-# tests/test_backward_compat_iar_off.py). See docs/ITERATION_AWARENESS.md.
+# The runtime reads the 4 IAR env vars once at the top of main() and packages
+# them into an IARConfig dataclass consumed by every IAR touchpoint. See
+# docs/ITERATION_AWARENESS.md.
 
 
 @dataclass(frozen=True)
@@ -1774,12 +1770,14 @@ class IARConfig:
     """Parsed + validated configuration for the Iteration-Aware Review
     subsystem. Built exactly once per run via `build_iar_config()`.
 
-    When `enabled` is False, every other field is still populated (with
-    defaults) but is ignored by the runtime — the master switch is the sole
-    gate on IAR code paths.
+    IAR runs on every review; consumers tune the four knobs below
+    (policy, round cap, cap multiplier, escape label). The pipeline
+    itself is wrapped in `try/except` at each `main()` call site so an
+    IAR bug degrades to the baseline review path (empty IAR outputs,
+    tracking marker without the annotation) — the reviewer never fails
+    because of IAR.
     """
 
-    enabled: bool
     policy: str
     max_review_rounds: int
     cap_multiplier: int
@@ -1787,20 +1785,17 @@ class IARConfig:
 
 
 def build_iar_config(env: dict[str, str]) -> IARConfig:
-    """Read the 5 IAR env vars from `env` and return a validated IARConfig.
+    """Read the 4 IAR env vars from `env` and return a validated IARConfig.
 
-    Defaults (v1.8.0+): IAR is ON by default with the `first-pass-exhaustive`
-    policy — matches the shipped `action.yml` defaults, so a consumer who
-    sets nothing gets the recommended convergence profile. Consumers who
-    explicitly set `iteration-awareness-enabled=false` get byte-identical
-    pre-v1.8 behavior (regression suite `test_backward_compat_iar_off.py`
-    locks that contract). Unknown policy values fall back to
-    `first-pass-exhaustive` with a debug log; negative integers are clamped
-    to sane values.
+    Defaults: `first-pass-exhaustive` policy, unlimited rounds,
+    3× cap multiplier, `full-review-please` escape label — matches the
+    shipped `action.yml` defaults, so a consumer who sets nothing gets
+    the recommended convergence profile.
+
+    Unknown policy values fall back to `first-pass-exhaustive` silently;
+    negative integers are clamped to sane values. All parsing is lenient
+    so a misconfigured input never crashes the run.
     """
-    enabled: bool = parse_bool(
-        env.get("AIPRR_ITERATION_AWARENESS_ENABLED", ""), default=True
-    )
     policy_raw: str = (
         env.get("AIPRR_CONVERGENCE_POLICY", "").strip()
         or IAR_POLICY_FIRST_PASS_EXHAUSTIVE
@@ -1808,7 +1803,7 @@ def build_iar_config(env: dict[str, str]) -> IARConfig:
     if policy_raw not in IAR_VALID_POLICIES:
         # Silent fallback keeps the runtime safe even under a misconfiguration.
         # main() emits a debug log line so the miswiring is visible in the
-        # workflow log when IAR is enabled.
+        # workflow log.
         policy: str = IAR_POLICY_FIRST_PASS_EXHAUSTIVE
     else:
         policy = policy_raw
@@ -1836,7 +1831,6 @@ def build_iar_config(env: dict[str, str]) -> IARConfig:
         or IAR_DEFAULT_ESCAPE_LABEL
     )
     return IARConfig(
-        enabled=enabled,
         policy=policy,
         max_review_rounds=max_review_rounds,
         cap_multiplier=cap_multiplier,
@@ -1847,9 +1841,16 @@ def build_iar_config(env: dict[str, str]) -> IARConfig:
 def write_iar_outputs_empty() -> None:
     """Write empty-string values for all 5 IAR action outputs.
 
-    Called on every code path where IAR is disabled OR where the review
-    aborts before IAR could populate its own values. Downstream steps that
-    read `steps.review.outputs.iteration-*` always see a defined value.
+    Called on every code path where IAR could not populate its own
+    values — the review was skipped before IAR ran, the pre-LLM or
+    post-LLM helper raised (caught by main()'s try/except), or the review
+    aborted early. Guarantees downstream steps that read
+    `steps.review.outputs.iteration-*` always see a defined string
+    (never a missing key or a null value).
+
+    `write_iar_outputs_populated()` is called after a successful IAR
+    pipeline execution and overwrites these empty strings with real
+    values — last-write-wins on `$GITHUB_OUTPUT`.
     """
     write_action_output("iteration-round", "")
     write_action_output("iteration-generation", "")
@@ -2165,16 +2166,28 @@ def embed_iteration_state(
 
 
 class GenerationTransition(str, Enum):
-    """Which of the four possible transitions the current run represents.
+    """Which of the possible transitions the current run represents.
 
     Values match the strings persisted in `IterationState.policy_applied`
-    when relevant, and the debug-log tags. Never surfaced to consumers;
-    used internally by the dispatcher (Task 7)."""
+    when relevant, and the debug-log tags. Surfaced to developers only
+    through the marker annotation (e.g. `(user_forced_reset)` after the
+    round/policy tags); consumers never see them in action outputs.
+
+    `USER_FORCED_RESET` fires when the consumer's `applied-label`
+    (the "reviewed" label the action stamps on a successful review) is
+    absent from the PR at review time AND a prior IAR state exists in
+    the tracking marker. Semantically identical to `FIRST_REVIEW`
+    downstream (fresh state, no dedup memory, round-1 exhaustive under
+    the default policy) — separated out only so the log + marker can
+    tell developers that the reset was a deliberate gesture, not the
+    first-ever review of the PR.
+    """
 
     FIRST_REVIEW = "first_review"
     SAME_GENERATION = "same_generation"
     NEW_COMMITS = "new_commits"
     REBASED = "rebased"
+    USER_FORCED_RESET = "user_forced_reset"
 
 
 def compute_generation_range_hash(
@@ -2262,9 +2275,12 @@ def advance_generation(
     just increment `round_in_generation` in place via
     `increment_round_in_generation()`.
     """
-    if transition == GenerationTransition.FIRST_REVIEW or prior_state is None:
+    if transition in (
+        GenerationTransition.FIRST_REVIEW,
+        GenerationTransition.USER_FORCED_RESET,
+    ) or prior_state is None:
         log(
-            f"IAR: FIRST_REVIEW — starting generation 1 "
+            f"IAR: {transition.value} — starting generation 1 "
             f"(range_hash={new_range_hash!r}, base_sha={new_base_sha[:8]!r})."
         )
         return new_iteration_state(
@@ -2693,7 +2709,7 @@ def apply_iterative_policy(
     everything else surfaces. `severity == critical` always surfaces
     (Task 5's safety rail).
 
-    Steady-state cost is close to the pre-IAR baseline: the LLM produces
+    Steady-state cost is close to a non-dedup baseline: the LLM produces
     the same set of findings, but the reviewer only submits deltas —
     saving tokens on the GitHub API submission side (small) and reducing
     developer noise (large)."""
@@ -3114,9 +3130,12 @@ def dispatch_policy(
 #      `result.findings` in place, and returns the new IterationState to
 #      embed in the tracking marker + telemetry to write to outputs.
 #
-# Every code path is gated on `iar_config.enabled` at the CALL SITE — this
-# module never runs when IAR is off, preserving the byte-identical
-# backward-compat contract in tests/test_backward_compat_iar_off.py.
+# Both touchpoints are wrapped in `try/except` at the `main()` call site
+# (see `tests/test_iar_failure_fallback.py` for the safety contract). On
+# any IAR failure the reviewer logs the exception, leaves the 5 IAR
+# outputs as empty strings (populated by `write_iar_outputs_empty()`),
+# and falls through to the baseline review path — the CI check still
+# gets a review, IAR just skips that run.
 #
 # `tokens_used` is a best-effort field. Populating it accurately requires
 # per-provider instrumentation (Anthropic's `usage.input_tokens`/`output_tokens`,
@@ -3347,6 +3366,7 @@ def run_iar_pre_llm(
     base_ref: str,
     head_sha: str,
     base_max_inline_comments: int,
+    applied_label: str = "",
 ) -> IARPreLLMContext:
     """Prepare IAR context BEFORE the LLM call.
 
@@ -3356,8 +3376,21 @@ def run_iar_pre_llm(
     prompt addendum + effective cap the caller will use to shape the
     LLM call.
 
-    Caller MUST gate on `iar_config.enabled` before calling this — the
-    function assumes IAR is enabled and does full GH API + git work.
+    User-forced reset: when `applied_label` (the consumer's "reviewed"
+    label — the one the action stamps on a successful review) is
+    non-empty AND absent from the PR labels AND prior IAR state exists
+    in the tracking marker, this run is treated as a
+    `USER_FORCED_RESET`. Downstream that behaves identically to
+    `FIRST_REVIEW`: prior state is discarded, dedup memory is wiped,
+    round-1 exhaustive fires under the default policy. The only reason
+    the transition is a distinct enum value is so the log + marker
+    annotation can tell developers the reset was a deliberate gesture
+    (they removed the reviewed label before re-triggering) rather than
+    a first-ever review of the PR.
+
+    Caller SHOULD wrap this in `try/except` — the function does full
+    GH API + git work and any failure should degrade to the baseline
+    review path (IAR outputs stay empty, review still ships).
     """
     prior_state: IterationState | None = read_prior_iteration_state(
         repo=repo, pr_number=pr_number, token=gh_token
@@ -3385,6 +3418,29 @@ def run_iar_pre_llm(
     pr_labels: list[str] = _fetch_pr_labels(
         token=gh_token, repo=repo, pr_number=pr_number
     )
+    # User-forced reset detection — see docstring. Overrides both
+    # `transition` and `prior_state` so every downstream code path
+    # (dedup, dispatch, advance_generation, safety-net) behaves as if
+    # this were a first review. Only fires when `applied_label` is
+    # configured — consumers who don't set a reviewed label can't
+    # perform the gesture, and the detection cleanly no-ops.
+    if (
+        applied_label
+        and prior_state is not None
+        and applied_label not in pr_labels
+    ):
+        log(
+            f"IAR: user-forced reset detected — reviewed label "
+            f"{applied_label!r} absent from PR while prior IAR state "
+            f"exists (prior gen={prior_state.generation}, "
+            f"round={prior_state.round_in_generation}). Treating this "
+            "run as USER_FORCED_RESET: dedup memory wiped, generation "
+            "counter reset to 1, round-1 exhaustive fires under the "
+            "default policy."
+        )
+        transition = GenerationTransition.USER_FORCED_RESET
+        prior_state = None
+        new_lines_pct = 0.0
     # Dispatch with empty findings — extracts cap + addendum only.
     pre_policy_result: PolicyResult = dispatch_policy(
         iar_config=iar_config,
@@ -5214,6 +5270,39 @@ def render_tracking_body_failed(
     )
 
 
+def render_tracking_body_skipped_by_label(
+    *, head_sha: str, skip_label: str, provider: str = ""
+) -> str:
+    """The terminal 'skipped by label' tracking-comment body.
+
+    Posted when the developer applied the `skip-review-label` alongside the
+    normal trigger — the reviewer short-circuits before the LLM call so the
+    merge can proceed without burning tokens. The comment carries the same
+    `<!-- ai-pr-reviewer-marker -->` header as any other terminal comment so
+    downstream tooling (dashboards, `collapse-previous` on the next run,
+    audit scripts) treats it uniformly.
+
+    The GitHub check reports `success` (exit 0). No IAR state is written; the
+    next real review starts from wherever the pipeline left off before this
+    skip. The `applied-label` is NOT stamped on skip runs — applying it would
+    misrepresent an unreviewed PR as reviewed.
+    """
+    return (
+        f"{_tracking_marker_header(provider)}\n"
+        f"### AI review for `{head_sha[:7]}` — ⏭️ skipped\n\n"
+        f"Full SHA: `{head_sha}`\n\n"
+        f"The `{skip_label}` label was applied to this PR, so the AI "
+        "reviewer short-circuited: **no LLM call, no findings, no state "
+        "mutation.** The GitHub check reports success so the merge can "
+        "proceed.\n\n"
+        f"_This is the intended behaviour when `skip-review-label` is "
+        "configured — use it deliberately for hotfixes, rollbacks, or "
+        "changes where an LLM review would burn tokens for no "
+        "incremental value. Remove the label + push a new commit to "
+        "get a real review on the follow-up work._"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -5262,6 +5351,9 @@ def main() -> int:
     ).strip()
     label_gate: str = os.environ.get("AIPRR_LABEL_GATE", "").strip()
     applied_label: str = os.environ.get("AIPRR_APPLIED_LABEL", "").strip()
+    skip_review_label: str = os.environ.get(
+        "AIPRR_SKIP_REVIEW_LABEL", ""
+    ).strip()
     collapse_previous: bool = parse_bool(
         os.environ.get("AIPRR_COLLAPSE_PREVIOUS", "true"), default=True
     )
@@ -5281,10 +5373,13 @@ def main() -> int:
         or DEFAULT_MAX_TURNS
     )
 
-    # Iteration-Aware Review (IAR) — opt-in subsystem. When
-    # `iar_config.enabled` is False (default), the runtime path is
-    # byte-identical to prior releases; every IAR call site below is
-    # explicitly gated on `iar_config.enabled`. See docs/ITERATION_AWARENESS.md.
+    # Iteration-Aware Review (IAR). Every review runs the IAR pipeline;
+    # the four tunable inputs (convergence-policy, max-review-rounds,
+    # exhaustive-first-pass-cap-multiplier, iteration-escape-label)
+    # shape it. Pre-LLM / post-LLM helpers are wrapped in try/except at
+    # their call sites — an IAR failure degrades to the baseline review
+    # path (5 IAR outputs stay empty via write_iar_outputs_empty(),
+    # tracking marker skips the annotation). See docs/ITERATION_AWARENESS.md.
     iar_config: IARConfig = build_iar_config(dict(os.environ))
     iar_telemetry: RunTelemetry = RunTelemetry(
         start_time_monotonic=time.monotonic()
@@ -5293,25 +5388,25 @@ def main() -> int:
     iar_state_final: IterationState | None = None
     iar_policy_final: PolicyResult | None = None
     iar_effective_cap: int = 0  # populated pre-LLM; used by cost estimate
-    if iar_config.enabled:
-        # Detect silently-fallback-corrected policy inputs so miswiring is
-        # visible in the workflow log rather than swallowed. The build_iar_config
-        # helper rewrote the value; we compare raw vs effective.
-        raw_policy: str = (
-            os.environ.get("AIPRR_CONVERGENCE_POLICY", "").strip()
-            or IAR_POLICY_ITERATIVE
-        )
-        if raw_policy not in IAR_VALID_POLICIES:
-            log(
-                f"IAR: unknown convergence-policy {raw_policy!r}; falling back "
-                f"to {IAR_POLICY_ITERATIVE!r}. Valid values: {list(IAR_VALID_POLICIES)}."
-            )
+    # Detect silently-fallback-corrected policy inputs so miswiring is
+    # visible in the workflow log rather than swallowed. The build_iar_config
+    # helper rewrote the value; we compare raw vs effective.
+    raw_policy: str = (
+        os.environ.get("AIPRR_CONVERGENCE_POLICY", "").strip()
+        or IAR_POLICY_FIRST_PASS_EXHAUSTIVE
+    )
+    if raw_policy not in IAR_VALID_POLICIES:
         log(
-            f"IAR: enabled (policy={iar_config.policy}, "
-            f"max-rounds={iar_config.max_review_rounds}, "
-            f"cap-multiplier={iar_config.cap_multiplier}, "
-            f"escape-label={iar_config.escape_label!r})."
+            f"IAR: unknown convergence-policy {raw_policy!r}; falling back "
+            f"to {IAR_POLICY_FIRST_PASS_EXHAUSTIVE!r}. "
+            f"Valid values: {list(IAR_VALID_POLICIES)}."
         )
+    log(
+        f"IAR: policy={iar_config.policy}, "
+        f"max-rounds={iar_config.max_review_rounds}, "
+        f"cap-multiplier={iar_config.cap_multiplier}, "
+        f"escape-label={iar_config.escape_label!r}."
+    )
 
     # PR description review (v1.2.0+)
     pr_desc_mode: str = (
@@ -5466,6 +5561,67 @@ def main() -> int:
         return 0
 
     # ------------------------------------------------------------------
+    # Skip-review-label short-circuit (emergency-bypass hatch)
+    # ------------------------------------------------------------------
+    # Opt-in escape: when `skip-review-label` is configured AND that label
+    # is present on the PR at trigger time, the reviewer short-circuits to
+    # success without touching the LLM, IAR state, or any other side
+    # effects. Intended for hotfixes / rollbacks / trivially safe changes
+    # where an LLM review would burn tokens for no incremental value.
+    #
+    # Contract (mirrors action.yml + docs/SKIP_REVIEW_LABEL.md):
+    #   1. No LLM call — the reviewer never enters `run_agentic_loop`.
+    #   2. No IAR state mutation — persisted state is left exactly as it
+    #      was; the next non-skip run resumes from where the pipeline
+    #      last left off.
+    #   3. No `applied-label` stamp — applying it would misrepresent an
+    #      unreviewed PR as reviewed. Anyone dashboarding on that label
+    #      keeps seeing the truth.
+    #   4. No collapse-previous — the skip is meant to be minimal; prior
+    #      reviews (if any) stay visible so the human reviewer still
+    #      has context before merging. The next real review will
+    #      collapse them as usual.
+    #   5. A tracking comment IS posted (subject to `tracking-comment`)
+    #      so the audit trail records WHY the review was skipped, and
+    #      so `collapse-previous` on the next real run treats this like
+    #      any other terminal comment.
+    #   6. Outputs: `skipped=true`, `severity=none`, `blocked=false`.
+    #      The GitHub check reports success (exit 0) so the merge
+    #      proceeds.
+    #
+    # SECURITY NOTE: anyone who can label a PR can bypass code review via
+    # this gesture. Consumers who care must combine this input with a
+    # ruleset / CODEOWNERS rule restricting who can apply the label.
+    if skip_review_label and skip_review_label in current_labels:
+        log(
+            f"Skip-review-label {skip_review_label!r} present on PR — "
+            "short-circuiting to success without invoking the LLM. No "
+            "findings, no IAR state mutation, no reviewed-label stamp."
+        )
+        if tracking_comment_enabled:
+            try:
+                gh_post_issue_comment(
+                    token=gh_token,
+                    repo=repo,
+                    pr_number=pr_number,
+                    body=render_tracking_body_skipped_by_label(
+                        head_sha=head_sha,
+                        skip_label=skip_review_label,
+                        provider=provider_id,
+                    ),
+                )
+            except Exception as e:  # noqa: BLE001 — audit trail is
+                # best-effort; the skip must still succeed even if the
+                # tracking comment fails to post (network hiccup,
+                # permissions revoked mid-run, etc.).
+                log(
+                    f"Could not post skip-review tracking comment "
+                    f"(non-fatal): {e}"
+                )
+        write_all_outputs(skipped=True)
+        return 0
+
+    # ------------------------------------------------------------------
     # Collapse previous bot reviews/comments as outdated
     # ------------------------------------------------------------------
     if collapse_previous:
@@ -5575,42 +5731,42 @@ def main() -> int:
     #
     # Reads the prior state, detects generation transition, and dispatches
     # to the configured policy with empty findings to extract the effective
-    # cap + optional prompt addendum. When IAR is disabled, this block is
-    # a no-op (`effective_max_inline_comments == max_inline_comments`,
-    # `system_prompt` unchanged), preserving the byte-identical backward-
-    # compat contract in tests/test_backward_compat_iar_off.py.
+    # cap + optional prompt addendum. Wrapped in try/except so any IAR
+    # failure degrades to the baseline review path (effective cap =
+    # base cap, system_prompt unchanged, outputs stay empty) — the safety
+    # contract locked by tests/test_iar_failure_fallback.py.
     # ------------------------------------------------------------------
     effective_max_inline_comments: int = max_inline_comments
-    if iar_config.enabled:
-        try:
-            iar_pre_context = run_iar_pre_llm(
-                iar_config=iar_config,
-                repo=repo,
-                pr_number=pr_number,
-                gh_token=gh_token,
-                base_ref=base_ref,
-                head_sha=head_sha,
-                base_max_inline_comments=max_inline_comments,
+    try:
+        iar_pre_context = run_iar_pre_llm(
+            iar_config=iar_config,
+            repo=repo,
+            pr_number=pr_number,
+            gh_token=gh_token,
+            base_ref=base_ref,
+            head_sha=head_sha,
+            base_max_inline_comments=max_inline_comments,
+            applied_label=applied_label,
+        )
+        effective_max_inline_comments = (
+            iar_pre_context.pre_policy_result.effective_max_inline_comments
+        )
+        iar_effective_cap = effective_max_inline_comments
+        if iar_pre_context.pre_policy_result.prompt_addendum:
+            system_prompt = compose_system_prompt(
+                system_prompt,
+                iar_pre_context.pre_policy_result.prompt_addendum,
             )
-            effective_max_inline_comments = (
-                iar_pre_context.pre_policy_result.effective_max_inline_comments
-            )
-            iar_effective_cap = effective_max_inline_comments
-            if iar_pre_context.pre_policy_result.prompt_addendum:
-                system_prompt = compose_system_prompt(
-                    system_prompt,
-                    iar_pre_context.pre_policy_result.prompt_addendum,
-                )
-        except Exception as exc:  # noqa: BLE001 — best-effort IAR wrap
-            # IAR must never crash the reviewer. On any pre-LLM error we
-            # log and continue with baseline behavior — the review still
-            # runs (IAR simply won't populate outputs or state this run).
-            log(
-                f"IAR pre-LLM crashed: {type(exc).__name__}: {exc}. "
-                "Continuing with baseline (non-IAR) review path."
-            )
-            iar_pre_context = None
-            effective_max_inline_comments = max_inline_comments
+    except Exception as exc:  # noqa: BLE001 — best-effort IAR wrap
+        # IAR must never crash the reviewer. On any pre-LLM error we
+        # log and continue with baseline behavior — the review still
+        # runs (IAR simply won't populate outputs or state this run).
+        log(
+            f"IAR pre-LLM crashed: {type(exc).__name__}: {exc}. "
+            "Continuing with baseline (non-IAR) review path."
+        )
+        iar_pre_context = None
+        effective_max_inline_comments = max_inline_comments
 
     # ------------------------------------------------------------------
     # Fetch PR + run agentic loop, all wrapped so failures hit the spinner
@@ -5743,13 +5899,13 @@ def main() -> int:
     # ------------------------------------------------------------------
     # IAR post-LLM: filter findings + build the state to persist.
     #
-    # When IAR is disabled or the pre-LLM step failed (`iar_pre_context is
-    # None`), this block is a no-op — the submission path sees exactly
-    # what the LLM produced. When enabled, we mutate `result.findings` to
-    # the surfaced subset and stash the new state + policy result for
-    # marker embedding + output writing further down.
+    # When the pre-LLM step failed (`iar_pre_context is None`) this block
+    # is a no-op — the submission path sees exactly what the LLM produced.
+    # Otherwise we mutate `result.findings` to the surfaced subset and
+    # stash the new state + policy result for marker embedding + output
+    # writing further down.
     # ------------------------------------------------------------------
-    if iar_config.enabled and iar_pre_context is not None:
+    if iar_pre_context is not None:
         try:
             iar_state_final, iar_policy_final = run_iar_post_llm(
                 iar_config=iar_config,
@@ -5761,7 +5917,8 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001 — best-effort IAR wrap
             log(
                 f"IAR post-LLM crashed: {type(exc).__name__}: {exc}. "
-                "Submitting the review as if IAR were disabled for this run."
+                "Submitting the review with the raw LLM findings (IAR "
+                "skipped for this run)."
             )
             iar_state_final = None
             iar_policy_final = None
@@ -5942,10 +6099,11 @@ def main() -> int:
         )
     # IAR marker embed: append a one-line annotation for developers who
     # skim the marker + embed the machine-readable state block that the
-    # next run will parse. Both are no-ops when IAR is disabled.
+    # next run will parse. Skipped only if the pre-LLM or post-LLM step
+    # crashed (state/policy will be None in that case) — the review still
+    # ships, IAR just doesn't annotate this specific marker.
     if (
-        iar_config.enabled
-        and iar_state_final is not None
+        iar_state_final is not None
         and iar_policy_final is not None
         and iar_pre_context is not None
     ):
@@ -5993,8 +6151,7 @@ def main() -> int:
     # crash leaves the empty defaults in place so downstream steps still
     # see defined values.
     if (
-        iar_config.enabled
-        and iar_state_final is not None
+        iar_state_final is not None
         and iar_policy_final is not None
     ):
         write_iar_outputs_populated(

@@ -53,11 +53,17 @@ class GenerationTransitionEnumTests(unittest.TestCase):
     """The enum values are consumed as strings (logs, marker debug
     output), so their spelling matters."""
 
-    def test_all_four_values_present(self) -> None:
+    def test_all_transition_values_present(self) -> None:
         vals: set[str] = {t.value for t in reviewer.GenerationTransition}
         self.assertEqual(
             vals,
-            {"first_review", "same_generation", "new_commits", "rebased"},
+            {
+                "first_review",
+                "same_generation",
+                "new_commits",
+                "rebased",
+                "user_forced_reset",
+            },
         )
 
     def test_is_string_enum(self) -> None:

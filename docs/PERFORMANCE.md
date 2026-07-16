@@ -142,7 +142,7 @@ There is no benchmark suite (adding one would violate the stdlib-only rule for t
 
 ## Iteration-Aware Review (IAR) — Cost and Latency Model
 
-IAR (on by default as of v1.8.0, with the `first-pass-exhaustive` policy) rebuilds the "converge in 1–3 rounds instead of 5–10" experience without raising steady-state per-turn cost. This section makes the cost impact explicit so you can tune it — or opt out via `iteration-awareness-enabled: false` — deliberately.
+IAR runs on every review with the `first-pass-exhaustive` policy by default. It delivers the "converge in 1–3 rounds instead of 5–10" experience without raising steady-state per-turn cost. This section makes the cost impact explicit so you can tune the pipeline deliberately.
 
 **One-line summary:** on the *first* review of a new commit-set with the recommended `first-pass-exhaustive` policy, the LLM may produce up to `cap_multiplier` × `max-inline-comments` findings and receives ~150 extra tokens of prompt guidance (the exhaustive addendum). On *subsequent* rounds of the same generation, IAR is close to a no-op — the LLM produces its normal set, and the reviewer dedupes them before posting. The full authoritative spec is in [`ITERATION_AWARENESS.md`](ITERATION_AWARENESS.md).
 
@@ -150,11 +150,11 @@ IAR (on by default as of v1.8.0, with the `first-pass-exhaustive` policy) rebuil
 
 ### Lifetime cost matrix per policy
 
-Assumes a mid-size PR reviewed 5 times over its lifetime (once on open, then 4 push/rebase iterations). Uses the default `cap_multiplier=3` and `max-inline-comments=10`. **All numbers are theoretical** — validated against real dogfooding data in Task 10 of the IAR rollout plan.
+Assumes a mid-size PR reviewed 5 times over its lifetime (once on open, then 4 push/rebase iterations). Uses the default `cap_multiplier=3` and `max-inline-comments=10`. **All numbers are theoretical** — validated against real dogfooding data.
 
-| Policy | Round 1 cost | Round 2 cost | Rounds 3–5 cost | Lifetime cost vs baseline | User-visible effect |
+| Policy | Round 1 cost | Round 2 cost | Rounds 3–5 cost | Lifetime cost vs no-dedup baseline | User-visible effect |
 |---|---|---|---|---|---|
-| **(baseline, IAR off)** | 1.0× | 1.0× | 1.0× | 1.0× | Same findings re-posted each round → the "infinite loop" symptom. |
+| **(no-dedup baseline)** | 1.0× | 1.0× | 1.0× | 1.0× | Same findings re-posted each round → the "infinite loop" symptom. |
 | `iterative` | 1.0× | 1.0× | 1.0× | 1.0× | Same LLM cost; only *deltas* posted. Best steady-state ratio. |
 | `first-pass-exhaustive` | ~1.3× | 1.0× | 1.0× | ~1.06× | Extended initial pass; dedup afterwards. Recommended default. |
 | `round-capped` (max 3) | 1.0× | 1.0× | 1.0× rounds 3, then 0.5× rounds 4–5 (silence pass) | ~0.9× | Aggressive cost saver — non-critical findings silenced after round 3. |
@@ -174,7 +174,7 @@ Total ambient overhead: **~500–800 ms per run**, well under the seconds of lat
 
 For a typical `first-pass-exhaustive` review on a 500-line PR:
 
-| Phase | Baseline (IAR off) | IAR round 1 (new gen) | IAR round 2+ (same gen) |
+| Phase | No-dedup baseline | IAR round 1 (new gen) | IAR round 2+ (same gen) |
 |---|---|---|---|
 | Setup + PR fetch | ~3 s | ~3.5 s (+GraphQL marker read) | ~3.5 s |
 | LLM turn loop | 30–90 s | 40–120 s (cap × 3) | 30–90 s (baseline cap) |
@@ -191,8 +191,7 @@ The round-1 extension is the meaningful cost, and only when a new generation act
 
 1. **Debounce your triggers** — use `on: push` for the base branch and `on: pull_request: [synchronize]` for feature branches; skip drafts. Standard workflow hygiene.
 2. **Cap ambition explicitly** — set `exhaustive-first-pass-cap-multiplier: 1` to disable cap expansion entirely, keeping only the prompt addendum. Turns "extended pass" into "same-cost pass with better guidance".
-3. **Switch to `iterative`** — no cap expansion, no prompt addendum, pure dedup engine. Same LLM cost as baseline, better UX.
-4. **Enable the 30% safety net's alternative** — the built-in safety net already forces `first-pass-exhaustive` when >= 30% of lines are new-in-generation. This is *usually* what you want. To turn it off (rare), set `iteration-awareness-enabled: false` and re-enable IAR only for the initial opening of the PR.
+3. **Switch to `iterative`** — no cap expansion, no prompt addendum, pure dedup engine. Same LLM cost as the no-dedup baseline, better UX.
 
 ### How to tune for cost sensitivity
 
@@ -200,7 +199,6 @@ Three recommended profiles:
 
 **Cost-sensitive (minimize spend, tolerate some multi-round noise):**
 ```yaml
-iteration-awareness-enabled: true
 convergence-policy: iterative              # dedup only, no cap expansion
 exhaustive-first-pass-cap-multiplier: 1    # ignored by iterative, safe default
 max-review-rounds: 0                       # unused by iterative
@@ -208,7 +206,6 @@ max-review-rounds: 0                       # unused by iterative
 
 **Balanced (recommended default — one-shot exhaustive, then converge):**
 ```yaml
-iteration-awareness-enabled: true
 convergence-policy: first-pass-exhaustive
 exhaustive-first-pass-cap-multiplier: 3    # round 1 gets 30 max instead of 10
 max-review-rounds: 5                       # unused by first-pass-exhaustive
@@ -217,7 +214,6 @@ iteration-escape-label: full-review-please
 
 **Quality-sensitive (biggest first-pass net, silence noise later):**
 ```yaml
-iteration-awareness-enabled: true
 convergence-policy: round-capped
 max-review-rounds: 3                       # exhaustive round 1, dedup 2-3, silence 4+
 exhaustive-first-pass-cap-multiplier: 5    # round 1 gets 50 max instead of 10
@@ -225,7 +221,7 @@ exhaustive-first-pass-cap-multiplier: 5    # round 1 gets 50 max instead of 10
 
 ### Reading the cost telemetry
 
-Every IAR-enabled run writes five outputs (empty strings when IAR is off):
+Every run writes five outputs (empty strings only if the IAR pipeline crashed):
 
 | Output | Meaning | Example use |
 |---|---|---|
