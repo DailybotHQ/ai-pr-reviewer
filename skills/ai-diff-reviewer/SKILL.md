@@ -71,10 +71,35 @@ into one of two flows — pick the one that matches the repo's use case:
 `prompt-extension-file: .review/extension.md` wired in (default when
 you accept the Step 5 handoff to `generate-extension`), the CI Action
 reads the same file your local agent uses. Same base prompt + same
-extension file = same review, locally and in CI. If the Step 5 handoff
-is declined, `setup` omits `prompt-extension-file` and you get
-base-prompt parity only — you can add the input manually later, or
-re-run `setup` and accept the handoff.
+extension file = same review methodology, locally and in CI. If the
+Step 5 handoff is declined, `setup` omits `prompt-extension-file` and
+you get base-prompt parity only — you can add the input manually
+later, or re-run `setup` and accept the handoff.
+
+**CI-only surfaces (not mirrored locally).** Two Action capabilities
+run only in GitHub Actions, not in this skill's local review flow:
+
+1. **Iteration-Aware Review (IAR)** — content-anchored dedup across
+   rounds, four convergence policies (default
+   `first-pass-exhaustive`), escape label (`full-review-please`),
+   and user-forced reset (remove `applied-label` then re-trigger).
+   A local review is always a **full pass** against the current
+   diff — it may surface findings CI has already silenced on
+   round 2+ of the same generation. Spec:
+   [`docs/ITERATION_AWARENESS.md`](https://github.com/DailybotHQ/ai-diff-reviewer/blob/main/docs/ITERATION_AWARENESS.md).
+   Tuning example:
+   [`examples/iteration-aware.yml`](https://github.com/DailybotHQ/ai-diff-reviewer/blob/main/examples/iteration-aware.yml).
+2. **`skip-review-label` emergency bypass** — when the configured
+   label is on the PR, CI short-circuits to success with no LLM
+   call. Hotfixes / rollbacks only; protect the label with a
+   ruleset. Spec:
+   [`docs/TRIGGER_MODES.md` § Emergency-bypass](https://github.com/DailybotHQ/ai-diff-reviewer/blob/main/docs/TRIGGER_MODES.md).
+   Example:
+   [`examples/skip-review-label.yml`](https://github.com/DailybotHQ/ai-diff-reviewer/blob/main/examples/skip-review-label.yml).
+
+The full input reference (including every IAR knob and
+`skip-review-label`) lives in
+[`setup/reference.md`](setup/reference.md).
 
 **Signalling the flow to your agent.** If the ambiguous request "set
 up the reviewer" could mean either flow, the agent will ask. To skip

@@ -38,15 +38,18 @@ Both surfaces share the same [`prompts/default.md`](../prompts/default.md) as th
 ┌────────────────────────▼─────────────────────────────────────────┐
 │  scripts/reviewer.py  (stdlib only)                              │
 │                                                                  │
-│   1. Label gate          ── exit 0 if missing                    │
-│   2. Author-association  ── skip fork PRs from drive-bys          │
-│   3. Collapse previous   ── GraphQL minimizeComment (per-provider)│
-│   4. Tracking comment    ── post spinner with marker             │
-│   5. Fetch PR context    ── REST + git diff                      │
-│   6. Agentic loop        ── provider.complete() + tools (or CLI) │
-│   7. Submit review       ── REST POST /pulls/N/reviews + 422 retry│
-│   8. Apply label         ── if not blocked                       │
-│   9. Strictness gate     ── exit 0 / 2                           │
+│   1. Access/trigger gates ── author / label-gate / trigger-mode  │
+│   2. skip-review-label    ── exit 0 + skipped tracking comment   │
+│      (opt-in emergency bypass; IAR state not mutated)            │
+│   3. Collapse previous    ── GraphQL minimizeComment (per-prov.) │
+│   4. Tracking comment     ── post spinner with marker            │
+│   5. Fetch PR context     ── REST + git diff                     │
+│   6. IAR pre-LLM          ── state, generation, cap, escape/net  │
+│   7. Agentic loop         ── provider.complete() + tools / CLI   │
+│   8. IAR post-LLM         ── dedupe, embed state, IAR outputs    │
+│   9. Submit review        ── POST /pulls/N/reviews + 422 retry   │
+│  10. Apply label          ── if not blocked                      │
+│  11. Strictness gate      ── exit 0 / 2                          │
 │                                                                  │
 │   Providers: AnthropicProvider (chat-completions),               │
 │              ClaudeCodeProvider, CursorProvider, CodexProvider   │
@@ -234,6 +237,8 @@ Each install step:
 ### 10. Iteration-Aware Review — a cross-cutting subsystem
 
 Iteration-Aware Review (IAR) is a subsystem that wraps the reviewer's main loop with a state layer, a generation-tracking layer, a content-anchored deduplication engine, and four convergence policies. It runs on every review with `convergence-policy: first-pass-exhaustive` as the default. The IAR pipeline is wrapped in `try/except` at every `main()` touchpoint so any IAR-specific failure degrades gracefully to the baseline review path — the reviewer never crashes on IAR bugs. The safety contract is locked by [`tests/test_iar_failure_fallback.py`](../tests/test_iar_failure_fallback.py).
+
+**Ordering note.** The opt-in `skip-review-label` emergency bypass (topology step 2) short-circuits **before** IAR pre-LLM — no LLM call, no IAR state mutation, check exits 0. See [`TRIGGER_MODES.md` § Emergency-bypass label](TRIGGER_MODES.md).
 
 **Read/write flow per review run:**
 

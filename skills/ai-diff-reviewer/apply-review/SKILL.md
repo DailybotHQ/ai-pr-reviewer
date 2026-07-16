@@ -407,6 +407,17 @@ mandatory rules from [`docs/PR_REVIEW_WORKFLOW.md` § Mandatory rules](https://g
    plural when multiple legs ran. Each marker's body starts with the
    marker string; each carries the SHA its leg reviewed.
 
+**IAR note.** The marker may contain an HTML-comment `IterationState`
+JSON block and a short gen/round/policy annotation — ignore both when
+collecting findings (they are telemetry, not review comments). The
+inline comments you present are already post-IAR-dedup. If the
+developer expected a finding that appeared in a local review but not
+in CI, suggest applying `full-review-please` (the
+`iteration-escape-label`, one-shot full review with state preserved)
+or removing the `applied-label` then re-triggering for a full state
+reset — see
+[`docs/ITERATION_AWARENESS.md` § 8](https://github.com/DailybotHQ/ai-diff-reviewer/blob/main/docs/ITERATION_AWARENESS.md).
+
 Emit the filtered set to your working context as a list of
 `{leg_label, sha, review_body, inline_comments[]}` records.
 

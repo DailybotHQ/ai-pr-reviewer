@@ -10,7 +10,7 @@ The docs tree is organised by intent: *what the product is* → *how it's built*
 |---|---|
 | [PRODUCT_SPEC.md](PRODUCT_SPEC.md) | The non-technical "why" — the problem the action solves, who it's for, success criteria, and explicit non-goals. |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | The real components: composite action shell, `scripts/reviewer.py` runtime, the two provider families (chat-completions + agent-runner), the tools the chat-completions family calls, the `.aiprr/findings.json` contract the agent-runner family uses, and the review-submission flow (including the 422 fallback). |
-| [PERFORMANCE.md](PERFORMANCE.md) | Cost and latency budget for both provider families: the agentic loop's `MAX_TURNS`/`max_tokens`/conversation pruning on the chat-completions path, and the single vendor-CLI invocation shape on the agent-runner path. |
+| [PERFORMANCE.md](PERFORMANCE.md) | Cost and latency budget for both provider families: the agentic loop's `MAX_TURNS`/`max_tokens`/conversation pruning on the chat-completions path, the single vendor-CLI invocation shape on the agent-runner path, and the Iteration-Aware Review cost/latency model + IAR action outputs. |
 
 ## Standards & how to build
 
@@ -21,7 +21,7 @@ The docs tree is organised by intent: *what the product is* → *how it's built*
 | [DEVELOPMENT_COMMANDS.md](DEVELOPMENT_COMMANDS.md) | Verbatim command reference (compile check, unittest suite, action.yml validation, local debug). |
 | [RELEASE_RECOVERY.md](RELEASE_RECOVERY.md) | Playbook for recovering from partial-release failures in `auto-release.yml` (tag pushed but sync commit rejected by branch protection, etc.). |
 | [TESTING_GUIDE.md](TESTING_GUIDE.md) | How the stdlib `unittest` suite is organised, how to run it, and the dogfooding loop via `self-review.yml`. |
-| [SECURITY.md](SECURITY.md) | Secrets handling (`AIPRR_API_KEY`), tool-arg redaction, safe-path resolution, sensitive-data boundaries. |
+| [SECURITY.md](SECURITY.md) | Secrets handling (`AIPRR_API_KEY`), tool-arg redaction, safe-path resolution, IAR trust boundary (marker author filter + parser hardening), and the `skip-review-label` threat model. |
 | [DOCUMENTATION_GUIDE.md](DOCUMENTATION_GUIDE.md) | How this documentation tree is organised and the rule that keeps it in sync with runtime behaviour. |
 
 ## User-facing surface (referenced from `README.md`)
@@ -31,7 +31,7 @@ The docs tree is organised by intent: *what the product is* → *how it's built*
 | [PROMPTS.md](PROMPTS.md) | What a good custom prompt looks like — the main lever consumers pull to adapt the reviewer to their codebase. Explains `prompt-file` vs `prompt-extension-file`, the `.review/extension.md` convention that keeps local skill and CI action in sync, and the meta-prompt for AI-generated custom prompts. |
 | [PROVIDERS.md](PROVIDERS.md) | Both provider families — the chat-completions Anthropic-shape contract and the agent-runner `.aiprr/findings.json` contract — plus the shipping providers (`anthropic`, `claude-code`, `cursor`, `codex`) and the roadmap for raw OpenAI / Gemini / Bedrock. |
 | [STRICTNESS.md](STRICTNESS.md) | The four strictness modes (`lenient` / `block-on-critical` / `block-on-warning` / `block-on-any`) and how the model's `severity` argument maps to the GitHub check outcome. |
-| [TRIGGER_MODES.md](TRIGGER_MODES.md) | The four `trigger-mode` values (`always` / `label-required` / `label-once` / `label-added-only`) and how to pair them with the workflow's `on:` block. |
+| [TRIGGER_MODES.md](TRIGGER_MODES.md) | The four `trigger-mode` values (`always` / `label-required` / `label-once` / `label-added-only`), how to pair them with the workflow's `on:` block, and the opt-in `skip-review-label` emergency-bypass hatch. |
 | [PR_METADATA_CHECKS.md](PR_METADATA_CHECKS.md) | PR description review (`pr-description-mode`) and AI-driven complexity labeling (`complexity-labels-enabled`) — how each works, the tool schema, threat model. |
 | [ITERATION_AWARENESS.md](ITERATION_AWARENESS.md) | Iteration-Aware Review (IAR) subsystem — converges multi-round self-review loops via content-anchored fingerprints, four convergence policies, generation tracking, and a hardcoded critical-always-surfaces safety rail. Runs on every review; wrapped in `try/except` so an IAR failure degrades to the baseline review path. |
 

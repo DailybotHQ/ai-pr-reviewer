@@ -366,6 +366,19 @@ Workflow written to `.github/workflows/pr-review.yml`. Two things left:
    ```bash
    gh label create ready --color 0e8a16 --description "Signals PR is ready for AI review"
    ```
+
+4. **Defaults you already have (no extra config needed).**
+   Iteration-Aware Review runs on every CI review with
+   `convergence-policy: first-pass-exhaustive` — exhaustive first
+   pass, then dedup on later rounds so the same warnings don't
+   trickle forever. To force a full un-deduped pass once, label
+   the PR `full-review-please` (the shipped
+   `iteration-escape-label`). Optional emergency bypass for
+   hotfixes: add `skip-review-label: skip-ai-review` to the
+   workflow and protect that label with a ruleset — see
+   `examples/skip-review-label.yml` and
+   `docs/ITERATION_AWARENESS.md` / `docs/TRIGGER_MODES.md` in the
+   action repo.
 ```
 
 Provider-console URLs to substitute in the instructions:

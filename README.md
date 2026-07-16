@@ -110,6 +110,7 @@ That's the minimum. Open a PR; the action posts a tracking comment, runs a revie
 - **Optional "reviewed" label**: applied automatically after a successful, non-blocked review.
 - **Self-healing on GitHub 422**: if the model anchors a comment outside the diff, the action retries summary-only instead of losing every other comment.
 - **Iteration-Aware Review**: dedup findings against prior rounds so the same warnings don't come back forever. Every review runs with `convergence-policy: first-pass-exhaustive` by default — exhaustive first pass (up to 3× the normal cap), dedup on subsequent rounds. Four convergence policies (`iterative`, `first-pass-exhaustive`, `round-capped`, `critical-gate`), a 30% new-lines safety net that forces an exhaustive pass when a big push arrives, and a hardcoded "criticals always surface" rail that no policy can bypass. Two escape gestures: apply the `iteration-escape-label` to bypass dedup for one run (state preserved) or remove the `applied-label` before the next review to force a full state reset (fresh generation, dedup memory wiped). See [docs/ITERATION_AWARENESS.md](docs/ITERATION_AWARENESS.md) for the full spec and [examples/iteration-aware.yml](examples/iteration-aware.yml) for tuning knobs.
+- **Emergency-bypass label** (`skip-review-label`): opt-in short-circuit when a PR carries e.g. `skip-ai-review` — no LLM call, check stays green, audit tracking comment posted. Pair with a ruleset restricting who can apply the label. See [docs/TRIGGER_MODES.md § Emergency-bypass label](docs/TRIGGER_MODES.md) and [examples/skip-review-label.yml](examples/skip-review-label.yml).
 
 ## Providers
 
@@ -606,7 +607,7 @@ The Action's runtime (the local skill mirrors these steps in your coding agent):
 10. **Apply label** — applies `applied-label` if set and the strictness gate didn't block.
 11. **Strictness gate** — exits 2 if blocked, 0 otherwise.
 
-The local skill diverges only at the boundary: instead of posting the review to GitHub (step 9), it collects findings in-memory and prints them as a Markdown table in your agent's terminal. Same tools, same prompt, same output shape. IAR pre/post steps (6 and 8) still apply locally when the companion skill runs a review against an open PR.
+The local companion skill diverges at two boundaries: (1) it prints findings instead of posting to GitHub, and (2) it does **not** run the IAR dedup pipeline — a local review is always a full pass against the current diff (it may surface findings CI has already silenced on round 2+ of the same generation). Same base prompt, same severity model, same output shape. IAR steps 6 and 8 apply only on Action runs; see [docs/ITERATION_AWARENESS.md](docs/ITERATION_AWARENESS.md).
 
 For the full design, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/PROVIDERS.md](docs/PROVIDERS.md), [docs/PROMPTS.md](docs/PROMPTS.md), [docs/STRICTNESS.md](docs/STRICTNESS.md).
 
@@ -644,7 +645,8 @@ The deep-dive docs live under [`docs/`](docs/) and are cross-linked from every r
 | Providers (chat-completions vs agent-runner, model choice) | [docs/PROVIDERS.md](docs/PROVIDERS.md) |
 | Prompts (base / extension / full replacement, worked examples) | [docs/PROMPTS.md](docs/PROMPTS.md) |
 | Strictness (`lenient` / `block-on-*` semantics) | [docs/STRICTNESS.md](docs/STRICTNESS.md) |
-| Trigger modes & branch-protection recipes | [docs/TRIGGER_MODES.md](docs/TRIGGER_MODES.md) |
+| Trigger modes, branch-protection recipes & emergency-bypass label | [docs/TRIGGER_MODES.md](docs/TRIGGER_MODES.md) |
+| Iteration-Aware Review (dedup, policies, escape label, outputs) | [docs/ITERATION_AWARENESS.md](docs/ITERATION_AWARENESS.md) |
 | PR-metadata checks (autocomplete, warn, block) | [docs/PR_METADATA_CHECKS.md](docs/PR_METADATA_CHECKS.md) |
 | Security model (author-association, egress surfaces, provider trust) | [docs/SECURITY.md](docs/SECURITY.md) |
 | Performance (turn budgets, prompt caching, token cost) | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) |

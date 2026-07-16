@@ -47,7 +47,8 @@ It is **not** a replacement for human code review. It's an additional reviewer t
 | Configurable gating | Four strictness modes (`lenient`, `block-on-critical`, `block-on-warning`, `block-on-any`) translate severity into the GitHub check status. |
 | Trigger control | Four `trigger-mode` values (`always`, `label-required`, `label-once`, `label-added-only`) for cost control and review-on-demand patterns. |
 | Label gate | Optionally only run when a PR has a specific label (e.g. `ready`). |
-| Applied label | Optionally label a PR after a successful review (e.g. `pr-reviewed`) so downstream automation can require it. |
+| Applied label | Optionally label a PR after a successful review (e.g. `pr-reviewed`) so downstream automation can require it. Removing that label before the next trigger forces an IAR state reset (fresh generation) — see [`ITERATION_AWARENESS.md` § 8.5](ITERATION_AWARENESS.md). |
+| Emergency-bypass label | Opt-in `skip-review-label` short-circuits to success (no LLM call, no findings, no IAR state mutation) when the label is present — hotfixes / rollbacks. Disabled by default; consumers must restrict who can apply the label. See [`TRIGGER_MODES.md` § Emergency-bypass label](TRIGGER_MODES.md). |
 | Auto-collapse | Previous bot reviews are marked `OUTDATED` on every new push so only the latest is visually active. Per-provider marker so multiple providers can co-exist on one PR. |
 | Tracking comment | A spinner comment with a stable `<!-- ai-pr-reviewer-marker -->` marker transitions in-place from `Working…` to `View review →`. |
 | Self-healing on 422 | If GitHub rejects the review because one comment anchored outside the diff, the action retries summary-only instead of losing every comment. |

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Docs + skill + examples sync for IAR / `skip-review-label`.**
+  Post-v1.8.0 discoverability pass so Marketplace consumers and the
+  companion skill see the same story as `action.yml`:
+  - `skills/ai-diff-reviewer/SKILL.md` — CI-only surfaces section
+    (IAR + emergency bypass; local review stays a full pass).
+  - `setup/SKILL.md` Step 4 — post-setup defaults note; `setup/reference.md`
+    — `skipped` output + related-docs links; `apply-review/SKILL.md` —
+    ignore embedded IterationState when collecting findings.
+  - `README.md` — Features emergency-bypass bullet, Documentation
+    index row for `ITERATION_AWARENESS.md`, corrected local-skill
+    wording (no local IAR dedup).
+  - `examples/full-featured.yml` + `examples/README.md` — explicit
+    IAR knobs + commented skip-review-label.
+  - `docs/ARCHITECTURE.md` topology pipeline (skip + IAR pre/post);
+    `PRODUCT_SPEC.md` emergency-bypass capability; `docs/README.md`
+    purpose one-liners for TRIGGER/PERFORMANCE/SECURITY.
+
 ### Added
 - **Iteration-Aware Review (IAR) — convergence subsystem.** Every
   review now runs the IAR pipeline: dedupes findings against prior
