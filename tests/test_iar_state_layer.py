@@ -143,6 +143,56 @@ class IterationStateRoundTripTests(unittest.TestCase):
         # It's the LAST N (most recent) that survive.
         self.assertEqual(parsed.history[-1]["gen"], 49)
 
+    def test_roundtrip_preserves_reviewed_label_applied_bit(self) -> None:
+        """The `reviewed_label_applied` bit is the load-bearing signal
+        for the USER_FORCED_RESET gesture — it MUST survive embed →
+        parse without truncation, sanitisation, or type coercion.
+        Round-trip both explicit boolean values."""
+        for expected in (True, False):
+            with self.subTest(reviewed_label_applied=expected):
+                state: reviewer.IterationState = _make_state()
+                state.reviewed_label_applied = expected
+                embedded: str = reviewer.embed_iteration_state("m", state)
+                parsed: reviewer.IterationState | None = (
+                    reviewer._parse_state_from_marker_body(embedded)
+                )
+                self.assertIsNotNone(parsed)
+                self.assertEqual(parsed.reviewed_label_applied, expected)
+
+    def test_parses_pre_v1_state_without_reviewed_label_applied(self) -> None:
+        """Backward compat: a state body written before the field
+        existed (i.e., no `reviewed_label_applied` key in the JSON
+        block) must parse cleanly and default the field to `False`. The
+        `False` default is the SAFE side of the reset gesture — it
+        suppresses USER_FORCED_RESET until the reviewer completes one
+        successful run and re-writes the state with the bit set (see
+        `test_iar_observability.RunIarPreLlmTests.
+        test_user_forced_reset_no_op_when_prior_state_never_stamped_label`)."""
+        legacy_json: str = json.dumps({
+            "version": reviewer.IAR_STATE_SCHEMA_VERSION,
+            "generation": 3,
+            "generation_range_hash": "abc",
+            "round_in_generation": 2,
+            "policy_applied": reviewer.IAR_POLICY_ITERATIVE,
+            "resolved_fingerprints": [],
+            "open_fingerprints_this_gen": [],
+            "history": [],
+            "base_sha": "b",
+            "head_sha": "h",
+            # DELIBERATELY OMITS reviewed_label_applied
+        })
+        body: str = (
+            f"marker\n{reviewer.IAR_STATE_TAG_OPEN}\n"
+            f"{legacy_json}\n"
+            f"{reviewer.IAR_STATE_TAG_CLOSE}\n"
+        )
+        parsed: reviewer.IterationState | None = (
+            reviewer._parse_state_from_marker_body(body)
+        )
+        self.assertIsNotNone(parsed)
+        self.assertFalse(parsed.reviewed_label_applied)
+        self.assertEqual(parsed.generation, 3)  # other fields unaffected
+
 
 class ParseFailureTests(unittest.TestCase):
     """Every failure mode falls back to `None` — never raises."""
@@ -250,14 +300,25 @@ class FetchLatestMarkerTests(unittest.TestCase):
             }
         }
 
-    def test_skips_minimized_comments(self) -> None:
+    def test_prefers_visible_marker_with_state_over_minimized_with_state(
+        self,
+    ) -> None:
+        """Tier 1 rule: when a non-minimized marker carries IAR state, it
+        wins over any minimized marker (regardless of createdAt), because
+        the visible marker is the authoritative live review.
+        """
+        state_block: str = (
+            f"\n{reviewer.IAR_STATE_TAG_OPEN}\n"
+            + '{"version": 1}\n'
+            + f"{reviewer.IAR_STATE_TAG_CLOSE}\n"
+        )
         newer_minimized: dict[str, Any] = {
-            "body": reviewer.REVIEW_MARKER + " STALE",
+            "body": reviewer.REVIEW_MARKER + " STALE" + state_block,
             "isMinimized": True,
             "createdAt": "2026-07-15T20:00:00Z",
         }
         older_live: dict[str, Any] = {
-            "body": reviewer.REVIEW_MARKER + " LIVE",
+            "body": reviewer.REVIEW_MARKER + " LIVE" + state_block,
             "isMinimized": False,
             "createdAt": "2026-07-15T10:00:00Z",
         }
@@ -270,6 +331,77 @@ class FetchLatestMarkerTests(unittest.TestCase):
             )
         self.assertIsNotNone(got)
         self.assertIn("LIVE", got)
+
+    def test_falls_back_to_minimized_marker_with_state_when_no_visible(
+        self,
+    ) -> None:
+        """Tier 2 rule: when NO visible marker carries IAR state (typical
+        under `collapse-previous: true` — the last tracking comment got
+        minimized between runs), fall back to the latest minimized marker
+        that still carries a state block. This is the load-bearing fix
+        for the IAR-vs-collapse ordering bug (without it, every default
+        config sees `first_review` on every run and never dedups).
+        """
+        state_block: str = (
+            f"\n{reviewer.IAR_STATE_TAG_OPEN}\n"
+            + '{"version": 1}\n'
+            + f"{reviewer.IAR_STATE_TAG_CLOSE}\n"
+        )
+        older_minimized: dict[str, Any] = {
+            "body": reviewer.REVIEW_MARKER + " OLDER" + state_block,
+            "isMinimized": True,
+            "createdAt": "2026-07-15T10:00:00Z",
+        }
+        newer_minimized: dict[str, Any] = {
+            "body": reviewer.REVIEW_MARKER + " NEWER" + state_block,
+            "isMinimized": True,
+            "createdAt": "2026-07-15T20:00:00Z",
+        }
+        # A visible marker without a state block (like the spinner) must
+        # not steal precedence from a minimized marker with real state.
+        visible_no_state: dict[str, Any] = {
+            "body": reviewer.REVIEW_MARKER + " SPINNER",
+            "isMinimized": False,
+            "createdAt": "2026-07-15T21:00:00Z",
+        }
+        with patch.object(
+            reviewer, "gh_graphql",
+            return_value=self._gql_return(
+                [older_minimized, newer_minimized, visible_no_state]
+            ),
+        ):
+            got: str | None = reviewer._fetch_latest_marker_body(
+                repo="acme/x", pr_number=1, token="tok"
+            )
+        self.assertIsNotNone(got)
+        self.assertIn("NEWER", got)
+
+    def test_falls_back_to_any_marker_when_none_carry_state(self) -> None:
+        """Tier 3 rule: when no marker carries an IAR state block at all
+        (fresh PR, or state predates IAR), return the newest marker
+        anyway so back-compat callers still see something to work with.
+        `_parse_state_from_marker_body` will return None for the missing
+        state block, which callers interpret as `first_review`.
+        """
+        older_stateless: dict[str, Any] = {
+            "body": reviewer.REVIEW_MARKER + " OLD",
+            "isMinimized": False,
+            "createdAt": "2026-07-15T10:00:00Z",
+        }
+        newer_stateless: dict[str, Any] = {
+            "body": reviewer.REVIEW_MARKER + " NEW",
+            "isMinimized": False,
+            "createdAt": "2026-07-15T20:00:00Z",
+        }
+        with patch.object(
+            reviewer, "gh_graphql",
+            return_value=self._gql_return([older_stateless, newer_stateless]),
+        ):
+            got: str | None = reviewer._fetch_latest_marker_body(
+                repo="acme/x", pr_number=1, token="tok"
+            )
+        self.assertIsNotNone(got)
+        self.assertIn("NEW", got)
 
     def test_takes_most_recent_by_created_at(self) -> None:
         older: dict[str, Any] = {

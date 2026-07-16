@@ -1925,6 +1925,18 @@ class IterationState:
     # is the safe conservative fallback (never silences a review that would
     # have benefited from an exhaustive pass; just skips the boost).
     head_sha: str = ""
+    # Records whether the reviewer stamped `applied-label` on the PR at the
+    # end of the last run (True only when the review posted AND was NOT
+    # blocked by the strictness gate). This is the load-bearing signal for
+    # USER_FORCED_RESET: the "reviewed label absent" gesture only counts as
+    # a deliberate reset if the label was previously present — otherwise
+    # every blocked run would look like a reset (since blocked runs never
+    # stamp the label). Defaults to `False` for backward-compat with older
+    # marker bodies that predate this field; the safe conservative fallback
+    # is "the label was never stamped", which suppresses the reset gesture
+    # (users on old state must complete one successful review before the
+    # reset gesture becomes armed — the correct, safe behavior).
+    reviewed_label_applied: bool = False
 
 
 # Cap on `history` list length. 20 generations is plenty for the lifetime
@@ -2010,6 +2022,9 @@ def _parse_state_from_marker_body(
             history=list(data.get("history", []) or []),
             base_sha=str(data.get("base_sha", "")),
             head_sha=str(data.get("head_sha", "")),
+            reviewed_label_applied=bool(
+                data.get("reviewed_label_applied", False)
+            ),
         )
     except IterationStateParseError as exc:
         log(f"IAR: state parse failed: {exc}; treating as first review.")
@@ -2025,14 +2040,33 @@ def _parse_state_from_marker_body(
 def _fetch_latest_marker_body(
     *, repo: str, pr_number: int, token: str
 ) -> str | None:
-    """Fetch the most recent non-minimized tracking-marker issue comment
-    on the given PR and return its body. Returns `None` if no marker is
-    found or on any API failure.
+    """Fetch the most recent tracking-marker issue comment on the PR that
+    carries an embedded IAR state block, and return its body. Returns
+    `None` if no such marker is found or on any API failure.
 
     Uses GraphQL because REST issue comments do not expose `isMinimized`,
-    and `collapse-previous` uses `minimizeComment` which toggles that
-    flag rather than mutating the body — reading a minimized marker
-    would surface stale state.
+    which the ordering fallback below reads.
+
+    Ordering rule (load-bearing — see docs/ITERATION_AWARENESS.md § 7):
+
+        1. Prefer the latest **non-minimized** marker that contains an
+           IAR state block. This is the common path: the tracking
+           comment posted at the end of the last successful review.
+        2. Fall back to the latest **minimized** marker that contains
+           an IAR state block. This is the collapse-previous case: the
+           consumer opted into `collapse-previous: true` (the shipped
+           default), so between runs the previous marker gets
+           minimized by `gh_collapse_previous_reviews` — but the state
+           block itself is still in the body. Without this fallback,
+           every collapse-previous consumer would see IAR reset to
+           `first_review` on every run and never dedup findings.
+        3. Fall back to any marker (state block or not) — matches the
+           legacy semantics used by callers other than IAR.
+
+    Tier (2) rescues state across the collapse boundary so IAR's
+    generation-tracking / dedup engine actually engages on the default
+    config. Tier (3) preserves back-compat for the non-IAR call sites
+    that just want "the last marker we posted."
     """
     if not repo or "/" not in repo or pr_number <= 0:
         return None
@@ -2073,28 +2107,51 @@ def _fetch_latest_marker_body(
         )
     except AttributeError:
         return None
-    candidates: list[dict[str, Any]] = []
+    non_minimized_with_state: list[dict[str, Any]] = []
+    minimized_with_state: list[dict[str, Any]] = []
+    any_marker: list[dict[str, Any]] = []
     for node in nodes:
         if not isinstance(node, dict):
             continue
         body: str = str(node.get("body") or "")
         if REVIEW_MARKER not in body:
             continue
-        if node.get("isMinimized") is True:
-            continue
-        candidates.append(node)
-    if not candidates:
-        return None
-    candidates.sort(key=lambda n: str(n.get("createdAt") or ""))
-    return str(candidates[-1].get("body") or "")
+        any_marker.append(node)
+        has_state_block: bool = IAR_STATE_TAG_OPEN in body
+        is_minimized: bool = node.get("isMinimized") is True
+        if has_state_block and not is_minimized:
+            non_minimized_with_state.append(node)
+        elif has_state_block and is_minimized:
+            minimized_with_state.append(node)
+
+    def _newest(nodes_: list[dict[str, Any]]) -> dict[str, Any]:
+        return sorted(nodes_, key=lambda n: str(n.get("createdAt") or ""))[-1]
+
+    if non_minimized_with_state:
+        return str(_newest(non_minimized_with_state).get("body") or "")
+    if minimized_with_state:
+        log(
+            "IAR: no visible marker carries state; falling back to the "
+            "latest minimized marker with an embedded state block "
+            "(this is expected under `collapse-previous: true` — the "
+            "prior tracking comment was minimized between runs)."
+        )
+        return str(_newest(minimized_with_state).get("body") or "")
+    if any_marker:
+        return str(_newest(any_marker).get("body") or "")
+    return None
 
 
 def read_prior_iteration_state(
     *, repo: str, pr_number: int, token: str
 ) -> IterationState | None:
-    """Public entry point: fetch the last non-minimized marker on the PR
-    and extract the embedded IAR state. Returns `None` on any failure —
+    """Public entry point: fetch the last marker on the PR that carries
+    an IAR state block and extract it. Returns `None` on any failure —
     treated by callers as "first review of this PR".
+
+    Reads MINIMIZED markers too when no visible marker carries state, so
+    IAR persistence survives `collapse-previous: true` (the shipped
+    default). See `_fetch_latest_marker_body` for the full ordering rule.
     """
     marker_body: str | None = _fetch_latest_marker_body(
         repo=repo, pr_number=pr_number, token=token
@@ -2132,6 +2189,7 @@ def embed_iteration_state(
         history=bounded_history,
         base_sha=state.base_sha,
         head_sha=state.head_sha,
+        reviewed_label_applied=state.reviewed_label_applied,
     )
     state_json: str = json.dumps(
         asdict(bounded_state), indent=2, sort_keys=True
@@ -3020,17 +3078,26 @@ def dispatch_policy(
 ) -> PolicyResult:
     """Top-level IAR policy dispatch. Order of precedence (highest → lowest):
 
-    1. Escape label short-circuit → surface all findings; no dedup; NO
-       state mutation for this run.
-    2. Safety net (>= 30% new lines on NEW_COMMITS or REBASED) → force
+    1. USER_FORCED_RESET transition → falls through to normal policy
+       dispatch with the reset already applied upstream (prior_state
+       has been cleared to None by `run_iar_pre_llm`). The reset is
+       the stronger of the two exhaustive-triggering gestures — it
+       DISCARDS state, whereas the escape label only bypasses dedup
+       for one run with state preserved. When a user applies BOTH
+       gestures the intent is "start clean," so we defer to the
+       reset semantics and skip the escape-label short-circuit
+       (docs/ITERATION_AWARENESS.md § 8.5 precedence).
+    2. Escape label short-circuit → surface all findings; no dedup;
+       NO state mutation for this run.
+    3. Safety net (>= 30% new lines on NEW_COMMITS or REBASED) → force
        `first-pass-exhaustive` for this round regardless of configured
        policy.
-    3. Configured `iar_config.policy` → one of iterative,
+    4. Configured `iar_config.policy` → one of iterative,
        first-pass-exhaustive, round-capped, critical-gate.
-    4. Unknown policy (should be unreachable — `build_iar_config`
+    5. Unknown policy (should be unreachable — `build_iar_config`
        already falls back) → iterative + warning log.
     """
-    if check_escape_label(
+    if transition != GenerationTransition.USER_FORCED_RESET and check_escape_label(
         pr_labels=pr_labels, escape_label=iar_config.escape_label
     ):
         log(
@@ -3376,17 +3443,25 @@ def run_iar_pre_llm(
     prompt addendum + effective cap the caller will use to shape the
     LLM call.
 
-    User-forced reset: when `applied_label` (the consumer's "reviewed"
-    label — the one the action stamps on a successful review) is
-    non-empty AND absent from the PR labels AND prior IAR state exists
-    in the tracking marker, this run is treated as a
-    `USER_FORCED_RESET`. Downstream that behaves identically to
+    User-forced reset: fires when ALL FOUR conditions hold — (a)
+    `applied_label` (the consumer's "reviewed" label — the one the
+    action stamps on a successful review) is configured, (b) prior IAR
+    state exists in the tracking marker, (c) the prior state records
+    that the reviewer had previously stamped that label
+    (`prior_state.reviewed_label_applied is True`), and (d) that label
+    is absent from the PR now. Downstream that behaves identically to
     `FIRST_REVIEW`: prior state is discarded, dedup memory is wiped,
     round-1 exhaustive fires under the default policy. The only reason
     the transition is a distinct enum value is so the log + marker
     annotation can tell developers the reset was a deliberate gesture
     (they removed the reviewed label before re-triggering) rather than
     a first-ever review of the PR.
+
+    Condition (c) is load-bearing: without it, any blocked review
+    (`block-on-critical` fired, so the label was never stamped)
+    followed by the natural re-trigger would look identical to a
+    deliberate reset and wipe fingerprint memory. See
+    `docs/ITERATION_AWARENESS.md` § 8.5 for the full contract.
 
     Caller SHOULD wrap this in `try/except` — the function does full
     GH API + git work and any failure should degrade to the baseline
@@ -3421,18 +3496,21 @@ def run_iar_pre_llm(
     # User-forced reset detection — see docstring. Overrides both
     # `transition` and `prior_state` so every downstream code path
     # (dedup, dispatch, advance_generation, safety-net) behaves as if
-    # this were a first review. Only fires when `applied_label` is
-    # configured — consumers who don't set a reviewed label can't
-    # perform the gesture, and the detection cleanly no-ops.
+    # this were a first review. Fires only when the FOUR conditions in
+    # the docstring all hold — the `reviewed_label_applied` guard is
+    # the safety net that stops any blocked review's natural re-trigger
+    # from being misclassified as a deliberate reset.
     if (
         applied_label
         and prior_state is not None
+        and prior_state.reviewed_label_applied
         and applied_label not in pr_labels
     ):
         log(
             f"IAR: user-forced reset detected — reviewed label "
-            f"{applied_label!r} absent from PR while prior IAR state "
-            f"exists (prior gen={prior_state.generation}, "
+            f"{applied_label!r} previously stamped (recorded in prior "
+            f"state) but now absent from PR (prior gen="
+            f"{prior_state.generation}, "
             f"round={prior_state.round_in_generation}). Treating this "
             "run as USER_FORCED_RESET: dedup memory wiped, generation "
             "counter reset to 1, round-1 exhaustive fires under the "
@@ -5569,7 +5647,7 @@ def main() -> int:
     # effects. Intended for hotfixes / rollbacks / trivially safe changes
     # where an LLM review would burn tokens for no incremental value.
     #
-    # Contract (mirrors action.yml + docs/SKIP_REVIEW_LABEL.md):
+    # Contract (mirrors action.yml + docs/TRIGGER_MODES.md § "Emergency-bypass label"):
     #   1. No LLM call — the reviewer never enters `run_agentic_loop`.
     #   2. No IAR state mutation — persisted state is left exactly as it
     #      was; the next non-skip run resumes from where the pipeline
@@ -6107,6 +6185,16 @@ def main() -> int:
         and iar_policy_final is not None
         and iar_pre_context is not None
     ):
+        # Load-bearing for USER_FORCED_RESET: record whether the applied
+        # label WILL be stamped on this run (i.e., the review posted AND
+        # the strictness gate did not block). The next run reads this
+        # bit to distinguish "the user removed the reviewed label
+        # deliberately" from "the previous run was blocked so the label
+        # was never stamped in the first place" — the former is a real
+        # reset gesture, the latter is a natural re-trigger.
+        iar_state_final.reviewed_label_applied = bool(
+            applied_label and not blocked
+        )
         tracking_body = tracking_body + _render_iar_marker_annotation(
             state=iar_state_final,
             policy_result=iar_policy_final,

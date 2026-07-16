@@ -369,7 +369,49 @@ class CheckEscapeLabelTests(unittest.TestCase):
 
 
 class DispatchPolicyPrecedenceTests(unittest.TestCase):
-    """Precedence: escape label > safety net > configured policy."""
+    """Precedence (highest → lowest):
+    USER_FORCED_RESET transition > escape label > safety net > configured policy.
+    """
+
+    def test_user_forced_reset_beats_escape_label(self) -> None:
+        """Both gestures applied simultaneously (user removed reviewed
+        label AND added escape label) → reset wins. Reset is the more
+        forceful gesture (DISCARDS state, whereas escape label only
+        bypasses dedup for one run with state preserved); when both are
+        active the user's intent is "start clean" so we defer to reset
+        semantics and skip the escape-label short-circuit.
+
+        Under `first-pass-exhaustive` (the shipped default), a
+        USER_FORCED_RESET run becomes a fresh round-1 with the
+        multiplied cap and exhaustive prompt addendum — the same
+        outcome the escape label would produce, but without silently
+        preserving stale fingerprint memory.
+        """
+        findings: list[reviewer.Finding] = [
+            _finding(line=i) for i in range(1, 5)
+        ]
+        got: reviewer.PolicyResult = reviewer.dispatch_policy(
+            iar_config=_cfg(policy="first-pass-exhaustive"),
+            findings=findings,
+            # By this point in the pipeline, `run_iar_pre_llm` has
+            # already cleared prior_state to None on USER_FORCED_RESET —
+            # dispatch_policy just sees the transition value.
+            prior_state=None,
+            code_contexts={},
+            base_max_inline_comments=10,
+            transition=reviewer.GenerationTransition.USER_FORCED_RESET,
+            new_lines_pct=0.0,
+            pr_labels=["full-review-please"],  # escape label ALSO present
+        )
+        self.assertEqual(
+            got.policy_applied,
+            reviewer.IAR_POLICY_FIRST_PASS_EXHAUSTIVE,
+            msg="USER_FORCED_RESET must fall through to the configured "
+                "policy's exhaustive path — the escape-label "
+                "short-circuit MUST be skipped to preserve the reset's "
+                "state-discard semantics.",
+        )
+        self.assertEqual(len(got.findings_to_surface), 4)
 
     def test_escape_label_beats_safety_net(self) -> None:
         """Even with safety-net threshold exceeded AND label present, the

@@ -676,14 +676,22 @@ class RunIarPreLlmTests(unittest.TestCase):
     def test_user_forced_reset_when_reviewed_label_absent_with_prior_state(
         self,
     ) -> None:
-        """Reviewed label absent + prior state present → USER_FORCED_RESET,
+        """Reviewed label absent + prior state present + prior state
+        recorded that the label WAS previously stamped → USER_FORCED_RESET,
         prior_state wiped to None, new_lines_pct forced to 0.0 so the
-        safety net can't fire (irrelevant when we're starting fresh)."""
+        safety net can't fire (irrelevant when we're starting fresh).
+
+        The `reviewed_label_applied=True` bit on the prior state is
+        load-bearing: without it, this looks identical to a blocked-run
+        re-trigger and the safety guard suppresses the reset (see
+        `test_user_forced_reset_no_op_when_prior_state_never_stamped_label`).
+        """
         prior_state: IterationState = new_iteration_state(
             generation=5, generation_range_hash="oldhash",
             round_in_generation=3, base_sha="baseabc",
             head_sha="prior_head",
         )
+        prior_state.reviewed_label_applied = True
         with patch.object(
             reviewer, "read_prior_iteration_state", return_value=prior_state,
         ), patch.object(
@@ -717,6 +725,59 @@ class RunIarPreLlmTests(unittest.TestCase):
         # so we don't assert on the call count — only on the effective
         # value that survives to the returned context.
         _ = mock_new_lines
+
+    def test_user_forced_reset_no_op_when_prior_state_never_stamped_label(
+        self,
+    ) -> None:
+        """The blocked-run safety guard: prior state exists AND the
+        reviewed label is absent from the PR, BUT the prior state records
+        `reviewed_label_applied=False` (the last review was BLOCKED and
+        therefore never stamped the label). This looks superficially like
+        a reset gesture but is actually a natural re-trigger after a
+        blocked review — the label was NEVER on the PR to remove — so
+        USER_FORCED_RESET MUST NOT fire and dedup memory MUST be
+        preserved. Without this guard, every `block-on-critical`
+        consumer would see fingerprint memory wiped after every blocked
+        run.
+        """
+        prior_state: IterationState = new_iteration_state(
+            generation=2, generation_range_hash="samehash",
+            round_in_generation=1, base_sha="baseabc",
+            head_sha="prior_head",
+        )
+        # Explicit for readability — `new_iteration_state` defaults to False,
+        # which is the correct "safe" default for consumers on state that
+        # predates the field.
+        self.assertFalse(prior_state.reviewed_label_applied)
+        with patch.object(
+            reviewer, "read_prior_iteration_state", return_value=prior_state,
+        ), patch.object(
+            reviewer, "_resolve_base_sha", return_value="baseabc",
+        ), patch.object(
+            reviewer, "compute_generation_range_hash", return_value="samehash",
+        ), patch.object(
+            reviewer, "_fetch_pr_labels",
+            return_value=["Ready"],  # reviewed label ABSENT
+        ):
+            ctx: IARPreLLMContext = run_iar_pre_llm(
+                iar_config=self._iar_config(),
+                repo="a/b", pr_number=1, gh_token="t",
+                base_ref="main", head_sha="head123",
+                base_max_inline_comments=10,
+                applied_label="ai-reviewed",  # configured
+            )
+        self.assertEqual(
+            ctx.transition, GenerationTransition.SAME_GENERATION,
+            msg="prior_state.reviewed_label_applied=False must suppress "
+                "USER_FORCED_RESET even when the reviewed label is absent "
+                "from the PR — otherwise every blocked-run re-trigger "
+                "looks like a deliberate reset gesture.",
+        )
+        self.assertIs(
+            ctx.prior_state, prior_state,
+            msg="Prior state must be preserved (dedup memory intact) "
+                "when the reset gesture is suppressed.",
+        )
 
     def test_user_forced_reset_no_op_when_reviewed_label_empty(self) -> None:
         """Consumer didn't set a reviewed label → the gesture can't

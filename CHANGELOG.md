@@ -140,11 +140,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   empty outputs, and `write_all_outputs()` on every exit path
   (skip, success, block) always includes the 5 IAR outputs. CI fails
   any PR where this suite regresses.
-- 190+ additional unit tests across
+- 200+ additional unit tests across
   `test_iar_state_layer.py`, `test_iar_generation_tracking.py`,
   `test_iar_dedup.py`, `test_iar_policies.py`, `test_iar_dispatch.py`,
   and `test_iar_observability.py` cover the pure IAR helpers. Total
-  suite: **429 tests** (all passing).
+  suite: **445 tests** (all passing).
+
+### Fixed
+- **IAR × `collapse-previous` ordering bug.** Before this fix, on the
+  shipped default (`collapse-previous: true`), the tracking marker
+  from the previous run was minimized BEFORE `run_iar_pre_llm()` read
+  the embedded state block — and the marker fetcher explicitly skipped
+  minimized comments, so IAR always saw `transition=first_review` and
+  never dedup'd. Every consumer on defaults burned through round-1
+  exhaustive on every run and never converged. Fix: teach
+  `_fetch_latest_marker_body` to fall back to the latest **minimized**
+  marker that carries an IAR state block when no visible marker does
+  (three-tier priority: visible-with-state → minimized-with-state →
+  any-marker). IAR state now persists across the collapse boundary;
+  dedup + generation tracking engage on every default run. New tests
+  in `test_iar_state_layer.py::FetchLatestMarkerTests` lock the
+  three-tier ordering.
+- **USER_FORCED_RESET false-positive after blocked runs.** Before this
+  fix, USER_FORCED_RESET fired whenever the reviewed label was absent
+  and prior state existed — but blocked runs (`block-on-critical` +
+  critical finding) never stamp the reviewed label in the first place,
+  so the natural re-trigger after a blocked run looked identical to a
+  deliberate reset gesture and wiped fingerprint memory. Fix: persist
+  a new `reviewed_label_applied: bool` bit inside `IterationState`
+  (set to `True` only when the reviewer successfully stamps the label
+  at the end of a non-blocked run), and gate USER_FORCED_RESET on that
+  bit being `True` in the prior state. Reset now fires only when the
+  reviewer previously stamped the label AND that label has since been
+  removed — a genuinely deliberate developer gesture. Field is
+  optional in the state schema (defaults to `False`) so state written
+  before this fix parses cleanly and safely suppresses the gesture
+  until the reviewer completes one successful run. New tests in
+  `test_iar_observability.py::RunIarPreLlmTests` and
+  `test_iar_state_layer.py::IterationStateRoundTripTests` lock the
+  parse + gate contract.
+- **USER_FORCED_RESET × escape-label precedence.** Before this fix,
+  the `iteration-escape-label` short-circuit in `dispatch_policy` ran
+  before the USER_FORCED_RESET check, so if a user applied BOTH
+  gestures (removed the reviewed label AND added `full-review-please`)
+  the escape label won — but escape preserves prior state whereas
+  reset discards it, contradicting the "reset is the stronger
+  gesture" contract documented in `docs/ITERATION_AWARENESS.md § 8.5`.
+  Fix: reorder `dispatch_policy` to skip the escape-label
+  short-circuit when `transition == USER_FORCED_RESET`, deferring to
+  the configured policy's exhaustive first-pass path with prior state
+  already cleared. New test in
+  `test_iar_dispatch.py::DispatchPolicyPrecedenceTests` locks the
+  precedence contract.
 
 - **New "Security audit alignment" section in `.review/extension.md`.**
   Codifies the review rules that keep the two external security

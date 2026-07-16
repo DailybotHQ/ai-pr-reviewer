@@ -331,6 +331,22 @@ IAR: safety net triggered (45.2% new lines exceeds threshold 30%) — forcing fi
 
 **Threshold configurability.** `IAR_SAFETY_NET_NEW_LINES_PCT` is currently a top-of-file constant (not an input). If a repo needs a different threshold, we'd add a new input in a future release rather than changing the default globally.
 
+### 7.3 State persistence across the `collapse-previous` boundary
+
+**The interaction.** `collapse-previous: true` (the shipped default) minimizes the reviewer's previous tracking marker on the next run so the PR conversation stays scannable. But that marker is exactly where IAR embeds its state block — so a naive implementation that only reads *visible* markers would see no prior state on every run and treat every review as `first_review`, which would defeat dedup + generation tracking entirely (every consumer on defaults would burn round-1 exhaustive on every run and never converge).
+
+**The rescue.** `_fetch_latest_marker_body` uses a three-tier ordering to find the latest marker that carries state, in priority order:
+
+1. **Newest non-minimized marker WITH an `IAR_STATE_TAG_OPEN` block** — the common path when `collapse-previous: false` or the current run is the first review since collapse.
+2. **Newest minimized marker WITH state block** — the collapse-boundary rescue. Under `collapse-previous: true` the last real tracking comment has been minimized, but the state block is still in its body. Reading it here is what makes IAR persistence work on defaults.
+3. **Newest marker of any shape** — back-compat fallback for callers who just want "the last marker we posted"; `_parse_state_from_marker_body` returns `None` if the body carries no state block, which downstream treats as a first review.
+
+Tiers 1 and 2 combined guarantee that no consumer setting of `collapse-previous` causes IAR to lose state. Tier 3 keeps the fetcher useful for other callers (currently none in-tree, but the API is public).
+
+**Log signature.** When tier 2 fires, the reviewer emits a `INFO`-level log line so the collapse-vs-IAR interaction is visible in the workflow log without turning on debug: `IAR: no visible marker carries state; falling back to the latest minimized marker with an embedded state block (this is expected under collapse-previous: true — the prior tracking comment was minimized between runs).`
+
+**Test coverage:** [`tests/test_iar_state_layer.py`](../tests/test_iar_state_layer.py) `FetchLatestMarkerTests.test_prefers_visible_marker_with_state_over_minimized_with_state`, `test_falls_back_to_minimized_marker_with_state_when_no_visible`, `test_falls_back_to_any_marker_when_none_carry_state` lock the three-tier ordering.
+
 ---
 
 ## 8. Escape hatch
@@ -367,7 +383,7 @@ Consumers can rename the label via the `iteration-escape-label` input. Useful wh
 
 Distinct from the escape label, there is a second **stateful** escape gesture that lets a developer force a complete IAR reset (as opposed to a one-run dedup skip). It uses the labels the workflow already has, so there is nothing new to configure.
 
-**Gesture:** on a PR with the reviewed label attached (e.g. `ai-reviewed`, whatever the consumer set as `applied-label`), the developer removes it. On the next review the reviewer sees that the reviewed label is absent while a prior IAR state still exists in the tracking marker — it interprets that as an intentional reset request.
+**Gesture:** on a PR that has previously been through a successful (non-blocked) IAR run — i.e. the reviewer stamped the reviewed label (e.g. `ai-reviewed`, whatever the consumer set as `applied-label`) at the end of that run — the developer removes the reviewed label. On the next review the reviewer confirms that (a) the previous run's state records the label was in fact stamped, and (b) that same label is no longer on the PR, and interprets the removal as an intentional reset request.
 
 **Effect (this run):**
 - Transition classified as `USER_FORCED_RESET` (visible in the marker annotation and the workflow log).
@@ -380,18 +396,21 @@ Distinct from the escape label, there is a second **stateful** escape gesture th
 **Why this exists.** The escape-label pattern (§ 8.1–8.4) is one-shot: dedup is bypassed for a single run and state carries on. The reset gesture is for the harder case — the developer suspects the accumulated state itself is wrong (stale fingerprints, drift after a big rebase, or simply "I want to start clean"). Removing the reviewed label is a gesture the developer already makes when they want to re-open a PR for review, so the cost is zero.
 
 **How the two interact.**
-- `full-review-please` label applied AND reviewed label removed → reset takes precedence. The next run is USER_FORCED_RESET (fresh start) rather than an escape-label run (dedup skipped, state preserved).
+- `full-review-please` label applied AND reviewed label removed → reset takes precedence. The next run is USER_FORCED_RESET (fresh start) rather than an escape-label run (dedup skipped, state preserved). Enforced in `dispatch_policy`: the escape-label short-circuit skips when `transition == USER_FORCED_RESET`, letting the reset's exhaustive first-pass path fire.
 - Escape label alone → dedup skipped this run, state preserved.
-- Reviewed label removed alone → USER_FORCED_RESET, state discarded.
+- Reviewed label removed alone (with prior state recording a successful stamp) → USER_FORCED_RESET, state discarded.
 
 **How the two are distinguished in the marker.** The annotation carries the transition name in parentheses — `(escape_label)` for one-shot bypass (state preserved) vs `(user_forced_reset)` for the reset (state discarded).
+
+**The load-bearing `reviewed_label_applied` safety guard.** The reset detection requires four conditions to fire — (1) `applied-label` is configured, (2) prior IAR state exists, (3) that prior state records the reviewer had previously stamped the label (`prior_state.reviewed_label_applied == True`), and (4) the label is absent from the PR now. Condition (3) is critical: without it, any blocked review (`block-on-critical` fired, so the reviewer never stamped the label) followed by the natural re-trigger would look identical to a deliberate reset and wipe fingerprint memory. The bit is written at the end of each run: `True` only when the review posted AND the strictness gate did not block; otherwise `False`. For state written before the field existed (missing key in the JSON block), the parser defaults to `False` — the safe side of the guard, which suppresses the gesture until the reviewer completes one successful run and re-writes the state with the bit set.
 
 **No-op cases.** The reset gesture does nothing when:
 - `applied-label` is empty / not configured (the consumer opted out of the reviewed-label workflow entirely).
 - No prior IAR state exists (first-ever review of the PR — no state to reset).
 - The reviewed label is still on the PR at review time (nothing was removed).
+- The prior state records `reviewed_label_applied=False` (the previous run was blocked or IAR itself failed, so the label was never on the PR — removing "the label" is nonsensical because it was never there).
 
-**Test coverage:** [`tests/test_iar_observability.py`](../tests/test_iar_observability.py) `RunIarPreLlmTests.test_user_forced_reset_*` (four cases — fires, three no-ops).
+**Test coverage:** [`tests/test_iar_observability.py`](../tests/test_iar_observability.py) `RunIarPreLlmTests.test_user_forced_reset_*` (five cases — fires, four no-ops) + [`tests/test_iar_state_layer.py`](../tests/test_iar_state_layer.py) `IterationStateRoundTripTests.test_roundtrip_preserves_reviewed_label_applied_bit` + `test_parses_pre_v1_state_without_reviewed_label_applied` (state persistence + backward compat) + [`tests/test_iar_dispatch.py`](../tests/test_iar_dispatch.py) `DispatchPolicyPrecedenceTests.test_user_forced_reset_beats_escape_label` (precedence).
 
 ---
 

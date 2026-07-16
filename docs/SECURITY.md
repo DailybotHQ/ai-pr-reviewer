@@ -295,7 +295,7 @@ IAR persists per-PR iteration state as a JSON block inside the tracking marker c
 
 ### User-controllable inputs
 
-Two new inputs accept user text: `convergence-policy` and `iteration-escape-label`. Both are validated at parse time — the policy is compared against a whitelist and falls back to `iterative` on any unknown value; the escape label is compared with `in pr_labels` (a Python list membership check on strings pulled from the GitHub REST `labels` field). Neither is ever passed to a subprocess, HTTP URL, or shell string.
+Two new inputs accept user text: `convergence-policy` and `iteration-escape-label`. Both are validated at parse time — the policy is compared against a whitelist and falls back to `first-pass-exhaustive` (the shipped default) on any unknown value; the escape label is compared with `in pr_labels` (a Python list membership check on strings pulled from the GitHub REST `labels` field). Neither is ever passed to a subprocess, HTTP URL, or shell string.
 
 ### API surface delta
 
@@ -304,6 +304,36 @@ Zero new endpoints beyond the reviewer's baseline set. The one HTTP call the IAR
 ### Cost telemetry
 
 `RunTelemetry` records `start_time_monotonic: float`, `tokens_used: int`, and `estimated_baseline_tokens: int`. All three fields are numeric — no user strings, no PII, no secrets. The five IAR action outputs surface only these numerics plus the enum-validated policy name and the round/generation counters. There is no path by which a value derived from the PR body could reach `iteration-tokens-used` or `iteration-cost-vs-baseline-estimate`.
+
+## Emergency-bypass label (`skip-review-label`) trust boundary
+
+The `skip-review-label` input is an opt-in escape hatch that lets a labeled PR merge without an AI review. It is disabled by default (empty string → the check never fires); once configured to a label name, applying that label to a PR causes the reviewer to short-circuit to success without invoking the LLM. The intent is to unblock hotfixes, rollbacks, and mechanically-safe changes where an LLM review would burn tokens for no incremental value.
+
+### Threat model
+
+**Anyone who can apply the configured label can bypass the AI review.** This is the load-bearing constraint. The reviewer performs zero mitigations of its own; the trust boundary lives entirely in GitHub's label-application permissions, which are configurable per-label via [repository rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets-for-a-repository) or [branch protection](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches).
+
+Recommended controls for consumers who make the AI review part of their merge gate:
+
+1. **Restrict the label** with a ruleset that lists an explicit allow-list of accounts/teams who can apply/remove it — the same pattern used for `hotfix`-style bypasses elsewhere.
+2. **Audit the tracking comment.** Every skip run posts a `⏭️ skipped` tracking comment with `REVIEW_MARKER` and the provider marker, so `collapse-previous` on the next real run treats it uniformly and dashboards/audit scripts can enumerate skip events.
+3. **Choose a label name that signals intent.** `skip-ai-review`, `emergency-bypass`, or `hotfix:approved` are more auditable in retrospect than a generic label like `wip`.
+4. **Do NOT reuse the label as a general workflow label.** If the same label triggers other jobs (e.g. `deploy` or `notify`), the blast radius grows — anyone who can trigger those jobs can also skip code review.
+
+### Zero-side-effect contract
+
+On a skip run the reviewer explicitly does NOT perform any of the following, so a legitimately skipped PR cannot be misclassified downstream as reviewed:
+
+- **`applied-label` is NOT stamped.** A skipped PR keeps whatever "reviewed" state it had before the skip — never gains a false "reviewed" annotation.
+- **`collapse-previous` does NOT run.** Prior real reviews on the PR stay visible so the human merger has context.
+- **IAR state is NOT touched.** The next non-skip run resumes from wherever the pipeline left off — the skip does not create ghost generations or wipe fingerprint memory.
+- **No LLM call.** The reviewer short-circuits before `run_agentic_loop`; there is no path by which the label body, name, or PR content is passed to a model on a skip run.
+
+### API surface delta
+
+Zero new endpoints. The skip check reuses the existing `gh_request` REST helper against `GET /repos/{owner}/{repo}/pulls/{pr}` (already called for the label-gate check). The one new HTTP call is `POST /repos/{owner}/{repo}/issues/{pr}/comments` for the tracking comment, which the reviewer already uses on every non-skipped run. No token elevation required.
+
+The label name flows into a single Python string comparison (`skip_review_label in current_labels`) and into `render_tracking_body_skipped_by_label()` where it is `str`-interpolated into a Markdown code fence — never a subprocess arg, HTTP URL path component, or shell string.
 
 ## Supply-chain audit checklist
 

@@ -373,6 +373,35 @@ both contracts across future PRs.
   on the transition enum without acknowledging `USER_FORCED_RESET`
   risks silently ignoring the reset semantics. Add a comment showing
   the reviewer considered it, or expand the branch to include it.
+- **Always `critical`:** any change to the USER_FORCED_RESET detection
+  in `run_iar_pre_llm` that removes or weakens the
+  `prior_state.reviewed_label_applied` guard. The guard is the
+  load-bearing safety net that prevents any blocked-review re-trigger
+  (which naturally has the reviewed label absent, because blocked runs
+  never stamp it) from being misclassified as a deliberate reset and
+  wiping fingerprint memory. All FOUR conditions — configured label,
+  prior state, prior state records the label was stamped, label absent
+  now — must remain conjoined.
+- **Always `critical`:** any change to `_fetch_latest_marker_body` that
+  removes the tier-2 fallback (minimized markers with an IAR state
+  block). Without tier-2, `collapse-previous: true` (the shipped
+  default) causes IAR to lose state on every run and treat every
+  review as `first_review`. Any refactor MUST preserve the three-tier
+  priority — see `docs/ITERATION_AWARENESS.md § 7.3`.
+- **Always `warning`:** any change to `dispatch_policy` that runs the
+  escape-label short-circuit when `transition == USER_FORCED_RESET`.
+  Reset is the stronger of the two exhaustive-triggering gestures
+  (DISCARDS state vs. state-preserved for escape); when both are
+  active the user's intent is "start clean" and the escape short-circuit
+  MUST be skipped so the configured policy's exhaustive first-pass path
+  fires. See `docs/ITERATION_AWARENESS.md § 8.5` precedence rules.
+- **Always `warning`:** setting `IterationState.reviewed_label_applied`
+  to a value other than `bool(applied_label and not blocked)` at the
+  end of a run, or omitting the assignment entirely. The bit is the
+  sole signal the next run has to distinguish "developer removed the
+  reviewed label deliberately" from "reviewer never stamped it because
+  the run was blocked" — anything else breaks the reset gesture's
+  guard.
 - **Always `info`:** using the term "silence" for a finding IAR
   chose not to submit. The correct term is "dedup" or "silence"
   depending on the reason (dedup = the finding matches a prior

@@ -235,7 +235,7 @@ Each install step:
 
 Iteration-Aware Review (IAR) is a subsystem that wraps the reviewer's main loop with a state layer, a generation-tracking layer, a content-anchored deduplication engine, and four convergence policies. It runs on every review with `convergence-policy: first-pass-exhaustive` as the default. The IAR pipeline is wrapped in `try/except` at every `main()` touchpoint so any IAR-specific failure degrades gracefully to the baseline review path — the reviewer never crashes on IAR bugs. The safety contract is locked by [`tests/test_iar_failure_fallback.py`](../tests/test_iar_failure_fallback.py).
 
-**Read/write flow per review run (when enabled):**
+**Read/write flow per review run:**
 
 ```
 main()
