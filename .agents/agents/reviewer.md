@@ -98,6 +98,19 @@ Run through this in order:
 - `action.yml` parses (`python3 -c "import yaml; yaml.safe_load(open('action.yml'))"`).
 - The `self-review.yml` workflow ran successfully on the PR.
 
+### 11. Iteration-Aware Review (IAR) contract (v1.6.0+)
+
+The IAR subsystem is off by default (`iteration-awareness-enabled: false`); any code touching it must preserve the byte-identical baseline path when the master switch is off. Specific checks for PRs that touch IAR code paths:
+
+- `IARConfig` is `@dataclass(frozen=True)`; construction ALWAYS goes through `build_iar_config(dict(os.environ))` — never `IARConfig(...)` directly (that would bypass validation and clamping).
+- Unknown `convergence-policy` values MUST fall back to `iterative` (not crash) — see `IAR_VALID_POLICIES` whitelist.
+- The critical-always-surfaces safety rail in `dedupe_findings_against_prior` is load-bearing — any PR that touches that function must preserve the unconditional `if finding.severity == SEVERITY_CRITICAL: continue` branch. Any accidental change here is a shipping-blocker.
+- `_parse_state_from_marker_body` treats every field as untrusted; new fields must be wrapped in `int()` / `str()` / `list()` and the parser must catch every failure path (never raise).
+- Any new IAR subprocess call joins the existing 5 sites (`git diff`, `git show`, `git rev-parse`) — argv-list form, no `shell=True`, path arg through `safe_repo_path`.
+- Any new prompt splicing MUST use a hardcoded module-scope constant like `IAR_EXHAUSTIVE_PROMPT_ADDENDUM` — never interpolate `iar_config.*` fields into the system prompt.
+- The 5 IAR outputs (`iteration-round`, `iteration-generation`, `iteration-policy-applied`, `iteration-tokens-used`, `iteration-cost-vs-baseline-estimate`) must be defined empty by `write_iar_outputs_empty()` when IAR is off — verified by `test_backward_compat_iar_off.py`.
+- Any new IAR test file should follow the naming convention `test_iar_<component>.py` and add tests to `tests/` for both the IAR-on and IAR-off code paths.
+
 ## Output format
 
 After reviewing, produce a Markdown report with:

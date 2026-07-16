@@ -159,6 +159,16 @@ If you're adding a new self-contained component (a new tool, a new severity-eval
 
 If your test would require mocking the entire Anthropic API surface or the entire GitHub API surface, the test isn't pulling its weight — write a smoke test on a real PR instead.
 
+## Backward-compat regression suites for opt-in features (repo convention)
+
+When you add a feature that ships as **opt-in behind a master switch** (like Iteration-Aware Review's `iteration-awareness-enabled` input), pair it with a dedicated `tests/test_backward_compat_<feature>.py` file that asserts the runtime is **byte-identical** to the pre-feature baseline when the master switch is off. This convention exists because:
+
+- The stdlib-only, single-file runtime relies on strict backward compat — a regression in the master-off path silently affects every existing consumer at the next release.
+- A dedicated file lets a reviewer see, at a glance, exactly which invariants a new opt-in feature protects (env-var parse-when-disabled, output-writing-when-disabled, no new subprocess-when-disabled, etc.).
+- The file becomes the failing test that any future refactor of the feature must first update — a deliberate friction point.
+
+Existing example: [`tests/test_backward_compat_iar_off.py`](../tests/test_backward_compat_iar_off.py) (19 tests, added in the v1.6 IAR release). Copy that structure when adding a new opt-in feature.
+
 ## Releasing
 
 Releases are cut by [`.github/workflows/auto-release.yml`](../.github/workflows/auto-release.yml) on push to `main`. It parses the Conventional-Commits history since the last tag, picks a SemVer bump (`major`/`minor`/`patch`), updates `CHANGELOG.md`, tags, and pushes. Then [`.github/workflows/release.yml`](../.github/workflows/release.yml) moves the major-version alias (`v1`, `v2`) on publish.
