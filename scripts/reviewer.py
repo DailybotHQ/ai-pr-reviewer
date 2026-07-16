@@ -66,8 +66,10 @@ Environment (set by the composite action's `env:` block; see action.yml):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -77,7 +79,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -1847,6 +1849,277 @@ def write_iar_outputs_empty() -> None:
     write_action_output("iteration-policy-applied", "")
     write_action_output("iteration-tokens-used", "")
     write_action_output("iteration-cost-vs-baseline-estimate", "")
+
+
+# ---------------------------------------------------------------------------
+# Iteration-Aware Review (IAR) — state layer
+# ---------------------------------------------------------------------------
+# The IAR runtime persists a small JSON blob inside the existing tracking
+# marker comment (an HTML-comment block delimited by IAR_STATE_TAG_OPEN /
+# IAR_STATE_TAG_CLOSE, nested inside REVIEW_MARKER). Zero external state,
+# zero new files on disk. Every parse/read failure falls back to `None`
+# (treated as "first review, no prior state") with a debug log — the
+# subsystem must never crash the reviewer on a malformed marker.
+#
+# See docs/ITERATION_AWARENESS.md § 13 for the JSON schema (version 1).
+
+
+class IterationStateParseError(Exception):
+    """Raised inside `_parse_state_from_marker_body` when the embedded JSON
+    is malformed or its schema version is unknown. NEVER propagates outside
+    the IAR module — callers catch and fall back to `None`."""
+
+
+@dataclass
+class IterationState:
+    """Persisted IAR state (version 1). Read from the last marker, updated
+    in-memory during the run, and re-embedded into the new marker at the
+    end. See docs/ITERATION_AWARENESS.md § 13 for the schema contract.
+
+    Field notes:
+    - `version`: schema version; matches IAR_STATE_SCHEMA_VERSION.
+    - `generation`: monotonic counter; increments on new commits or rebase.
+    - `generation_range_hash`: SHA256(hex) of the sorted commit-SHA list
+      for this generation. Detecting a change advances the generation.
+    - `round_in_generation`: how many reviews have run in this generation.
+      Resets to 1 on generation change.
+    - `policy_applied`: which policy actually fired on the last review
+      (usually matches configured policy; safety net or escape label can
+      override).
+    - `resolved_fingerprints`: fingerprints reported in prior rounds AND
+      not present in the current round → treated as resolved.
+      `iterative` / `first-pass-exhaustive` re-surface these when they
+      reappear; `critical-gate` silences them unless critical.
+    - `open_fingerprints_this_gen`: fingerprints reported in the current
+      generation and NOT yet reported as resolved. Used by dedup engine.
+    - `history`: append-only per-generation summary rows. Bounded to the
+      last N generations (see IAR_HISTORY_MAX_ENTRIES) so the marker body
+      cannot grow unboundedly.
+    """
+
+    version: int
+    generation: int
+    generation_range_hash: str
+    round_in_generation: int
+    policy_applied: str
+    resolved_fingerprints: list[str]
+    open_fingerprints_this_gen: list[str]
+    history: list[dict[str, Any]]
+
+
+# Cap on `history` list length. 20 generations is plenty for the lifetime
+# of a single PR while keeping the marker body under ~10KB even in
+# pathological cases. See docs/ITERATION_AWARENESS.md § 13.
+IAR_HISTORY_MAX_ENTRIES: int = 20
+
+
+def new_iteration_state(
+    *,
+    generation: int = 1,
+    generation_range_hash: str = "",
+    round_in_generation: int = 1,
+    policy_applied: str = IAR_POLICY_ITERATIVE,
+) -> IterationState:
+    """Construct a fresh IterationState with schema version + empty lists.
+    Used on first review of a PR (no prior marker found)."""
+    return IterationState(
+        version=IAR_STATE_SCHEMA_VERSION,
+        generation=generation,
+        generation_range_hash=generation_range_hash,
+        round_in_generation=round_in_generation,
+        policy_applied=policy_applied,
+        resolved_fingerprints=[],
+        open_fingerprints_this_gen=[],
+        history=[],
+    )
+
+
+def _parse_state_from_marker_body(
+    marker_body: str,
+) -> IterationState | None:
+    """Extract + parse the IAR state block from a marker body string.
+
+    Returns:
+    - `IterationState` on success.
+    - `None` on any failure (no block, malformed JSON, unknown version,
+      shape mismatch). Failure is logged via `log()` with an `IAR:` prefix
+      so miswiring is visible in the workflow log.
+    """
+    if not marker_body or IAR_STATE_TAG_OPEN not in marker_body:
+        return None
+    pattern: re.Pattern[str] = re.compile(
+        re.escape(IAR_STATE_TAG_OPEN)
+        + r"(.*?)"
+        + re.escape(IAR_STATE_TAG_CLOSE),
+        re.DOTALL,
+    )
+    matches: list[str] = pattern.findall(marker_body)
+    if not matches:
+        return None
+    raw_block: str = matches[-1].strip()
+    try:
+        data: Any = json.loads(raw_block)
+        if not isinstance(data, dict):
+            raise IterationStateParseError(
+                f"expected JSON object at root, got {type(data).__name__}"
+            )
+        version: Any = data.get("version")
+        if version != IAR_STATE_SCHEMA_VERSION:
+            raise IterationStateParseError(
+                f"unknown schema version {version!r} "
+                f"(runtime supports {IAR_STATE_SCHEMA_VERSION})"
+            )
+        return IterationState(
+            version=int(version),
+            generation=int(data.get("generation", 1)),
+            generation_range_hash=str(data.get("generation_range_hash", "")),
+            round_in_generation=int(data.get("round_in_generation", 1)),
+            policy_applied=str(
+                data.get("policy_applied", IAR_POLICY_ITERATIVE)
+            ),
+            resolved_fingerprints=list(
+                data.get("resolved_fingerprints", []) or []
+            ),
+            open_fingerprints_this_gen=list(
+                data.get("open_fingerprints_this_gen", []) or []
+            ),
+            history=list(data.get("history", []) or []),
+        )
+    except IterationStateParseError as exc:
+        log(f"IAR: state parse failed: {exc}; treating as first review.")
+        return None
+    except (json.JSONDecodeError, ValueError, TypeError) as exc:
+        log(
+            f"IAR: state parse failed with {type(exc).__name__}: {exc}; "
+            "treating as first review."
+        )
+        return None
+
+
+def _fetch_latest_marker_body(
+    *, repo: str, pr_number: int, token: str
+) -> str | None:
+    """Fetch the most recent non-minimized tracking-marker issue comment
+    on the given PR and return its body. Returns `None` if no marker is
+    found or on any API failure.
+
+    Uses GraphQL because REST issue comments do not expose `isMinimized`,
+    and `collapse-previous` uses `minimizeComment` which toggles that
+    flag rather than mutating the body — reading a minimized marker
+    would surface stale state.
+    """
+    if not repo or "/" not in repo or pr_number <= 0:
+        return None
+    owner: str
+    name: str
+    owner, name = repo.split("/", 1)
+    query: str = (
+        "query($owner: String!, $name: String!, $pr: Int!) {\n"
+        "  repository(owner: $owner, name: $name) {\n"
+        "    pullRequest(number: $pr) {\n"
+        "      comments(last: 100) {\n"
+        "        nodes {\n"
+        "          body\n"
+        "          isMinimized\n"
+        "          createdAt\n"
+        "        }\n"
+        "      }\n"
+        "    }\n"
+        "  }\n"
+        "}"
+    )
+    try:
+        data: Any = gh_graphql(
+            query,
+            {"owner": owner, "name": name, "pr": pr_number},
+            token=token,
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort GH API call
+        log(f"IAR: _fetch_latest_marker_body GraphQL failed: {exc!r}.")
+        return None
+    try:
+        nodes: list[dict[str, Any]] = (
+            data.get("repository", {})
+            .get("pullRequest", {})
+            .get("comments", {})
+            .get("nodes", [])
+            or []
+        )
+    except AttributeError:
+        return None
+    candidates: list[dict[str, Any]] = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        body: str = str(node.get("body") or "")
+        if REVIEW_MARKER not in body:
+            continue
+        if node.get("isMinimized") is True:
+            continue
+        candidates.append(node)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda n: str(n.get("createdAt") or ""))
+    return str(candidates[-1].get("body") or "")
+
+
+def read_prior_iteration_state(
+    *, repo: str, pr_number: int, token: str
+) -> IterationState | None:
+    """Public entry point: fetch the last non-minimized marker on the PR
+    and extract the embedded IAR state. Returns `None` on any failure —
+    treated by callers as "first review of this PR".
+    """
+    marker_body: str | None = _fetch_latest_marker_body(
+        repo=repo, pr_number=pr_number, token=token
+    )
+    if marker_body is None:
+        log("IAR: no prior marker found; treating as first review.")
+        return None
+    return _parse_state_from_marker_body(marker_body)
+
+
+def embed_iteration_state(
+    marker_body: str, state: IterationState
+) -> str:
+    """Inject or replace the IAR state HTML-comment block in a marker
+    body string. Deterministic: same inputs produce byte-identical output
+    (JSON is dumped with `sort_keys=True`).
+
+    Truncates `state.history` to the last IAR_HISTORY_MAX_ENTRIES entries
+    at embed time so the marker body cannot grow unboundedly across many
+    generations.
+    """
+    bounded_history: list[dict[str, Any]] = (
+        state.history[-IAR_HISTORY_MAX_ENTRIES:]
+        if len(state.history) > IAR_HISTORY_MAX_ENTRIES
+        else state.history
+    )
+    bounded_state: IterationState = IterationState(
+        version=state.version,
+        generation=state.generation,
+        generation_range_hash=state.generation_range_hash,
+        round_in_generation=state.round_in_generation,
+        policy_applied=state.policy_applied,
+        resolved_fingerprints=list(state.resolved_fingerprints),
+        open_fingerprints_this_gen=list(state.open_fingerprints_this_gen),
+        history=bounded_history,
+    )
+    state_json: str = json.dumps(
+        asdict(bounded_state), indent=2, sort_keys=True
+    )
+    block: str = (
+        f"\n\n{IAR_STATE_TAG_OPEN}\n{state_json}\n{IAR_STATE_TAG_CLOSE}\n"
+    )
+    pattern: re.Pattern[str] = re.compile(
+        re.escape(IAR_STATE_TAG_OPEN)
+        + r".*?"
+        + re.escape(IAR_STATE_TAG_CLOSE)
+        + r"\n?",
+        re.DOTALL,
+    )
+    stripped_body: str = pattern.sub("", marker_body).rstrip()
+    return stripped_body + block
 
 
 # ---------------------------------------------------------------------------

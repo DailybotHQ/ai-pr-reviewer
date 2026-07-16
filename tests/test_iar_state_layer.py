@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+"""Unit tests for the Iteration-Aware Review (IAR) state layer —
+`IterationState` dataclass, `read_prior_iteration_state`,
+`_fetch_latest_marker_body`, `_parse_state_from_marker_body`, and
+`embed_iteration_state`.
+
+Every function under test lives in `scripts/reviewer.py` and is opt-in
+via the master switch — but the state-layer helpers themselves must be
+robust to malformed markers even when IAR is disabled (defensive
+programming: they might be called from a code path that reads a marker
+authored by an IAR-enabled run for other reasons).
+
+Stdlib `unittest` only.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+import unittest
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any
+from unittest.mock import patch
+
+_ROOT: Path = Path(__file__).resolve().parent.parent
+_SPEC = importlib.util.spec_from_file_location(
+    "reviewer", _ROOT / "scripts" / "reviewer.py"
+)
+assert _SPEC is not None and _SPEC.loader is not None
+reviewer = importlib.util.module_from_spec(_SPEC)
+sys.modules["reviewer"] = reviewer
+_SPEC.loader.exec_module(reviewer)
+
+
+def _make_state(**overrides: Any) -> "reviewer.IterationState":
+    """Build an IterationState with plausible defaults; override any
+    field for test scenarios."""
+    base: dict[str, Any] = {
+        "version": reviewer.IAR_STATE_SCHEMA_VERSION,
+        "generation": 2,
+        "generation_range_hash": "abc123def456",
+        "round_in_generation": 3,
+        "policy_applied": reviewer.IAR_POLICY_ITERATIVE,
+        "resolved_fingerprints": ["fp-resolved-1", "fp-resolved-2"],
+        "open_fingerprints_this_gen": ["fp-open-3"],
+        "history": [
+            {
+                "gen": 1,
+                "range_hash": "prev-hash-xyz",
+                "rounds_ran": 3,
+                "converged": True,
+                "tokens_used": 5000,
+                "wall_clock_ms": 45000,
+            }
+        ],
+    }
+    base.update(overrides)
+    return reviewer.IterationState(**base)
+
+
+class IterationStateRoundTripTests(unittest.TestCase):
+    """embed → parse → deep-equal invariant, across a matrix of shapes."""
+
+    def test_roundtrip_preserves_all_fields(self) -> None:
+        state: reviewer.IterationState = _make_state()
+        body: str = "### Tracking marker\n\nBody text.\n"
+        new_body: str = reviewer.embed_iteration_state(body, state)
+        parsed: reviewer.IterationState | None = (
+            reviewer._parse_state_from_marker_body(new_body)
+        )
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed, state)
+
+    def test_roundtrip_with_empty_fingerprint_lists(self) -> None:
+        state: reviewer.IterationState = _make_state(
+            resolved_fingerprints=[],
+            open_fingerprints_this_gen=[],
+            history=[],
+        )
+        body: str = reviewer.REVIEW_MARKER + "\n\n" + "some text"
+        new_body: str = reviewer.embed_iteration_state(body, state)
+        parsed: reviewer.IterationState | None = (
+            reviewer._parse_state_from_marker_body(new_body)
+        )
+        self.assertEqual(parsed, state)
+
+    def test_roundtrip_with_unicode_hash(self) -> None:
+        """Fingerprints are ASCII SHA hashes today, but the parser must
+        survive arbitrary strings in case a future scheme lands."""
+        state: reviewer.IterationState = _make_state(
+            resolved_fingerprints=["ünïcödé-fingerprint", "abc123"],
+            generation_range_hash="こんにちは",
+        )
+        new_body: str = reviewer.embed_iteration_state("marker", state)
+        parsed: reviewer.IterationState | None = (
+            reviewer._parse_state_from_marker_body(new_body)
+        )
+        self.assertEqual(parsed, state)
+
+    def test_embed_is_deterministic(self) -> None:
+        """Same inputs → byte-identical output. Important because a
+        non-deterministic embed makes debugging state drift very hard."""
+        state: reviewer.IterationState = _make_state()
+        body: str = "body"
+        a: str = reviewer.embed_iteration_state(body, state)
+        b: str = reviewer.embed_iteration_state(body, state)
+        self.assertEqual(a, b)
+
+    def test_embed_replaces_existing_block(self) -> None:
+        """Two consecutive embeds MUST produce a body with exactly one
+        state block, not two stacked."""
+        state_a: reviewer.IterationState = _make_state(generation=1)
+        state_b: reviewer.IterationState = _make_state(generation=5)
+        body: str = "marker"
+        step_1: str = reviewer.embed_iteration_state(body, state_a)
+        step_2: str = reviewer.embed_iteration_state(step_1, state_b)
+        self.assertEqual(step_2.count(reviewer.IAR_STATE_TAG_OPEN), 1)
+        parsed: reviewer.IterationState | None = (
+            reviewer._parse_state_from_marker_body(step_2)
+        )
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.generation, 5)
+
+    def test_embed_bounds_history_to_max_entries(self) -> None:
+        """History is capped so a long-lived PR does not grow the marker
+        body unboundedly."""
+        oversized: list[dict[str, Any]] = [
+            {"gen": i, "range_hash": f"h{i}", "rounds_ran": 1,
+             "converged": True, "tokens_used": 100, "wall_clock_ms": 1000}
+            for i in range(50)
+        ]
+        state: reviewer.IterationState = _make_state(history=oversized)
+        embedded: str = reviewer.embed_iteration_state("marker", state)
+        parsed: reviewer.IterationState | None = (
+            reviewer._parse_state_from_marker_body(embedded)
+        )
+        self.assertIsNotNone(parsed)
+        self.assertEqual(
+            len(parsed.history), reviewer.IAR_HISTORY_MAX_ENTRIES
+        )
+        # It's the LAST N (most recent) that survive.
+        self.assertEqual(parsed.history[-1]["gen"], 49)
+
+
+class ParseFailureTests(unittest.TestCase):
+    """Every failure mode falls back to `None` — never raises."""
+
+    def test_missing_state_block_returns_none(self) -> None:
+        """First-review case: marker exists but has no embedded state."""
+        body: str = f"{reviewer.REVIEW_MARKER}\n\nSome body without state."
+        self.assertIsNone(
+            reviewer._parse_state_from_marker_body(body)
+        )
+
+    def test_empty_body_returns_none(self) -> None:
+        self.assertIsNone(reviewer._parse_state_from_marker_body(""))
+
+    def test_malformed_json_returns_none(self) -> None:
+        body: str = (
+            f"{reviewer.IAR_STATE_TAG_OPEN}\n"
+            "{not valid json {{{\n"
+            f"{reviewer.IAR_STATE_TAG_CLOSE}"
+        )
+        self.assertIsNone(reviewer._parse_state_from_marker_body(body))
+
+    def test_unknown_version_returns_none(self) -> None:
+        """Schema version > current runtime → fallback to None (safest;
+        avoids interpreting a shape we don't understand)."""
+        body: str = (
+            f"{reviewer.IAR_STATE_TAG_OPEN}\n"
+            + json.dumps({"version": 99, "generation": 1})
+            + f"\n{reviewer.IAR_STATE_TAG_CLOSE}"
+        )
+        self.assertIsNone(reviewer._parse_state_from_marker_body(body))
+
+    def test_missing_version_returns_none(self) -> None:
+        body: str = (
+            f"{reviewer.IAR_STATE_TAG_OPEN}\n"
+            + json.dumps({"generation": 1})
+            + f"\n{reviewer.IAR_STATE_TAG_CLOSE}"
+        )
+        self.assertIsNone(reviewer._parse_state_from_marker_body(body))
+
+    def test_root_is_not_object_returns_none(self) -> None:
+        body: str = (
+            f"{reviewer.IAR_STATE_TAG_OPEN}\n"
+            "[1, 2, 3]\n"
+            f"{reviewer.IAR_STATE_TAG_CLOSE}"
+        )
+        self.assertIsNone(reviewer._parse_state_from_marker_body(body))
+
+    def test_wrong_type_for_int_field_returns_none(self) -> None:
+        body: str = (
+            f"{reviewer.IAR_STATE_TAG_OPEN}\n"
+            + json.dumps({
+                "version": 1,
+                "generation": "not-an-int",
+                "generation_range_hash": "x",
+                "round_in_generation": 1,
+                "policy_applied": "iterative",
+                "resolved_fingerprints": [],
+                "open_fingerprints_this_gen": [],
+                "history": [],
+            })
+            + f"\n{reviewer.IAR_STATE_TAG_CLOSE}"
+        )
+        self.assertIsNone(reviewer._parse_state_from_marker_body(body))
+
+
+class MultipleBlocksTests(unittest.TestCase):
+    """Defensive: if a marker somehow contains multiple state blocks,
+    the LAST one wins. Callers only ever produce one block, so this is
+    strictly a safety rail against future bugs."""
+
+    def test_multiple_blocks_takes_last(self) -> None:
+        state_a: reviewer.IterationState = _make_state(generation=1)
+        state_b: reviewer.IterationState = _make_state(generation=7)
+        embedded_a: str = reviewer.embed_iteration_state("m", state_a)
+        # Manually append a second block (embed() would normally replace).
+        state_b_json: str = json.dumps(
+            asdict(state_b), indent=2, sort_keys=True
+        )
+        embedded_ab: str = (
+            embedded_a + f"\n\n{reviewer.IAR_STATE_TAG_OPEN}\n"
+            + state_b_json
+            + f"\n{reviewer.IAR_STATE_TAG_CLOSE}\n"
+        )
+        parsed: reviewer.IterationState | None = (
+            reviewer._parse_state_from_marker_body(embedded_ab)
+        )
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.generation, 7)
+
+
+class FetchLatestMarkerTests(unittest.TestCase):
+    """`_fetch_latest_marker_body` reads via GraphQL, must skip
+    minimized comments, non-marker comments, and pick the most recent
+    by createdAt."""
+
+    def _gql_return(
+        self, comments: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        return {
+            "repository": {
+                "pullRequest": {
+                    "comments": {"nodes": comments}
+                }
+            }
+        }
+
+    def test_skips_minimized_comments(self) -> None:
+        newer_minimized: dict[str, Any] = {
+            "body": reviewer.REVIEW_MARKER + " STALE",
+            "isMinimized": True,
+            "createdAt": "2026-07-15T20:00:00Z",
+        }
+        older_live: dict[str, Any] = {
+            "body": reviewer.REVIEW_MARKER + " LIVE",
+            "isMinimized": False,
+            "createdAt": "2026-07-15T10:00:00Z",
+        }
+        with patch.object(
+            reviewer, "gh_graphql",
+            return_value=self._gql_return([newer_minimized, older_live]),
+        ):
+            got: str | None = reviewer._fetch_latest_marker_body(
+                repo="acme/x", pr_number=1, token="tok"
+            )
+        self.assertIsNotNone(got)
+        self.assertIn("LIVE", got)
+
+    def test_takes_most_recent_by_created_at(self) -> None:
+        older: dict[str, Any] = {
+            "body": reviewer.REVIEW_MARKER + " OLD",
+            "isMinimized": False,
+            "createdAt": "2026-07-15T10:00:00Z",
+        }
+        newer: dict[str, Any] = {
+            "body": reviewer.REVIEW_MARKER + " NEW",
+            "isMinimized": False,
+            "createdAt": "2026-07-15T20:00:00Z",
+        }
+        with patch.object(
+            reviewer, "gh_graphql",
+            return_value=self._gql_return([older, newer]),
+        ):
+            got: str | None = reviewer._fetch_latest_marker_body(
+                repo="acme/x", pr_number=1, token="tok"
+            )
+        self.assertIsNotNone(got)
+        self.assertIn("NEW", got)
+
+    def test_skips_comments_without_marker(self) -> None:
+        with patch.object(
+            reviewer, "gh_graphql",
+            return_value=self._gql_return([
+                {
+                    "body": "just some other bot comment",
+                    "isMinimized": False,
+                    "createdAt": "2026-07-15T20:00:00Z",
+                }
+            ]),
+        ):
+            self.assertIsNone(
+                reviewer._fetch_latest_marker_body(
+                    repo="acme/x", pr_number=1, token="tok"
+                )
+            )
+
+    def test_graphql_failure_returns_none(self) -> None:
+        def _boom(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("simulated 5xx")
+
+        with patch.object(reviewer, "gh_graphql", side_effect=_boom):
+            self.assertIsNone(
+                reviewer._fetch_latest_marker_body(
+                    repo="acme/x", pr_number=1, token="tok"
+                )
+            )
+
+    def test_empty_repo_input_returns_none(self) -> None:
+        self.assertIsNone(
+            reviewer._fetch_latest_marker_body(
+                repo="", pr_number=1, token="tok"
+            )
+        )
+        self.assertIsNone(
+            reviewer._fetch_latest_marker_body(
+                repo="malformed", pr_number=1, token="tok"
+            )
+        )
+
+    def test_negative_pr_number_returns_none(self) -> None:
+        self.assertIsNone(
+            reviewer._fetch_latest_marker_body(
+                repo="acme/x", pr_number=0, token="tok"
+            )
+        )
+
+
+class ReadPriorIterationStateTests(unittest.TestCase):
+    """End-to-end: read_prior_iteration_state chains
+    _fetch_latest_marker_body + _parse_state_from_marker_body."""
+
+    def test_returns_state_when_marker_and_block_present(self) -> None:
+        state: reviewer.IterationState = _make_state()
+        marker: str = reviewer.embed_iteration_state(
+            reviewer.REVIEW_MARKER + "\n\nWorking on it.", state
+        )
+        with patch.object(
+            reviewer, "_fetch_latest_marker_body", return_value=marker
+        ):
+            got: reviewer.IterationState | None = (
+                reviewer.read_prior_iteration_state(
+                    repo="a/b", pr_number=1, token="t"
+                )
+            )
+        self.assertEqual(got, state)
+
+    def test_returns_none_when_no_marker(self) -> None:
+        with patch.object(
+            reviewer, "_fetch_latest_marker_body", return_value=None
+        ):
+            self.assertIsNone(
+                reviewer.read_prior_iteration_state(
+                    repo="a/b", pr_number=1, token="t"
+                )
+            )
+
+    def test_returns_none_when_marker_has_no_state_block(self) -> None:
+        with patch.object(
+            reviewer, "_fetch_latest_marker_body",
+            return_value=reviewer.REVIEW_MARKER + "\n\nFirst review.",
+        ):
+            self.assertIsNone(
+                reviewer.read_prior_iteration_state(
+                    repo="a/b", pr_number=1, token="t"
+                )
+            )
+
+
+class NewIterationStateHelperTests(unittest.TestCase):
+    """`new_iteration_state` is the constructor for first-round runs."""
+
+    def test_defaults_produce_valid_schema(self) -> None:
+        state: reviewer.IterationState = reviewer.new_iteration_state()
+        self.assertEqual(state.version, reviewer.IAR_STATE_SCHEMA_VERSION)
+        self.assertEqual(state.generation, 1)
+        self.assertEqual(state.round_in_generation, 1)
+        self.assertEqual(state.resolved_fingerprints, [])
+        self.assertEqual(state.open_fingerprints_this_gen, [])
+        self.assertEqual(state.history, [])
+
+    def test_roundtrip_with_default_construction(self) -> None:
+        state: reviewer.IterationState = reviewer.new_iteration_state(
+            generation_range_hash="range-hash-abc"
+        )
+        embedded: str = reviewer.embed_iteration_state("marker", state)
+        parsed: reviewer.IterationState | None = (
+            reviewer._parse_state_from_marker_body(embedded)
+        )
+        self.assertEqual(parsed, state)
+
+
+if __name__ == "__main__":
+    unittest.main()
