@@ -177,13 +177,17 @@ Every generation transition emits a debug log line:
 IAR: generation change detected (new_commits). Prior: gen=1, rounds=3, range_hash=abc123. New: gen=2, range_hash=def456.
 ```
 
-And the marker title shows the transition:
+And the marker shows the iteration status as a short italic footer under the H3 title (the H3 itself keeps the short `AI review for <sha> — <status>` shape — the transition/gen/round detail goes in the annotation line):
 
 ```
-### AI review for def456 — done · Gen 2 round 1 (new commits since Gen 1 · 3 rounds ran on abc123 · converged) · 8 findings (5 new-in-gen, 3 carried-over-open, 2 critical-forced-surface)
+### AI review for def456 — ✅ done
+
+...standard review summary + strictness gate lines...
+
+_Iteration-Aware Review: gen 2, round 1, policy=`first-pass-exhaustive` (new_commits) — 8 surfaced._
 ```
 
-Developers can audit any PR by searching the conversation for `Gen \d+ round \d+`.
+Developers can audit any PR by grepping the tracking marker comments for `gen \d+, round \d+` (lowercase, comma-separated — matching what `_render_iar_marker_annotation` actually emits). The transition name in parentheses distinguishes `(first_review)`, `(new_commits)`, `(rebased)`, `(same_generation)`, `(user_forced_reset)`, and safety-net variants like `(safety_net_new_lines_pct)`.
 
 ---
 
@@ -327,12 +331,16 @@ if finding.severity == "critical":
 
 **Rationale.** A big PR growth is exactly when a subtle bug is most likely to hide. Auto-exhaustive ensures the review pays extra attention when the code has substantially changed.
 
-**Detection.** Uses `git diff --stat` on the range: `added_lines / (added + removed + context) * 100`.
+**Detection.** `compute_new_lines_pct` uses `git diff --numstat` on the three-dot range (`current_base_sha...current_head_sha`) and computes `new_added / (total_added + total_removed) * 100`, where `new_added` counts only lines added between the prior review's head and the current head (`prior_head_sha..current_head_sha`, two-dot on purpose — both are head SHAs on the same branch). Context lines are NOT in the denominator (`--numstat` doesn't emit them; `--stat` would but the code deliberately picks `--numstat` for machine-parseable output).
 
-**Loud + audible.** The marker title reflects the safety net:
+**Loud + audible.** The marker annotation footer reflects the safety net via its transition name — `(safety_net_new_lines_pct)`:
 
 ```
-### AI review for def456 — done · Gen 2 round 1 (SAFETY NET: 45% new lines) · exhaustive first-pass forced · 18 findings (15 new-in-gen, 3 critical-forced-surface)
+### AI review for def456 — ✅ done
+
+...standard review summary + strictness gate lines...
+
+_Iteration-Aware Review: gen 2, round 1, policy=`first-pass-exhaustive` (safety_net_new_lines_pct) — 18 surfaced._
 ```
 
 Debug log entry:
@@ -686,6 +694,14 @@ The tool-call cap enforcement in the agent-runner code path (Claude Code / Curso
 ### 13.2 Fingerprint body slice is a magic constant
 
 `finding.body[:200]` in `finding_fingerprint` (`scripts/reviewer.py`) is inlined as a magic number rather than promoted to a module-level `IAR_FINGERPRINT_BODY_CHARS: int = 200` next to `IAR_CONTEXT_HASH_RADIUS`. The value is stable and documented in this file (§ 5.2), but a single named constant would let tests and docs reference one source of truth. Cosmetic; no behavioral impact.
+
+### 13.3 Per-generation telemetry stays at placeholder values
+
+`state.history[]` entries carry `tokens_used=0` + `wall_clock_ms=0` placeholders that are never populated. On a `NEW_COMMITS` / `REBASED` transition, `advance_generation` closes the prior generation's `history[]` entry and IAR could — but currently does not — backfill telemetry into that closed entry. The previous approach (backfilling with the CURRENT run's telemetry at post-LLM time) was incorrect because the current run is round 1 of the NEW generation, so its tokens / wall-clock belong to the new gen, not the closed one. Attributing them backward misreports per-generation cost history and poisons the cost-vs-baseline estimate once token accounting lands.
+
+**Scope:** currently only `wall_clock_ms` shows the mis-attribution symptom because `tokens_used` is always 0 (the metadata capture from provider responses isn't wired into `RunTelemetry` yet). The current-run telemetry does surface correctly via `write_iar_outputs_populated` (`iteration-tokens-used`, `iteration-cost-vs-baseline-estimate`) — the gap is per-generation attribution inside the marker's `history[]`, not per-run reporting.
+
+**Follow-up:** accumulate telemetry across a generation's rounds (add a `tokens_used_this_gen` + `wall_clock_ms_this_gen` accumulator to `IterationState`, increment on every post-LLM step, and only fold the accumulators into `history[-1]` when `advance_generation` closes the entry). Non-blocking for the shipped runtime; matters most when token accounting lands.
 
 ---
 

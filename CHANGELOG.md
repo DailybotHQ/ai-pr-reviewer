@@ -144,7 +144,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test_iar_state_layer.py`, `test_iar_generation_tracking.py`,
   `test_iar_dedup.py`, `test_iar_policies.py`, `test_iar_dispatch.py`,
   and `test_iar_observability.py` cover the pure IAR helpers. Total
-  suite: **455 tests** (all passing).
+  suite: **456 tests** (all passing).
 
 ### Fixed
 - **IAR × `collapse-previous` ordering bug.** Before this fix, on the
@@ -269,6 +269,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (§ 13.2). Value is stable and documented; a follow-up will promote
   it to `IAR_FINGERPRINT_BODY_CHARS` next to the other IAR module
   constants. Cosmetic; no behavioral impact.
+
+### Fixed (round-4 self-review sweep)
+
+Final polish pass driven by the self-review of the doc-sweep commit
+— five doc/comment stragglers + one real runtime attribution bug:
+
+- **`run_iar_post_llm` was backfilling the closed prior generation's
+  `history[-1]` entry with the CURRENT run's telemetry** on
+  `NEW_COMMITS` / `REBASED` transitions. But the current run is round
+  1 of the NEW generation, so its `tokens_used` + `wall_clock_ms`
+  belong to the new gen — attributing them backward misreported
+  per-generation cost history and (once token accounting lands)
+  would poison the cost-vs-baseline estimate. Fixed by removing the
+  backfill; the closed entry retains its `(0, 0)` placeholders.
+  Proper per-generation accumulation is documented as follow-up in
+  `docs/ITERATION_AWARENESS.md § 13.3`. Regression locked by
+  `test_iar_observability.py::test_new_commits_does_not_backfill_current_run_telemetry_into_prior_gen`.
+- **`docs/ITERATION_AWARENESS.md § 4.5` marker-title example was
+  aspirational** — described an H3 like `Gen 2 round 1 (new commits
+  since …)` that the runtime never emits. `render_tracking_body_done`
+  ships a short `### AI review for <sha> — <status>` and IAR appends
+  a quiet italic footer via `_render_iar_marker_annotation`
+  (`gen 2, round 1, policy=... (transition)`). Rewrote the example
+  to match the shipping output and updated the audit grep pattern
+  from `Gen \d+ round \d+` → `gen \d+, round \d+`.
+- **`docs/ITERATION_AWARENESS.md § 7.2` safety-net formula was wrong.**
+  Said `git diff --stat` + `(added + removed + context)` denominator;
+  the runtime is `git diff --numstat` + `(added + removed)` on the
+  three-dot range (numstat doesn't emit context lines). Rewrote the
+  paragraph to match the code, including the two-vs-three-dot
+  reasoning for the `new_added` numerator vs `total` denominator.
+- **`compute_new_lines_pct` docstring said two-dot** for the `total`
+  diff even though the implementation now correctly uses three-dot.
+  Docstring updated to match, with an explicit two-dot-on-purpose
+  note for the `new_added` numerator (both head SHAs → no merge-base
+  semantics apply).
+- **`.github/workflows/self-review.yml` comment claimed
+  `max-review-rounds: 5` dogfooded the `round-capped` composition**
+  path, but under `convergence-policy: first-pass-exhaustive` (this
+  workflow's shipped-default policy), the runtime does not invoke
+  `apply_round_capped_policy` at all — `max-review-rounds` is a
+  no-op. Reset the input to the shipped default `0` and rewrote the
+  surrounding comment to note that a future matrix leg pinned to
+  `round-capped` would be where the value becomes meaningful.
+- **`.github/workflows/self-review.yml` USER_FORCED_RESET smoke-test
+  procedure omitted the four-condition guard.** Explicitly enumerated
+  all four checks the runtime performs (`applied-label` configured,
+  label absent, prior state exists, `prior_state.reviewed_label_applied
+  == True`) and documented the NO-OP CASES (blocked prior run,
+  first-ever review of the PR) so a developer running the smoke test
+  on a blocked PR does not misdiagnose the silent no-op as a
+  regression.
 
 ### Fixed (doc-sweep after three-dot landing)
 

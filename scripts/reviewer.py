@@ -3055,9 +3055,13 @@ def compute_new_lines_pct(
     current generation vs the prior one.
 
     Formula: `new_added / max(total_current, 1) * 100`, where
-    `total_current = added + removed` across all files in the diff
-    `current_base..current_head`, and `new_added` counts only lines
-    added since `prior_head..current_head` (net new).
+    `total_current = added + removed` across all files in the
+    three-dot diff `current_base_sha...current_head_sha` (matching
+    the PR-visible diff pinned to the merge base — see
+    docs/ITERATION_AWARENESS.md § 4.3 for why three-dot), and
+    `new_added` counts only lines added since `prior_head..current_head`
+    (net new — this one is two-dot on purpose because both SHAs are
+    head SHAs on the same branch, no merge-base semantics apply).
 
     Best-effort: returns `0.0` on any git subprocess failure so the
     safety net defaults to "no override" rather than crashing the run.
@@ -3800,16 +3804,25 @@ def run_iar_post_llm(
         base_sha=state_before_fp_update.base_sha,
         head_sha=state_before_fp_update.head_sha,
     )
-    # Backfill telemetry into the last closed-generation history entry,
-    # which `advance_generation` created for the PRIOR generation with
-    # tokens_used=0 + wall_clock_ms=0 placeholders.
-    if (
-        pre_context.transition
-        in (GenerationTransition.NEW_COMMITS, GenerationTransition.REBASED)
-        and state_final.history
-    ):
-        state_final.history[-1]["tokens_used"] = telemetry.tokens_used
-        state_final.history[-1]["wall_clock_ms"] = telemetry.wall_clock_ms()
+    # NOTE on generation-history telemetry attribution: the closed
+    # prior-generation entry in `state_final.history[-1]` (created by
+    # `advance_generation` on NEW_COMMITS/REBASED transitions) holds
+    # `tokens_used=0` + `wall_clock_ms=0` placeholders. We do NOT
+    # backfill those placeholders from THIS run's telemetry, because
+    # this run is round 1 of the NEW generation — attributing its
+    # tokens/wall-clock to the closed prior generation misreports
+    # per-generation cost history and poisons the cost-vs-baseline
+    # estimate once token accounting lands (`tokens_used` is 0 today
+    # so the harm is currently limited to `wall_clock_ms`, but the
+    # semantics need to be right before that changes).
+    #
+    # The current run's telemetry surfaces as-is via `write_iar_outputs_populated`
+    # (`iteration-tokens-used`, `iteration-cost-vs-baseline-estimate`,
+    # observability marker annotation). Attributing per-round telemetry
+    # to individual `history[]` entries would require accumulating
+    # across a generation's rounds and only close the entry when the
+    # generation itself closes — a bigger refactor tracked as a
+    # follow-up (docs § 13.3 to be added).
     log(
         f"IAR post-LLM: policy={policy_result.policy_applied}, "
         f"surfaced={len(policy_result.findings_to_surface)}, "

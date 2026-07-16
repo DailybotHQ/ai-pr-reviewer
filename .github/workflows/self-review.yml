@@ -240,37 +240,61 @@ jobs:
           # Iteration-Aware Review — dogfood (Rule #10 pillar A).
           # Every value below matches the shipped default and could be
           # omitted entirely — kept explicit as living documentation of
-          # the profile self-review exercises. The one exception is
-          # `max-review-rounds: 5` which differs from the shipped `0`
-          # (unlimited) on purpose: self-review verifies that the
-          # `round-capped` code path composes correctly with
-          # `first-pass-exhaustive`. Every self-review job exercises
-          # the full pre-LLM + post-LLM IAR path in production; the
-          # failure-fallback safety contract is locked separately by
+          # the profile self-review exercises. Every self-review job
+          # exercises the full pre-LLM + post-LLM IAR path in production;
+          # the failure-fallback safety contract is locked separately by
           # tests/test_iar_failure_fallback.py.
           #
+          # NOTE on `max-review-rounds`: kept at the shipped default (0 =
+          # unlimited) because under `convergence-policy: first-pass-exhaustive`
+          # (the shipped default this workflow dogfoods) the runtime does NOT
+          # invoke `apply_round_capped_policy`, so `max-review-rounds` is a
+          # no-op here. If a future revision of this workflow adds a matrix
+          # leg pinned to `convergence-policy: round-capped`, THAT leg is
+          # where `max-review-rounds: 5` becomes meaningful.
+          #
           # Manual USER_FORCED_RESET smoke test (docs/ITERATION_AWARENESS.md § 8.5):
-          # this workflow also dogfoods the reset gesture. To verify it end-to-end
-          # on any PR that has already been self-reviewed at least once:
-          #   1. Remove the provider's `self-reviewed:<provider>` label (the
-          #      `applied-label` value below, per matrix leg — e.g.
-          #      `self-reviewed:anthropic`). Removing this label does NOT trigger
-          #      the workflow on its own; it just changes the PR's label state.
-          #   2. Remove the `ready` label. Same — no workflow trigger fires.
-          #   3. Re-add `ready`. The workflow fires (`types: [labeled]`); IAR sees
-          #      the reviewed label is missing while prior state still exists in
-          #      the marker → transition = USER_FORCED_RESET, prior state
-          #      discarded, round 1 exhaustive on a clean slate.
+          # this workflow also dogfoods the reset gesture. To verify it
+          # end-to-end on any PR that has ALREADY been self-reviewed at
+          # least ONCE SUCCESSFULLY (i.e. the previous run's strictness
+          # gate did not block, so the reviewer actually stamped the
+          # `self-reviewed:<provider>` label AND the outgoing IAR state
+          # recorded `reviewed_label_applied=True`):
+          #   1. Remove the provider's `self-reviewed:<provider>` label
+          #      (the `applied-label` value below, per matrix leg — e.g.
+          #      `self-reviewed:anthropic`). Removing this label does
+          #      NOT trigger the workflow on its own; it just changes
+          #      the PR's label state.
+          #   2. Remove the `ready` label. Same — no workflow trigger.
+          #   3. Re-add `ready`. The workflow fires (`types: [labeled]`);
+          #      IAR checks all four USER_FORCED_RESET conditions:
+          #        (a) `applied-label` configured (yes: `self-reviewed:*`),
+          #        (b) that label absent from PR now (yes: step 1),
+          #        (c) `prior_state is not None` (yes: marker chain has
+          #            state from the earlier successful run),
+          #        (d) `prior_state.reviewed_label_applied == True` (yes:
+          #            recorded by the earlier successful run's marker).
+          #      All four true → transition = USER_FORCED_RESET, prior
+          #      state discarded, round 1 exhaustive on a clean slate.
           # Verification signals to look for on the completed review comment:
           #   - Marker annotation reads `(user_forced_reset)` (not `(new_commits)`).
           #   - `iteration-generation` output = 1; `iteration-round` output = 1.
           #   - No prior findings are silenced as dedup — the dedup memory is gone.
-          # Scope: each provider maintains its own marker + IAR state, so the reset
-          # is scoped to whichever `self-reviewed:*` label you removed. Removing
-          # all four resets every provider's timeline independently.
+          # NO-OP CASES (the reset silently does not fire — this is by design):
+          #   - If the previous run was blocked (critical finding under
+          #     `block-on-critical`), condition (d) fails because the
+          #     reviewer didn't stamp the label, so `reviewed_label_applied`
+          #     stayed `False`. The re-trigger looks like a normal
+          #     `(new_commits)` / `(same_generation)` run, not a reset.
+          #   - If no prior IAR state exists (first-ever review of the PR),
+          #     condition (c) fails.
+          # Scope: each provider maintains its own marker + IAR state, so
+          # the reset is scoped to whichever `self-reviewed:*` label you
+          # removed. Removing all four resets every provider's timeline
+          # independently.
           convergence-policy: first-pass-exhaustive        # shipped default
           exhaustive-first-pass-cap-multiplier: 3          # shipped default
-          max-review-rounds: 5                             # dogfood-only override (default is 0/unlimited)
+          max-review-rounds: 0                             # shipped default (unlimited); no-op under first-pass-exhaustive — see note above
           iteration-escape-label: full-review-please       # shipped default
           # Emergency-bypass label — dogfoods docs/TRIGGER_MODES.md
           # § "Emergency-bypass label". Enabled here so the short-circuit

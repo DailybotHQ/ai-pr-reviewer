@@ -966,6 +966,75 @@ class RunIarPostLlmTests(unittest.TestCase):
         # Prior state preserved EXACTLY — no mutation.
         self.assertIs(state_final, prior_state)
 
+    def test_new_commits_does_not_backfill_current_run_telemetry_into_prior_gen(
+        self,
+    ) -> None:
+        """Regression against docs § 13.3 telemetry-attribution bug: on
+        NEW_COMMITS / REBASED, `advance_generation` closes the prior
+        generation's `history[]` entry with tokens_used=0 + wall_clock_ms=0
+        placeholders. The runtime MUST NOT overwrite those placeholders
+        with THIS run's telemetry — this run is round 1 of the NEW
+        generation and its metrics belong to the new gen, not the
+        closed one. Backfilling misreports per-generation cost history
+        and (once token accounting lands) poisons the cost-vs-baseline
+        estimate."""
+        prior_state: IterationState = new_iteration_state(
+            generation=1, round_in_generation=3,
+            generation_range_hash="oldhash", base_sha="base",
+            head_sha="oldhead",
+        )
+        pre: IARPreLLMContext = IARPreLLMContext(
+            prior_state=prior_state,
+            transition=GenerationTransition.NEW_COMMITS,
+            base_sha="base", head_sha="newhead",
+            range_hash="newhash", new_lines_pct=5.0, pr_labels=[],
+            pre_policy_result=PolicyResult(
+                findings_to_surface=[], findings_silenced=[],
+                effective_max_inline_comments=10, prompt_addendum="",
+                policy_applied=IAR_POLICY_ITERATIVE,
+            ),
+        )
+        result: ReviewResult = ReviewResult(
+            summary="", findings=[_basic_finding("a.py")],
+        )
+        # Fabricate a telemetry object that HAS non-zero wall-clock and
+        # tokens — if the buggy backfill fires, this would attribute
+        # those values to gen 1 in history[-1].
+        telemetry: RunTelemetry = RunTelemetry()
+        telemetry.tokens_used = 12345
+        # RunTelemetry uses monotonic times; the wall_clock_ms() method
+        # returns the delta from _start_time. We just need it to be
+        # observably non-zero when the (removed) backfill line ran.
+        with patch.object(reviewer, "load_code_context", return_value=None):
+            with patch.object(
+                telemetry, "wall_clock_ms", return_value=99999
+            ):
+                state_final, _ = run_iar_post_llm(
+                    iar_config=self._iar_config(),
+                    pre_context=pre, result=result,
+                    base_max_inline_comments=10, telemetry=telemetry,
+                )
+        # New generation's history[-1] was created by advance_generation
+        # with (0, 0) placeholders — those MUST survive this run.
+        self.assertGreaterEqual(len(state_final.history), 1)
+        closed_prior_gen: dict[str, Any] = state_final.history[-1]
+        self.assertEqual(
+            closed_prior_gen["tokens_used"], 0,
+            msg="Prior generation's tokens_used must stay at the "
+                "placeholder — not backfill with the current run's "
+                "telemetry (docs § 13.3).",
+        )
+        self.assertEqual(
+            closed_prior_gen["wall_clock_ms"], 0,
+            msg="Prior generation's wall_clock_ms must stay at the "
+                "placeholder — not backfill with the current run's "
+                "telemetry (docs § 13.3). Regression against F5 from "
+                "the round-4 self-review of PR #39.",
+        )
+        # Sanity: gen advanced correctly.
+        self.assertEqual(state_final.generation, 2)
+        self.assertEqual(state_final.round_in_generation, 1)
+
     def test_findings_mutated_in_place(self) -> None:
         prior_state: IterationState = new_iteration_state(
             generation=1, round_in_generation=1,
