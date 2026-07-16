@@ -2424,15 +2424,20 @@ class GenerationTransition(str, Enum):
     through the marker annotation (e.g. `(user_forced_reset)` after the
     round/policy tags); consumers never see them in action outputs.
 
-    `USER_FORCED_RESET` fires ONLY when ALL FOUR conditions hold:
+    `USER_FORCED_RESET` fires ONLY when ALL FIVE conditions hold:
     (1) the consumer's `applied-label` (the "reviewed" label the
     action stamps on a successful review) is configured; (2) a prior
     IAR state exists in the tracking marker; (3) that prior state's
     `reviewed_label_applied` bit is `True` (recording that the
-    reviewer previously stamped the label successfully — this is
-    the load-bearing guard that prevents a blocked review's natural
-    re-trigger from being misclassified as a deliberate reset); and
-    (4) the label is absent from the PR now. Semantically identical
+    reviewer previously stamped the label successfully — the
+    load-bearing guard that prevents a blocked review's natural
+    re-trigger from being misclassified as a deliberate reset);
+    (4) the PR-labels fetch succeeded (`label_fetch_ok is True` —
+    a transient GitHub 5xx returning an empty list from
+    `_fetch_pr_labels` must NOT be misread as "label absent" or
+    the reset gesture would silently wipe fingerprint memory on
+    every transient outage — round-14 F1); and (5) the label is
+    absent from the returned PR-labels list. Semantically identical
     to `FIRST_REVIEW` downstream (fresh state, no dedup memory,
     round-1 exhaustive under the default policy) — separated out
     only so the log + marker can tell developers that the reset was
@@ -3616,11 +3621,33 @@ def _resolve_base_sha(*, base_ref: str, repo_root: str | None = None) -> str:
 
 def _fetch_pr_labels(
     *, token: str, repo: str, pr_number: int
-) -> list[str]:
-    """Fetch PR labels via REST. Returns empty list on any failure —
-    escape-label detection then degrades to "not applied" (no override)."""
+) -> tuple[list[str], bool]:
+    """Fetch PR labels via REST. Returns `(labels, ok)`:
+      - `(labels, True)` — API call succeeded; `labels` is the
+        authoritative list (possibly empty because the PR has no
+        labels).
+      - `([], False)` — API call failed; `labels` is empty as a
+        conservative default and `ok=False` warns the caller not
+        to distinguish "no labels" from "unknown".
+
+    The `ok` bit is load-bearing for anywhere that would take an
+    IRREVERSIBLE action on the "label absent" branch — most notably
+    USER_FORCED_RESET, which wipes IAR dedup memory + resets the
+    generation counter (round-14 F1). Without the bit, a transient
+    GitHub 5xx during label fetch would look identical to "user
+    deliberately removed the reviewed label" and silently wipe
+    dedup state on the next run — the exact "infinite loop" symptom
+    IAR is designed to prevent.
+
+    Escape-label detection is a REVERSIBLE side-effect (skip dedup
+    for THIS run only) so it can safely treat `ok=False` as "escape
+    label not applied" — the next successful fetch restores the
+    proper behaviour. USER_FORCED_RESET cannot degrade the same
+    way: once state is wiped, the marker no longer records it,
+    and the fingerprint memory is unrecoverable.
+    """
     if "/" not in repo or pr_number <= 0:
-        return []
+        return [], False
     owner: str
     name: str
     owner, name = repo.split("/", 1)
@@ -3628,11 +3655,18 @@ def _fetch_pr_labels(
         pr: Any = gh_request(
             "GET", f"/repos/{owner}/{name}/pulls/{pr_number}", token=token
         )
-    except Exception as exc:  # noqa: BLE001 — best-effort GH API call
+    except Exception as exc:  # noqa: BLE001 — best-effort GH API call:
+        # transient network / rate-limit / 5xx failures are expected;
+        # we return `ok=False` so callers can distinguish "PR has no
+        # labels" from "we don't know if it has labels" — see
+        # docstring for why that distinction is load-bearing.
         log(f"IAR: _fetch_pr_labels failed: {exc!r}. Returning empty list.")
-        return []
+        return [], False
     raw: list[dict[str, Any]] = pr.get("labels", []) or []
-    return [str(lbl.get("name") or "") for lbl in raw if lbl.get("name")]
+    labels: list[str] = [
+        str(lbl.get("name") or "") for lbl in raw if lbl.get("name")
+    ]
+    return labels, True
 
 
 def _load_code_contexts_for_findings(
@@ -3848,24 +3882,30 @@ def run_iar_pre_llm(
     prompt addendum + effective cap the caller will use to shape the
     LLM call.
 
-    User-forced reset: fires when ALL FOUR conditions hold — (a)
+    User-forced reset: fires when ALL FIVE conditions hold — (a)
     `applied_label` (the consumer's "reviewed" label — the one the
     action stamps on a successful review) is configured, (b) prior IAR
     state exists in the tracking marker, (c) the prior state records
     that the reviewer had previously stamped that label
-    (`prior_state.reviewed_label_applied is True`), and (d) that label
-    is absent from the PR now. Downstream that behaves identically to
-    `FIRST_REVIEW`: prior state is discarded, dedup memory is wiped,
-    round-1 exhaustive fires under the default policy. The only reason
-    the transition is a distinct enum value is so the log + marker
-    annotation can tell developers the reset was a deliberate gesture
-    (they removed the reviewed label before re-triggering) rather than
-    a first-ever review of the PR.
+    (`prior_state.reviewed_label_applied is True`), (d) the PR-labels
+    fetch succeeded (`label_fetch_ok is True` — a transient GitHub
+    5xx returning an empty list CANNOT be misread as "label absent"
+    or the reset gesture would falsely fire and wipe fingerprint
+    memory), and (e) that label is absent from the returned list.
+    Downstream this behaves identically to `FIRST_REVIEW`: prior
+    state is discarded, dedup memory is wiped, round-1 exhaustive
+    fires under the default policy. The only reason the transition
+    is a distinct enum value is so the log + marker annotation can
+    tell developers the reset was a deliberate gesture (they removed
+    the reviewed label before re-triggering) rather than a first-ever
+    review of the PR.
 
     Condition (c) is load-bearing: without it, any blocked review
     (`block-on-critical` fired, so the label was never stamped)
     followed by the natural re-trigger would look identical to a
-    deliberate reset and wipe fingerprint memory. See
+    deliberate reset and wipe fingerprint memory. Condition (d)
+    (round-14 F1) is load-bearing for the same reason: transient
+    API failures cannot silently look like a reset gesture. See
     `docs/ITERATION_AWARENESS.md` § 8.5 for the full contract.
 
     Caller SHOULD wrap this in `try/except` — the function does full
@@ -3899,20 +3939,27 @@ def run_iar_pre_llm(
             current_base_sha=base_sha,
             current_head_sha=head_sha,
         )
-    pr_labels: list[str] = _fetch_pr_labels(
+    pr_labels: list[str]
+    label_fetch_ok: bool
+    pr_labels, label_fetch_ok = _fetch_pr_labels(
         token=gh_token, repo=repo, pr_number=pr_number
     )
     # User-forced reset detection — see docstring. Overrides both
     # `transition` and `prior_state` so every downstream code path
     # (dedup, dispatch, advance_generation, safety-net) behaves as if
-    # this were a first review. Fires only when the FOUR conditions in
+    # this were a first review. Fires only when the FIVE conditions in
     # the docstring all hold — the `reviewed_label_applied` guard is
     # the safety net that stops any blocked review's natural re-trigger
-    # from being misclassified as a deliberate reset.
+    # from being misclassified as a deliberate reset. The
+    # `label_fetch_ok` guard (round-14 F1) prevents a transient GitHub
+    # 5xx from silently wiping fingerprint memory — we can only trust
+    # "reviewed label absent" when the API said it's absent, not when
+    # we couldn't ask.
     if (
         applied_label
         and prior_state is not None
         and prior_state.reviewed_label_applied
+        and label_fetch_ok
         and not _labels_contain_ci(
             needle=applied_label, haystack=pr_labels
         )

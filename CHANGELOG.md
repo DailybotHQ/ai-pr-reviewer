@@ -144,7 +144,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test_iar_state_layer.py`, `test_iar_generation_tracking.py`,
   `test_iar_dedup.py`, `test_iar_policies.py`, `test_iar_dispatch.py`,
   and `test_iar_observability.py` cover the pure IAR helpers. Total
-  suite currently: **468 tests** (all passing). Updated across
+  suite currently: **480 tests** (all passing). Updated across
   round-11..round-13 self-review fixes; the running counter is
   intentional — a slowly climbing total signals that every new
   behaviour lands with regression coverage.
@@ -272,6 +272,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (§ 13.2). Value is stable and documented; a follow-up will promote
   it to `IAR_FINGERPRINT_BODY_CHARS` next to the other IAR module
   constants. Cosmetic; no behavioral impact.
+
+### Fixed (round-14 self-review: label-fetch failure guard for USER_FORCED_RESET)
+
+Round-14 self-review **passed** (PR green, label stamped). One warning
+was a real security bug worth calling out on its own:
+
+- **`_fetch_pr_labels` now returns `(labels, ok)`.** Previous shape
+  `list[str]` collapsed two distinct outcomes into the same value:
+  "the API said the PR has no labels" and "the API failed, we don't
+  know". The escape-label check on the `SAME_GENERATION` path
+  could safely coalesce them ("no escape label" is a REVERSIBLE
+  "don't take the escape hatch on THIS run only" decision). But
+  the USER_FORCED_RESET branch is IRREVERSIBLE — it wipes
+  fingerprint memory + resets the generation counter — and the
+  same `[]` was silently being read as "reviewed label absent"
+  every time a GitHub 5xx returned an empty list from the labels
+  fetch. Under the shipped default `block-on-critical` strictness,
+  a transient outage would silently wipe a converged PR's dedup
+  state on the next run — the exact "infinite loop" symptom IAR
+  is designed to prevent, but triggered by API instability
+  instead of convergence pressure.
+- **`run_iar_pre_llm` USER_FORCED_RESET check gated on
+  `label_fetch_ok`** — the fifth condition alongside the round-7
+  `reviewed_label_applied` guard. Both distinguish "we know the
+  developer removed the label" from a superficially-identical
+  false-positive; both are non-blocking (a transient failure
+  simply delays the reset gesture until the next successful fetch).
+- Docstrings for `GenerationTransition.USER_FORCED_RESET`,
+  `run_iar_pre_llm`, and `_fetch_pr_labels` all rewritten to
+  describe the "know vs don't-know" distinction and why the ok
+  bit is load-bearing.
+- `docs/ITERATION_AWARENESS.md` § 4.2, § 8.5, and § 15 (changelog)
+  updated to describe the five-condition guard (was four in
+  round-7) and cross-reference the `label_fetch_ok` bit.
+- 3 new regression tests: `FetchPrLabelsTests.
+  test_pr_with_no_labels_returns_empty_and_ok` (locks the
+  operational-empty case), `test_api_failure_returns_empty_and_not_ok`
+  (locks the failure case). `RunIarPreLlmTests.
+  test_user_forced_reset_no_op_when_label_fetch_failed` (locks
+  the new guard) and `test_user_forced_reset_fires_only_when_
+  fetch_ok_and_label_absent` (contrast test proving `ok` is the
+  ONLY difference between the two branches). All 8 pre-existing
+  `_fetch_pr_labels` patch sites updated from `return_value=[...]`
+  to `return_value=([...], True)`.
+- CHANGELOG stale test count `468` bumped to `480` (round-14 adds
+  3 tests; the running counter continues to climb).
 
 ### Fixed (round-13 self-review: skip-label collision guard + test coverage)
 

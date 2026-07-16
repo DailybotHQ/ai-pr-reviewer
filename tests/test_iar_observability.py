@@ -358,16 +358,25 @@ class ResolveBaseShaTests(unittest.TestCase):
 
 
 class FetchPrLabelsTests(unittest.TestCase):
+    """Round-14 F1: `_fetch_pr_labels` returns `(labels, ok)` — the
+    `ok` bit is load-bearing for the USER_FORCED_RESET guard so a
+    transient API failure cannot silently look like "label absent"
+    and wipe fingerprint memory. Tests below lock both halves of the
+    tuple on every path (happy, invalid-input, API failure)."""
 
-    def test_invalid_repo_returns_empty(self) -> None:
-        self.assertEqual(_fetch_pr_labels(token="t", repo="bad", pr_number=1), [])
-
-    def test_invalid_pr_number_returns_empty(self) -> None:
-        self.assertEqual(
-            _fetch_pr_labels(token="t", repo="a/b", pr_number=0), []
+    def test_invalid_repo_returns_empty_and_not_ok(self) -> None:
+        got: tuple[list[str], bool] = _fetch_pr_labels(
+            token="t", repo="bad", pr_number=1
         )
+        self.assertEqual(got, ([], False))
 
-    def test_happy_path_returns_label_names(self) -> None:
+    def test_invalid_pr_number_returns_empty_and_not_ok(self) -> None:
+        got: tuple[list[str], bool] = _fetch_pr_labels(
+            token="t", repo="a/b", pr_number=0
+        )
+        self.assertEqual(got, ([], False))
+
+    def test_happy_path_returns_label_names_and_ok(self) -> None:
         payload: dict[str, Any] = {
             "labels": [
                 {"name": "bug"},
@@ -377,17 +386,47 @@ class FetchPrLabelsTests(unittest.TestCase):
             ]
         }
         with patch.object(reviewer, "gh_request", return_value=payload):
-            got: list[str] = _fetch_pr_labels(
+            labels, ok = _fetch_pr_labels(
                 token="t", repo="owner/repo", pr_number=42
             )
-        self.assertEqual(got, ["bug", "priority-high"])
+        self.assertEqual(labels, ["bug", "priority-high"])
+        self.assertTrue(ok, msg="Successful REST call must set ok=True.")
 
-    def test_api_failure_returns_empty(self) -> None:
-        with patch.object(reviewer, "gh_request", side_effect=RuntimeError("500")):
-            got: list[str] = _fetch_pr_labels(
+    def test_pr_with_no_labels_returns_empty_and_ok(self) -> None:
+        """Critical distinction from `test_api_failure_returns_empty_and_not_ok`:
+        the API can succeed with an empty label list (a PR without
+        any labels) — that must NOT look like a failure to the
+        USER_FORCED_RESET guard."""
+        with patch.object(reviewer, "gh_request", return_value={"labels": []}):
+            labels, ok = _fetch_pr_labels(
                 token="t", repo="owner/repo", pr_number=42
             )
-        self.assertEqual(got, [])
+        self.assertEqual(labels, [])
+        self.assertTrue(
+            ok,
+            msg="An empty-but-successful label list is the operational "
+                "signal that the PR genuinely has no labels — must be "
+                "distinguishable from ok=False so USER_FORCED_RESET "
+                "can trust the 'label absent' branch.",
+        )
+
+    def test_api_failure_returns_empty_and_not_ok(self) -> None:
+        """Round-14 F1 regression: without the ok bit, a transient
+        GitHub 5xx would look identical to "PR has no labels" and
+        arm a false USER_FORCED_RESET, silently wiping fingerprint
+        memory on the next run. The ok=False signal is what breaks
+        that ambiguity."""
+        with patch.object(reviewer, "gh_request", side_effect=RuntimeError("500")):
+            labels, ok = _fetch_pr_labels(
+                token="t", repo="owner/repo", pr_number=42
+            )
+        self.assertEqual(labels, [])
+        self.assertFalse(
+            ok,
+            msg="API failure MUST NOT return ok=True — otherwise the "
+                "USER_FORCED_RESET guard would silently wipe dedup "
+                "memory on every transient outage.",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -667,7 +706,7 @@ class RunIarPreLlmTests(unittest.TestCase):
         ), patch.object(
             reviewer, "compute_generation_range_hash", return_value="rangehash",
         ), patch.object(
-            reviewer, "_fetch_pr_labels", return_value=[],
+            reviewer, "_fetch_pr_labels", return_value=([], True),
         ):
             ctx: IARPreLLMContext = run_iar_pre_llm(
                 iar_config=self._iar_config(),
@@ -698,7 +737,7 @@ class RunIarPreLlmTests(unittest.TestCase):
         ), patch.object(
             reviewer, "compute_generation_range_hash", return_value="samehash",
         ), patch.object(
-            reviewer, "_fetch_pr_labels", return_value=[],
+            reviewer, "_fetch_pr_labels", return_value=([], True),
         ), patch.object(
             reviewer, "compute_new_lines_pct",
         ) as mock_new_lines:
@@ -725,7 +764,7 @@ class RunIarPreLlmTests(unittest.TestCase):
         ), patch.object(
             reviewer, "compute_generation_range_hash", return_value="newhash",
         ), patch.object(
-            reviewer, "_fetch_pr_labels", return_value=[],
+            reviewer, "_fetch_pr_labels", return_value=([], True),
         ), patch.object(
             reviewer, "compute_new_lines_pct", return_value=42.5,
         ) as mock_new_lines:
@@ -770,7 +809,7 @@ class RunIarPreLlmTests(unittest.TestCase):
             reviewer, "compute_generation_range_hash", return_value="newhash",
         ), patch.object(
             reviewer, "_fetch_pr_labels",
-            return_value=["Ready", "priority:high"],  # reviewed label removed
+            return_value=(["Ready", "priority:high"], True),  # reviewed label removed
         ), patch.object(
             reviewer, "compute_new_lines_pct", return_value=42.5,
         ) as mock_new_lines:
@@ -827,7 +866,7 @@ class RunIarPreLlmTests(unittest.TestCase):
             reviewer, "compute_generation_range_hash", return_value="samehash",
         ), patch.object(
             reviewer, "_fetch_pr_labels",
-            return_value=["Ready"],  # reviewed label ABSENT
+            return_value=(["Ready"], True),  # reviewed label ABSENT
         ):
             ctx: IARPreLLMContext = run_iar_pre_llm(
                 iar_config=self._iar_config(),
@@ -864,7 +903,7 @@ class RunIarPreLlmTests(unittest.TestCase):
         ), patch.object(
             reviewer, "compute_generation_range_hash", return_value="samehash",
         ), patch.object(
-            reviewer, "_fetch_pr_labels", return_value=["Ready"],
+            reviewer, "_fetch_pr_labels", return_value=(["Ready"], True),
         ):
             ctx: IARPreLLMContext = run_iar_pre_llm(
                 iar_config=self._iar_config(),
@@ -896,7 +935,7 @@ class RunIarPreLlmTests(unittest.TestCase):
             reviewer, "compute_generation_range_hash", return_value="samehash",
         ), patch.object(
             reviewer, "_fetch_pr_labels",
-            return_value=["Ready", "ai-reviewed"],
+            return_value=(["Ready", "ai-reviewed"], True),
         ):
             ctx: IARPreLLMContext = run_iar_pre_llm(
                 iar_config=self._iar_config(),
@@ -921,7 +960,7 @@ class RunIarPreLlmTests(unittest.TestCase):
         ), patch.object(
             reviewer, "compute_generation_range_hash", return_value="rangehash",
         ), patch.object(
-            reviewer, "_fetch_pr_labels", return_value=["Ready"],
+            reviewer, "_fetch_pr_labels", return_value=(["Ready"], True),
         ):
             ctx: IARPreLLMContext = run_iar_pre_llm(
                 iar_config=self._iar_config(),
@@ -931,6 +970,100 @@ class RunIarPreLlmTests(unittest.TestCase):
                 applied_label="ai-reviewed",
             )
         self.assertEqual(ctx.transition, GenerationTransition.FIRST_REVIEW)
+        self.assertIsNone(ctx.prior_state)
+
+    def test_user_forced_reset_no_op_when_label_fetch_failed(self) -> None:
+        """Round-14 F1 regression: prior state exists AND records that
+        the reviewed label was successfully stamped, BUT the
+        `_fetch_pr_labels` REST call failed (ok=False). This looks
+        superficially like a reset gesture — the empty list contains
+        no reviewed label — but is actually a transient API failure
+        where we DON'T KNOW whether the label is on the PR.
+
+        USER_FORCED_RESET MUST NOT fire; prior state MUST be
+        preserved so the natural retry after the API recovers
+        continues the same generation. Without this guard, a
+        transient GitHub 5xx would silently wipe fingerprint memory
+        on every outage — the exact "infinite loop" symptom IAR is
+        designed to prevent, triggered by API instability instead
+        of convergence pressure.
+        """
+        prior_state: IterationState = new_iteration_state(
+            generation=5, generation_range_hash="samehash",
+            round_in_generation=3, base_sha="baseabc",
+            head_sha="prior_head",
+        )
+        prior_state.reviewed_label_applied = True  # arm the reset gesture
+        with patch.object(
+            reviewer, "read_prior_iteration_state", return_value=prior_state,
+        ), patch.object(
+            reviewer, "_resolve_base_sha", return_value="baseabc",
+        ), patch.object(
+            reviewer, "compute_generation_range_hash", return_value="samehash",
+        ), patch.object(
+            reviewer, "_fetch_pr_labels",
+            return_value=([], False),  # API failure — DON'T KNOW
+        ):
+            ctx: IARPreLLMContext = run_iar_pre_llm(
+                iar_config=self._iar_config(),
+                repo="a/b", pr_number=1, gh_token="t",
+                base_ref="main", head_sha="head123",
+                base_max_inline_comments=10,
+                applied_label="ai-reviewed",
+            )
+        self.assertNotEqual(
+            ctx.transition,
+            GenerationTransition.USER_FORCED_RESET,
+            msg="A failed label fetch (ok=False) MUST NOT be misread "
+                "as 'reviewed label absent' — transient API failures "
+                "cannot look like a deliberate reset gesture.",
+        )
+        self.assertIs(
+            ctx.prior_state, prior_state,
+            msg="Prior state MUST be preserved when the label fetch "
+                "failed — the next successful retry needs to continue "
+                "the same generation.",
+        )
+
+    def test_user_forced_reset_fires_only_when_fetch_ok_and_label_absent(
+        self,
+    ) -> None:
+        """Contrast test to lock the load-bearing distinction: same
+        setup as `test_user_forced_reset_no_op_when_label_fetch_failed`
+        (prior state, `reviewed_label_applied=True`, empty list) EXCEPT
+        `ok=True`. This is the operational "PR has no labels" signal,
+        which IS a valid reset gesture (developer took every label off)
+        — so USER_FORCED_RESET MUST fire.
+
+        Locking both branches with the same fixture proves the
+        `label_fetch_ok` bit is the ONLY thing distinguishing the
+        two behaviours."""
+        prior_state: IterationState = new_iteration_state(
+            generation=5, generation_range_hash="samehash",
+            round_in_generation=3, base_sha="baseabc",
+            head_sha="prior_head",
+        )
+        prior_state.reviewed_label_applied = True
+        with patch.object(
+            reviewer, "read_prior_iteration_state", return_value=prior_state,
+        ), patch.object(
+            reviewer, "_resolve_base_sha", return_value="baseabc",
+        ), patch.object(
+            reviewer, "compute_generation_range_hash", return_value="samehash",
+        ), patch.object(
+            reviewer, "_fetch_pr_labels",
+            return_value=([], True),  # succeeded; PR has no labels
+        ):
+            ctx: IARPreLLMContext = run_iar_pre_llm(
+                iar_config=self._iar_config(),
+                repo="a/b", pr_number=1, gh_token="t",
+                base_ref="main", head_sha="head123",
+                base_max_inline_comments=10,
+                applied_label="ai-reviewed",
+            )
+        self.assertEqual(
+            ctx.transition, GenerationTransition.USER_FORCED_RESET,
+        )
         self.assertIsNone(ctx.prior_state)
 
 

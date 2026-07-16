@@ -135,12 +135,13 @@ Detection logic (deterministic, no ambiguity):
 - `prior_base_sha != current_base_sha` → `REBASED` (takes precedence over NEW_COMMITS)
 - Otherwise → `NEW_COMMITS`
 
-After the four-way classification above, one **override** may fire: if ALL FOUR of the following are true, the transition is upgraded to `USER_FORCED_RESET` and `prior_state` is discarded before any downstream logic runs:
+After the four-way classification above, one **override** may fire: if ALL FIVE of the following are true, the transition is upgraded to `USER_FORCED_RESET` and `prior_state` is discarded before any downstream logic runs:
 
 1. The consumer's `applied-label` (the "reviewed" label the action stamps on every successful review) is non-empty.
-2. That label is absent from the PR's current labels at trigger time.
-3. `prior_state is not None` (i.e., a previous review exists in the marker chain).
-4. `prior_state.reviewed_label_applied == True` (i.e., the reviewer previously succeeded at stamping the reviewed label — see § 8.5 for why this fourth condition is load-bearing).
+2. `prior_state is not None` (i.e., a previous review exists in the marker chain).
+3. `prior_state.reviewed_label_applied == True` (i.e., the reviewer previously succeeded at stamping the reviewed label — see § 8.5 for why this condition is load-bearing).
+4. `label_fetch_ok == True` — the `_fetch_pr_labels` REST call SUCCEEDED (as opposed to returning `([], False)` on a transient network failure). Without this guard, a GitHub 5xx would silently look identical to "label absent" and fire a false reset, wiping fingerprint memory on every transient outage (round-14 F1).
+5. That label is absent from the PR's current labels at trigger time.
 
 Behaviorally identical to `FIRST_REVIEW` (fresh state, no dedup memory, round-1 exhaustive under the default policy) — the separate enum value only exists so the log and marker annotation can tell developers the reset was a deliberate gesture. The fourth condition prevents a blocked run (whose review posted but whose reviewed-label stamp was suppressed by the strictness gate) from being misread as a deliberate reset on the natural re-trigger that follows. Full spec in § 8.5.
 
@@ -443,7 +444,10 @@ Distinct from the escape label, there is a second **stateful** escape gesture th
 
 To audit these programmatically, grep the marker chain: `policy=\`escape-label-forced-` for escape usage; `(user_forced_reset)` for resets.
 
-**The load-bearing `reviewed_label_applied` safety guard.** The reset detection requires four conditions to fire — (1) `applied-label` is configured, (2) prior IAR state exists, (3) that prior state records the reviewer had previously stamped the label (`prior_state.reviewed_label_applied == True`), and (4) the label is absent from the PR now. Condition (3) is critical: without it, any blocked review (`block-on-critical` fired, so the reviewer never stamped the label) followed by the natural re-trigger would look identical to a deliberate reset and wipe fingerprint memory.
+**The load-bearing safety guards.** The reset detection requires five conditions to fire — (1) `applied-label` is configured, (2) prior IAR state exists, (3) that prior state records the reviewer had previously stamped the label (`prior_state.reviewed_label_applied == True`), (4) the `_fetch_pr_labels` REST call succeeded (`label_fetch_ok == True`), and (5) the label is absent from the returned list. Two of the five are load-bearing safety guards:
+
+- **Condition (3)** — `reviewed_label_applied` guard: without it, any blocked review (`block-on-critical` fired, so the reviewer never stamped the label) followed by the natural re-trigger would look identical to a deliberate reset and wipe fingerprint memory.
+- **Condition (4)** — `label_fetch_ok` guard (round-14 F1): without it, any transient GitHub 5xx returning an empty label list would look identical to "label absent" and fire a false reset — the exact "infinite loop" symptom IAR is designed to prevent, but triggered by API instability rather than by convergence pressure. `_fetch_pr_labels` returns a `(labels, ok)` tuple specifically so this branch can distinguish "the API said no labels" from "we don't know if there are labels".
 
 The bit is written at the end of each run as the OR of three signals — `label_stamped OR label_currently_on_pr OR prior_bit`:
 
@@ -760,4 +764,4 @@ Both paths deferred to a dedicated refactor PR that can be reviewed on its own w
 
 ## Change log
 
-- **v1 (2026-07-16):** initial spec authored during Task 1 of `PLAN_iteration_aware_review`. Post-launch corrections in the same day (three-dot generation range hash, four-condition USER_FORCED_RESET guard with three-signal `reviewed_label_applied` write logic, § 13 known-limitations catalogue) folded in during self-review dogfooding.
+- **v1 (2026-07-16):** initial spec authored during Task 1 of `PLAN_iteration_aware_review`. Post-launch corrections in the same day (three-dot generation range hash, five-condition USER_FORCED_RESET guard with three-signal `reviewed_label_applied` write logic + `label_fetch_ok` transient-failure guard, § 13 known-limitations catalogue) folded in during self-review dogfooding.
