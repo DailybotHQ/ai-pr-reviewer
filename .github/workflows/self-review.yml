@@ -171,14 +171,6 @@ jobs:
           else
             echo 'empty_reason=' >> "$GITHUB_OUTPUT"
           fi
-          # Complexity labeling (dogfooded below via `complexity-labels-enabled`)
-          # is chat-completions-only — `set_pr_complexity` is not exposed on
-          # agent-runner legs (cursor/claude-code/codex). Warn when no
-          # anthropic secret is configured so maintainers don't expect a
-          # `complexity:*` label from a cursor-only matrix.
-          if [ "$HAS_ANTHROPIC" != "true" ]; then
-            echo "::warning::complexity-labels-enabled is dogfooded in self-review but ANTHROPIC_API_KEY is not configured — only the anthropic leg can apply complexity:* labels. Agent-runner legs will no-op this feature (see docs/PR_METADATA_CHECKS.md)."
-          fi
           echo "::notice::Self-review matrix: $matrix"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
@@ -333,10 +325,9 @@ jobs:
           # GitHub ruleset (see docs/TRIGGER_MODES.md for the worked pattern).
           skip-review-label: skip-ai-review
           # PR complexity labeling — dogfood docs/PR_METADATA_CHECKS.md
-          # § `complexity-labels-enabled`. The model calls `set_pr_complexity`
-          # and applies `complexity:low|medium|high`. Chat-completions legs
-          # (anthropic, codex) perform the assessment; agent-runner legs
-          # (claude-code, cursor) log a no-op warning by design.
+          # § `complexity-labels-enabled`. Chat-completions legs use
+          # `set_pr_complexity`; agent-runner legs write `complexity` to
+          # `.aiprr/findings.json` (all providers apply `complexity:*`).
           complexity-labels-enabled: true
           complexity-label-prefix: 'complexity:'
 
