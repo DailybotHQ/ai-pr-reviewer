@@ -307,6 +307,73 @@ ALLOWED_SIDES: tuple[str, ...] = ("LEFT", "RIGHT")
 # recommended workflow `timeout-minutes: 15` in examples/*.yml.
 CLI_INVOCATION_TIMEOUT: int = 900
 
+# ---------------------------------------------------------------------------
+# Iteration-Aware Review (IAR) — opt-in subsystem constants
+# ---------------------------------------------------------------------------
+# Full spec in docs/ITERATION_AWARENESS.md. Master switch defaults to false so
+# every consumer's runtime behavior is byte-identical to prior releases unless
+# they explicitly opt in.
+
+# Convergence policy enum values (docs/ITERATION_AWARENESS.md § 6).
+IAR_POLICY_ITERATIVE: str = "iterative"
+IAR_POLICY_FIRST_PASS_EXHAUSTIVE: str = "first-pass-exhaustive"
+IAR_POLICY_ROUND_CAPPED: str = "round-capped"
+IAR_POLICY_CRITICAL_GATE: str = "critical-gate"
+IAR_VALID_POLICIES: tuple[str, ...] = (
+    IAR_POLICY_ITERATIVE,
+    IAR_POLICY_FIRST_PASS_EXHAUSTIVE,
+    IAR_POLICY_ROUND_CAPPED,
+    IAR_POLICY_CRITICAL_GATE,
+)
+
+# Default multiplier applied to max-inline-comments on round 1 of each
+# generation when convergence-policy is first-pass-exhaustive
+# (docs/ITERATION_AWARENESS.md § 6.2).
+IAR_DEFAULT_CAP_MULTIPLIER: int = 3
+
+# Lines above + below a finding anchor included in the context hash for
+# fingerprinting (docs/ITERATION_AWARENESS.md § 5.2). 10 above + 10 below
+# = 21-line window.
+IAR_CONTEXT_HASH_RADIUS: int = 10
+
+# When a generation change (NEW_COMMITS / REBASED) brings more than this
+# percentage of new lines relative to the total diff, the safety net
+# forces first-pass-exhaustive for that round regardless of the configured
+# policy (docs/ITERATION_AWARENESS.md § 7.2).
+IAR_SAFETY_NET_NEW_LINES_PCT: int = 30
+
+# IterationState JSON schema version embedded in the marker state block
+# (docs/ITERATION_AWARENESS.md § 13). Increment when the schema breaks
+# backward-read compatibility; also extend _parse_state_from_marker_body
+# with backward-read logic before incrementing.
+IAR_STATE_SCHEMA_VERSION: int = 1
+
+# Default escape label a human can apply to force a full review
+# (docs/ITERATION_AWARENESS.md § 8). Consumers can rename via the
+# iteration-escape-label input.
+IAR_DEFAULT_ESCAPE_LABEL: str = "full-review-please"
+
+# HTML-comment tags that delimit the embedded IterationState JSON block
+# inside the tracking marker body. Nested inside REVIEW_MARKER so any
+# consumer parser looking for the tracking marker still finds it.
+IAR_STATE_TAG_OPEN: str = "<!-- ai-pr-reviewer-iteration-state"
+IAR_STATE_TAG_CLOSE: str = "-->"
+
+# Hardcoded prompt addendum spliced into the system prompt on round 1 of
+# each generation when convergence-policy is first-pass-exhaustive. NEVER
+# sourced from user input — this constant is the security surface
+# (docs/ITERATION_AWARENESS.md § 6.2). Kept short; ≈40 tokens.
+IAR_EXHAUSTIVE_PROMPT_ADDENDUM: str = (
+    "\n\n[Iteration-Aware Review — exhaustive first-pass mode active]\n"
+    "This is round 1 of a fresh review generation. Prioritize exhaustive\n"
+    "coverage over conciseness: surface every relevant finding you can\n"
+    "identify in this diff, up to the increased inline-comments ceiling.\n"
+    "Subsequent rounds will dedupe against these findings, so it is\n"
+    "preferable to report a superset now than to trickle findings across\n"
+    "future rounds. Focus areas, severity model, and output shape are\n"
+    "unchanged.\n"
+)
+
 
 # ---------------------------------------------------------------------------
 # Logging / utilities
@@ -432,12 +499,21 @@ def write_all_outputs(
     blocked: bool = False,
     review_url: str = "",
 ) -> None:
-    """Write the complete set of six action outputs in one call.
+    """Write the complete set of six pre-IAR action outputs + the five IAR
+    outputs (as empty strings) in one call.
 
     Every exit path — success, skip, and hard failure — routes through here so
     downstream steps never read an empty string for an output they key on
     (e.g. `steps.review.outputs.blocked == 'false'`). Defaults describe the
     "no review produced" state used by the skip and failure paths.
+
+    The five IAR outputs (`iteration-round`, `iteration-generation`,
+    `iteration-policy-applied`, `iteration-tokens-used`,
+    `iteration-cost-vs-baseline-estimate`) are always written as empty strings
+    here. When IAR is enabled AND the reviewer reaches its IAR-populating
+    code path, that path overwrites the four values with real data
+    (`$GITHUB_OUTPUT` is append-only; last write wins). See
+    docs/ITERATION_AWARENESS.md § 3.2.
     """
     write_action_output("skipped", "true" if skipped else "false")
     write_action_output("severity", severity)
@@ -445,6 +521,7 @@ def write_all_outputs(
     write_action_output("inline-dropped", str(inline_dropped))
     write_action_output("blocked", "true" if blocked else "false")
     write_action_output("review-url", review_url)
+    write_iar_outputs_empty()
 
 
 # ---------------------------------------------------------------------------
@@ -1677,6 +1754,99 @@ def build_provider(
         f"Unsupported provider: {provider_id!r}. Currently supported: "
         f"{sorted(DEFAULT_MODELS)}."
     )
+
+
+# ---------------------------------------------------------------------------
+# Iteration-Aware Review (IAR) config
+# ---------------------------------------------------------------------------
+# The runtime reads the 5 IAR env vars once at the top of main() and packages
+# them into an IARConfig dataclass. When enabled=False (default), every IAR
+# integration point in main() takes an early-return path — the runtime
+# behavior is byte-identical to prior releases (verified by
+# tests/test_backward_compat_iar_off.py). See docs/ITERATION_AWARENESS.md.
+
+
+@dataclass(frozen=True)
+class IARConfig:
+    """Parsed + validated configuration for the Iteration-Aware Review
+    subsystem. Built exactly once per run via `build_iar_config()`.
+
+    When `enabled` is False, every other field is still populated (with
+    defaults) but is ignored by the runtime — the master switch is the sole
+    gate on IAR code paths.
+    """
+
+    enabled: bool
+    policy: str
+    max_review_rounds: int
+    cap_multiplier: int
+    escape_label: str
+
+
+def build_iar_config(env: dict[str, str]) -> IARConfig:
+    """Read the 5 IAR env vars from `env` and return a validated IARConfig.
+
+    All defaults preserve the pre-IAR runtime path byte-identically when the
+    master switch is off. Unknown policy values fall back to `iterative` with
+    a debug log; negative integers are clamped to sane values.
+    """
+    enabled: bool = parse_bool(
+        env.get("AIPRR_ITERATION_AWARENESS_ENABLED", ""), default=False
+    )
+    policy_raw: str = (
+        env.get("AIPRR_CONVERGENCE_POLICY", "").strip() or IAR_POLICY_ITERATIVE
+    )
+    if policy_raw not in IAR_VALID_POLICIES:
+        # Silent fallback keeps the runtime safe even under a misconfiguration.
+        # main() emits a debug log line so the miswiring is visible in the
+        # workflow log when IAR is enabled.
+        policy: str = IAR_POLICY_ITERATIVE
+    else:
+        policy = policy_raw
+    max_review_rounds_raw: str = (
+        env.get("AIPRR_MAX_REVIEW_ROUNDS", "").strip() or "0"
+    )
+    try:
+        max_review_rounds: int = int(max_review_rounds_raw)
+    except ValueError:
+        max_review_rounds = 0
+    if max_review_rounds < 0:
+        max_review_rounds = 0
+    cap_multiplier_raw: str = (
+        env.get("AIPRR_EXHAUSTIVE_FIRST_PASS_CAP_MULTIPLIER", "").strip()
+        or str(IAR_DEFAULT_CAP_MULTIPLIER)
+    )
+    try:
+        cap_multiplier: int = int(cap_multiplier_raw)
+    except ValueError:
+        cap_multiplier = IAR_DEFAULT_CAP_MULTIPLIER
+    if cap_multiplier < 1:
+        cap_multiplier = 1
+    escape_label: str = (
+        env.get("AIPRR_ITERATION_ESCAPE_LABEL", "").strip()
+        or IAR_DEFAULT_ESCAPE_LABEL
+    )
+    return IARConfig(
+        enabled=enabled,
+        policy=policy,
+        max_review_rounds=max_review_rounds,
+        cap_multiplier=cap_multiplier,
+        escape_label=escape_label,
+    )
+
+
+def write_iar_outputs_empty() -> None:
+    """Write empty-string values for all 5 IAR action outputs.
+
+    Called on every code path where IAR is disabled OR where the review
+    aborts before IAR could populate its own values. Downstream steps that
+    read `steps.review.outputs.iteration-*` always see a defined value.
+    """
+    write_action_output("iteration-round", "")
+    write_action_output("iteration-generation", "")
+    write_action_output("iteration-policy-applied", "")
+    write_action_output("iteration-tokens-used", "")
+    write_action_output("iteration-cost-vs-baseline-estimate", "")
 
 
 # ---------------------------------------------------------------------------
@@ -3427,6 +3597,31 @@ def main() -> int:
         os.environ.get("AIPRR_MAX_TURNS", DEFAULT_MAX_TURNS)
         or DEFAULT_MAX_TURNS
     )
+
+    # Iteration-Aware Review (IAR) — opt-in subsystem. When
+    # `iar_config.enabled` is False (default), the runtime path is
+    # byte-identical to prior releases; downstream Task 3+ integrations
+    # early-return on the master switch. See docs/ITERATION_AWARENESS.md.
+    iar_config: IARConfig = build_iar_config(dict(os.environ))
+    if iar_config.enabled:
+        # Detect silently-fallback-corrected policy inputs so miswiring is
+        # visible in the workflow log rather than swallowed. The build_iar_config
+        # helper rewrote the value; we compare raw vs effective.
+        raw_policy: str = (
+            os.environ.get("AIPRR_CONVERGENCE_POLICY", "").strip()
+            or IAR_POLICY_ITERATIVE
+        )
+        if raw_policy not in IAR_VALID_POLICIES:
+            log(
+                f"IAR: unknown convergence-policy {raw_policy!r}; falling back "
+                f"to {IAR_POLICY_ITERATIVE!r}. Valid values: {list(IAR_VALID_POLICIES)}."
+            )
+        log(
+            f"IAR: enabled (policy={iar_config.policy}, "
+            f"max-rounds={iar_config.max_review_rounds}, "
+            f"cap-multiplier={iar_config.cap_multiplier}, "
+            f"escape-label={iar_config.escape_label!r})."
+        )
 
     # PR description review (v1.2.0+)
     pr_desc_mode: str = (

@@ -189,6 +189,11 @@ Like Cursor, `claude-code` can bill against a **Claude Pro/Max subscription**. R
 | `claude-code-version` | | `''` | Pin the Claude Code CLI version (npm semver). Empty = latest. |
 | `cursor-version` | | `''` | Pin the Cursor Agent CLI version. Empty = latest stable. |
 | `codex-version` | | `''` | Pin the OpenAI Codex CLI version (npm semver). Empty = latest. |
+| `iteration-awareness-enabled` | | `false` | **Opt-in Iteration-Aware Review (IAR) master switch.** When `true`, the reviewer gains memory across rounds: dedup against prior reports, generation tracking (new commits reset the round counter), 4 convergence policies. Master switch off = byte-identical to prior releases. See [docs/ITERATION_AWARENESS.md](docs/ITERATION_AWARENESS.md). |
+| `convergence-policy` | | `iterative` | IAR policy: `iterative` (dedup only), `first-pass-exhaustive` (exhaustive round 1 + higher cap), `round-capped` (post-cap only critical surfaces), `critical-gate` (strict cross-gen dedup). Ignored when `iteration-awareness-enabled` is `false`. |
+| `max-review-rounds` | | `0` | Hard cap for `round-capped`. `0` = unlimited. After N rounds only critical severity findings surface. Ignored by other policies. |
+| `exhaustive-first-pass-cap-multiplier` | | `3` | Multiplier applied to `max-inline-comments` on round 1 of each generation when policy is `first-pass-exhaustive`. Set to `1` to keep exhaustive prompting without amplification. |
+| `iteration-escape-label` | | `full-review-please` | Label a human applies to force a full review — dedup skipped for that run, persisted state unchanged. |
 
 **Prefer to look up an input from your coding agent?** The [companion skill's `setup` sub-skill](#sub-skill-setup--install-the-action-via-wizard) doubles as a reference manual — ask any agent with the skill installed *"what does `strictness` do?"* or *"how do I pin the Cursor CLI version?"* and it answers from [`skills/ai-diff-reviewer/setup/reference.md`](skills/ai-diff-reviewer/setup/reference.md) without opening the action source.
 
@@ -202,6 +207,11 @@ Like Cursor, `claude-code` can bill against a **Claude Pro/Max subscription**. R
 | `inline-dropped` | int | Inline comments dropped because GitHub returned 422. |
 | `blocked` | bool | Whether strictness blocked the check. When `true`, the action exits with code 2. |
 | `skipped` | bool | Whether the run was skipped (label/author gate). |
+| `iteration-round` | int (as string) | IAR round number within the current generation (empty when `iteration-awareness-enabled` is `false`). |
+| `iteration-generation` | int (as string) | IAR generation counter; increments on new commits or rebase (empty when IAR disabled). |
+| `iteration-policy-applied` | string | Which IAR policy actually fired (usually matches `convergence-policy`; safety net or escape label can override). Empty when IAR disabled. |
+| `iteration-tokens-used` | int (as string) | Total LLM input+output tokens for this run (cost telemetry). Empty when IAR disabled. |
+| `iteration-cost-vs-baseline-estimate` | string | Heuristic cost delta vs projected non-IAR baseline (e.g. `-30%`, `+15%`, `unknown`). Empty when IAR disabled. |
 
 Consume them in a later step by giving the action step an `id`:
 

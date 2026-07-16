@@ -153,6 +153,32 @@ inputs:
     required: false
     default: ''
 
+  # ---------------- Iteration-Aware Review (IAR) — opt-in subsystem ----------------
+  # All defaults preserve the pre-IAR runtime behavior byte-identically. The
+  # master switch is `iteration-awareness-enabled`; when false (default), the
+  # other four IAR inputs are ignored and the runtime path is unchanged.
+  # See docs/ITERATION_AWARENESS.md for the full spec.
+  iteration-awareness-enabled:
+    description: 'Opt-in master switch for the Iteration-Aware Review (IAR) subsystem. When `false` (default), runtime behavior is byte-identical to prior releases — all other `iteration-*` inputs are ignored. When `true`, the reviewer gains memory across rounds: it dedupes findings against prior reports, tracks generations (new commits / rebase reset the counter), and applies the configured `convergence-policy`. Critical severity findings ALWAYS surface unconditionally — this safety rail is hardcoded and non-configurable. See docs/ITERATION_AWARENESS.md.'
+    required: false
+    default: 'false'
+  convergence-policy:
+    description: 'Which IAR convergence policy to apply when `iteration-awareness-enabled` is `true`. One of `iterative` (default; dedup only), `first-pass-exhaustive` (exhaustive prompt + higher cap on round 1 of each generation, dedup on rounds 2+), `round-capped` (dedup pre-cap, only critical severity surfaces post-cap; requires `max-review-rounds > 0`), `critical-gate` (strict cross-generation dedup — prior-resolved fingerprints stay silenced unless critical). Ignored when master switch is `false`.'
+    required: false
+    default: 'iterative'
+  max-review-rounds:
+    description: 'Hard cap for the `round-capped` convergence policy. `0` (default) = unlimited (behaves like `iterative` for that policy). After N rounds, only critical severity findings surface — warnings and infos are silenced with a "cap reached" annotation. Ignored by other policies and when master switch is `false`.'
+    required: false
+    default: '0'
+  exhaustive-first-pass-cap-multiplier:
+    description: 'Multiplier applied to `max-inline-comments` on round 1 of each generation when `convergence-policy` is `first-pass-exhaustive`. Default `3` means round 1 can post up to 3× the normal cap; rounds 2+ use the base cap. Set to `1` to disable the amplification while keeping the exhaustive prompt splicing. Ignored by other policies and when master switch is `false`. See docs/ITERATION_AWARENESS.md § 6.2.'
+    required: false
+    default: '3'
+  iteration-escape-label:
+    description: 'Label name a human can apply to a PR to force a full review regardless of IAR state — dedup is skipped for that run only, persisted state is NOT mutated. Default `full-review-please`. When the label is removed, subsequent reviews resume normal IAR behavior. Ignored when master switch is `false`. See docs/ITERATION_AWARENESS.md § 8.'
+    required: false
+    default: 'full-review-please'
+
 outputs:
   review-url:
     description: 'URL of the posted PR review (empty when the run was skipped).'
@@ -172,6 +198,25 @@ outputs:
   skipped:
     description: 'Whether the run was skipped by the label gate (`true`/`false`).'
     value: ${{ steps.review.outputs.skipped }}
+
+  # ---------------- Iteration-Aware Review (IAR) outputs ----------------
+  # All five IAR outputs are empty strings when `iteration-awareness-enabled`
+  # is `false`, so downstream steps reading them always see a defined value.
+  iteration-round:
+    description: 'IAR round number within the current generation (`1` on first review, resets when a new generation begins). Empty string when `iteration-awareness-enabled` is `false`.'
+    value: ${{ steps.review.outputs.iteration-round }}
+  iteration-generation:
+    description: 'IAR generation counter. Increments when new commits or a rebase are detected via the range hash. Empty string when `iteration-awareness-enabled` is `false`.'
+    value: ${{ steps.review.outputs.iteration-generation }}
+  iteration-policy-applied:
+    description: 'Which IAR policy actually fired this run. Usually matches `convergence-policy`, but the 30% new-lines safety net can override it to `first-pass-exhaustive`, and the escape label overrides to `escape-label-forced-full-review`. Empty string when `iteration-awareness-enabled` is `false`.'
+    value: ${{ steps.review.outputs.iteration-policy-applied }}
+  iteration-tokens-used:
+    description: 'Total input + output tokens consumed by the LLM in this run (cost telemetry). Empty string when `iteration-awareness-enabled` is `false`.'
+    value: ${{ steps.review.outputs.iteration-tokens-used }}
+  iteration-cost-vs-baseline-estimate:
+    description: 'Heuristic estimate of this run''s cost vs a projected non-IAR baseline (e.g. `"-30%"`, `"+15%"`, `"unknown"`). Empty string when `iteration-awareness-enabled` is `false`.'
+    value: ${{ steps.review.outputs.iteration-cost-vs-baseline-estimate }}
 
 runs:
   using: 'composite'
@@ -288,6 +333,17 @@ runs:
         AIPRR_CLAUDE_CODE_VERSION: ${{ inputs.claude-code-version }}
         AIPRR_CURSOR_VERSION: ${{ inputs.cursor-version }}
         AIPRR_CODEX_VERSION: ${{ inputs.codex-version }}
+
+        # Iteration-Aware Review (IAR) — opt-in subsystem. When
+        # AIPRR_ITERATION_AWARENESS_ENABLED is not "true" the reviewer takes the
+        # pre-IAR path and the other four env vars are ignored. See
+        # docs/ITERATION_AWARENESS.md § 2 for the byte-identical backward-compat
+        # contract.
+        AIPRR_ITERATION_AWARENESS_ENABLED: ${{ inputs.iteration-awareness-enabled }}
+        AIPRR_CONVERGENCE_POLICY: ${{ inputs.convergence-policy }}
+        AIPRR_MAX_REVIEW_ROUNDS: ${{ inputs.max-review-rounds }}
+        AIPRR_EXHAUSTIVE_FIRST_PASS_CAP_MULTIPLIER: ${{ inputs.exhaustive-first-pass-cap-multiplier }}
+        AIPRR_ITERATION_ESCAPE_LABEL: ${{ inputs.iteration-escape-label }}
 
         # Repo / PR context — pulled from the consumer's `pull_request` event.
         AIPRR_REPO: ${{ github.repository }}

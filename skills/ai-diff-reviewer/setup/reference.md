@@ -354,6 +354,63 @@ These inputs affect only the CLI providers (`claude-code`, `cursor`,
 
 ---
 
+## Iteration-Aware Review (IAR) — opt-in
+
+Five opt-in inputs power the IAR subsystem. Master switch defaults to
+`false` so the runtime behaves byte-identically to prior releases unless
+the consumer explicitly opts in. Full spec:
+[docs/ITERATION_AWARENESS.md](../../../docs/ITERATION_AWARENESS.md).
+
+### `iteration-awareness-enabled`
+
+- **Default:** `false`.
+- **What it is:** Master switch. When `true`, the reviewer gains memory
+  across rounds: dedupes findings against prior reports, tracks
+  generations (new commits / rebase reset the round counter), and applies
+  the configured `convergence-policy`. Critical severity findings ALWAYS
+  surface unconditionally — hardcoded safety rail. When `false`, all other
+  IAR inputs are ignored and the runtime path is unchanged.
+
+### `convergence-policy`
+
+- **Default:** `iterative`.
+- **What it is:** Which IAR policy to apply. One of:
+  - `iterative` — dedup only. Cost-neutral vs pre-IAR baseline.
+  - `first-pass-exhaustive` — exhaustive prompt + higher findings cap on
+    round 1 of each generation; dedup on rounds 2+. Best for
+    "prefer 20 findings at once vs 10 loops" workflows.
+  - `round-capped` — dedup pre-cap. Post-cap only critical findings
+    surface. Requires `max-review-rounds > 0`.
+  - `critical-gate` — strict cross-generation dedup: prior-resolved
+    fingerprints stay silenced unless critical.
+
+### `max-review-rounds`
+
+- **Default:** `0` (unlimited).
+- **What it is:** Hard cap for the `round-capped` policy. After N rounds
+  only critical findings surface; warnings and infos are silenced with a
+  "cap reached" annotation. Ignored by other policies.
+
+### `exhaustive-first-pass-cap-multiplier`
+
+- **Default:** `3`.
+- **What it is:** Multiplier applied to `max-inline-comments` on round 1
+  of each generation when policy is `first-pass-exhaustive`. Default `3`
+  means round 1 can post up to 3× the normal cap. Set to `1` to keep the
+  exhaustive prompt splicing without amplification. Ignored by other
+  policies.
+
+### `iteration-escape-label`
+
+- **Default:** `full-review-please`.
+- **What it is:** Label a human applies to force a full review. Dedup is
+  skipped for that run only; persisted state is NOT mutated. When the
+  label is removed, subsequent reviews resume normal IAR behavior. Useful
+  before final merge to see everything again, or when the developer
+  suspects IAR silenced something they need to see.
+
+---
+
 ## Outputs
 
 The action writes these to the workflow's `steps.<id>.outputs.*` for
@@ -367,6 +424,11 @@ downstream steps to consume.
 | `inline-dropped` | Number of inline comments dropped because GitHub rejected the review with HTTP 422 (the action retries summary-only on 422). |
 | `blocked` | Whether the strictness gate decided to fail the check (`true`/`false`). When `true`, the action exits with code 2 so the GitHub check turns red. |
 | `skipped` | Whether the run was skipped by the label gate (`true`/`false`). |
+| `iteration-round` | IAR round number within the current generation. Empty when `iteration-awareness-enabled` is `false`. |
+| `iteration-generation` | IAR generation counter; increments on new commits or rebase. Empty when IAR disabled. |
+| `iteration-policy-applied` | Which IAR policy actually fired (usually matches `convergence-policy`; the 30% safety net or escape label can override). Empty when IAR disabled. |
+| `iteration-tokens-used` | Total LLM input+output tokens consumed this run (cost telemetry). Empty when IAR disabled. |
+| `iteration-cost-vs-baseline-estimate` | Heuristic estimate of this run's cost vs projected non-IAR baseline (e.g. `-30%`, `+15%`, `unknown`). Empty when IAR disabled. |
 
 ---
 

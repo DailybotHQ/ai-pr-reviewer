@@ -8,6 +8,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Iteration-Aware Review (IAR) — opt-in convergence subsystem.** New
+  master switch `iteration-awareness-enabled` (default `false`) that
+  preserves current runtime behavior byte-identically when off. When
+  enabled, the reviewer gains memory across rounds: dedupes findings
+  against prior reports using content-anchored fingerprints (hash of the
+  finding + ~20 lines of surrounding code), tracks generations (new
+  commits or rebase reset the round counter), and applies one of four
+  convergence policies (`iterative`, `first-pass-exhaustive`,
+  `round-capped`, `critical-gate`). **Critical severity findings ALWAYS
+  surface unconditionally** — hardcoded safety rail, non-configurable.
+  Human escape hatch via a `full-review-please` label that forces a full
+  review without mutating persisted state. Full spec in
+  [docs/ITERATION_AWARENESS.md](docs/ITERATION_AWARENESS.md).
+
+### Public surface
+- 5 new inputs (all optional, all default-off / safe):
+  `iteration-awareness-enabled` (`false`), `convergence-policy`
+  (`iterative`), `max-review-rounds` (`0`),
+  `exhaustive-first-pass-cap-multiplier` (`3`),
+  `iteration-escape-label` (`full-review-please`).
+- 5 new outputs (empty strings when IAR disabled — downstream steps
+  reading them always see a defined value):
+  `iteration-round`, `iteration-generation`, `iteration-policy-applied`,
+  `iteration-tokens-used`, `iteration-cost-vs-baseline-estimate`.
+- Zero breaking changes; the new inputs/outputs are additive to
+  `action.yml`. Consumers on `@v1` see no change unless they explicitly
+  opt in.
+
+### Regression contract
+- New test suite `tests/test_backward_compat_iar_off.py` asserts
+  byte-identical runtime behavior when the master switch is off. CI
+  fails any PR where this suite regresses.
+
 - **New "Security audit alignment" section in `.review/extension.md`.**
   Codifies the review rules that keep the two external security
   surfaces at 100% pass — (1) [skills.sh badges](https://www.skills.sh/dailybothq/ai-diff-reviewer/ai-diff-reviewer)
